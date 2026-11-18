@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Read-only token; no job here needs to write anything.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: short
+
+jobs:
+  frontend:
+    name: Frontend (tsc, vitest, build)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx tsc --noEmit
+      - run: npx vitest run
+      - run: npx vite build
+
+  rust:
+    name: Rust (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        # Linux is the fast gate; macOS is the platform the app ships on and the only
+        # place the macOS-only code (tray template icon, Keychain backend) compiles.
+        os: [ubuntu-latest, macos-latest]
+    defaults:
+      run:
+        working-directory: src-tauri
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        working-directory: .
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev \
+            libayatana-appindicator3-dev libssl-dev build-essential pkg-config
+
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: src-tauri
+
+      # tauri::generate_context! embeds the frontend at compile time; an empty dist is enough
+      # for checks and tests (the frontend job builds the real one).
+      - name: Stub frontend dist
+        working-directory: .
+        run: mkdir -p dist && echo '<!doctype html>' > dist/index.html
+
+      - name: rustfmt
+        if: runner.os == 'Linux'
+        run: cargo fmt --check
+
+      - name: clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      # Ignored tests need the real claude CLI or the OS keychain and stay opt-in.
+      - name: cargo test
+        run: cargo test --locked
+
+      - name: Generated TS bindings are up to date
+        if: runner.os == 'Linux'
+        working-directory: .
+        run: |
+          if ! git diff --exit-code -- src/lib/bindings; then
+            echo "::error::src/lib/bindings is stale. Run 'npm run test:rust' and commit the result."
+            exit 1
+          fi
+          untracked=$(git ls-files --others --exclude-standard -- src/lib/bindings)
+          if [ -n "$untracked" ]; then
+            echo "::error::New generated bindings are not committed: $untracked"
+            exit 1
+          fi

@@ -1,6 +1,22 @@
 {
   "version": 2,
   "skills": {
+    "github-actions-hardening": {
+      "source": "github/awesome-copilot",
+      "commit": "a255a193d1318e5a9ca3e9e575897f9a7845c099",
+      "sourceType": "github",
+      "skillPath": "skills/github-actions-hardening/SKILL.md",
+      "computedHash": "ce7df8e90622480a41ffae4a81c78dbf4de3a6965cc21a91693efdf15fb3284c",
+      "installMode": "copy"
+    },
+    "github-actions-templates": {
+      "source": "wshobson/agents",
+      "commit": "42203085cfc5736204bf0f6d436dff7e1da0bf3f",
+      "sourceType": "github",
+      "skillPath": "plugins/cicd-automation/skills/github-actions-templates/SKILL.md",
+      "computedHash": "4cfaaba2a265ae01444e6d0b4f629ef6ce190c6ca336c83c99b8a9afec70f702",
+      "installMode": "copy"
+    },
     "rust-async-patterns": {
       "source": "wshobson/agents",
       "commit": "42203085cfc5736204bf0f6d436dff7e1da0bf3f",
