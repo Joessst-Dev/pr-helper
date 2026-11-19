@@ -11,14 +11,15 @@ cask "pr-helper" do
     skip "Auto-generated on release."
   end
 
-  depends_on macos: ">= :catalina"
+  depends_on :macos
 
   app "PR Helper.app"
 
   # Ad-hoc signed, not notarized: strip quarantine so Gatekeeper allows the first launch.
-  postflight do
-    system_command "/usr/bin/xattr",
-                   args: ["-dr", "com.apple.quarantine", "#{appdir}/PR Helper.app"]
+  postflight_steps do
+    run "/usr/bin/xattr",
+        args:         ["-dr", "com.apple.quarantine", "{{appdir}}/PR Helper.app"],
+        must_succeed: false
   end
 
   zap trash: [
