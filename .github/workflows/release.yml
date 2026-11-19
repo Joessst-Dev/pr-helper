@@ -1,0 +1,202 @@
+name: Release
+
+# Pushing a vX.Y.Z tag builds the universal macOS app, publishes a GitHub Release and
+# updates the cask in Joessst-Dev/homebrew-tap. A manual run only builds (dry run): the
+# publish jobs are gated on a tag ref.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+# Deny by default; each job asks for what it needs.
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  build:
+    name: Build universal macOS app
+    runs-on: macos-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      sha256: ${{ steps.package.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The tag is the release; the app must report the same version it is published under.
+      - name: Resolve and check version
+        id: version
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          conf=$(node -p 'require("./src-tauri/tauri.conf.json").version')
+          pkg=$(node -p 'require("./package.json").version')
+          cargo=$(sed -n 's/^version = "\(.*\)"$/\1/p' src-tauri/Cargo.toml | head -n1)
+          if [ "$conf" != "$pkg" ] || [ "$conf" != "$cargo" ]; then
+            echo "::error::Version mismatch: tauri.conf.json=$conf package.json=$pkg Cargo.toml=$cargo"
+            exit 1
+          fi
+          if [ "$REF_TYPE" = "tag" ] && [ "$REF_NAME" != "v$conf" ]; then
+            echo "::error::Tag $REF_NAME does not match app version v$conf"
+            exit 1
+          fi
+          if ! printf '%s' "$conf" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
+            echo "::error::Unexpected version format: $conf"
+            exit 1
+          fi
+          echo "version=$conf" >> "$GITHUB_OUTPUT"
+
+      # No npm/cargo caches here on purpose: a shipped binary should not be built from a
+      # cache another workflow wrote.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          package-manager-cache: false
+
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - run: npm ci
+
+      # Ad-hoc signed via bundle.macOS.signingIdentity "-" in tauri.conf.json (no Developer ID).
+      - name: Build
+        run: npx tauri build --target universal-apple-darwin --bundles dmg
+
+      - name: Package
+        id: package
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          mkdir -p out
+          src=$(ls src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg)
+          if [ "$(printf '%s\n' "$src" | wc -l)" -ne 1 ]; then
+            echo "::error::Expected exactly one dmg, found: $src"
+            exit 1
+          fi
+          dmg="PR-Helper_${VERSION}_universal.dmg"
+          cp "$src" "out/$dmg"
+          app="src-tauri/target/universal-apple-darwin/release/bundle/macos/PR Helper.app"
+          exe=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")
+          archs=$(lipo -archs "$app/Contents/MacOS/$exe")
+          echo "Architectures: $archs"
+          case "$archs" in *x86_64*arm64*|*arm64*x86_64*) ;; *) echo "::error::not universal: $archs"; exit 1 ;; esac
+          codesign --verify --verbose "$app"
+          (cd out && shasum -a 256 "$dmg" > SHA256SUMS)
+          echo "sha256=$(cut -d' ' -f1 out/SHA256SUMS)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: macos-universal
+          path: out/
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Only this job can write to the repo, and it runs no project code.
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: macos-universal
+          path: out
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          prerelease=()
+          case "$TAG" in *-*) prerelease=(--prerelease) ;; esac
+          cat > notes.md <<'EOF'
+          ## Install
+
+          ```sh
+          brew install --cask joessst-dev/tap/pr-helper
+          ```
+
+          Requires the Claude Code CLI (`claude`) on your PATH. The app is ad-hoc signed, not notarized; the cask clears the quarantine flag for you.
+          EOF
+          gh release create "$TAG" out/* \
+            --verify-tag \
+            --title "PR Helper $TAG" \
+            --notes-file notes.md \
+            --generate-notes \
+            "${prerelease[@]}"
+
+  tap:
+    name: Update Homebrew cask
+    needs: [build, release]
+    # A prerelease must never become `brew install`.
+    if: github.ref_type == 'tag' && !contains(github.ref_name, '-')
+    runs-on: macos-latest
+    timeout-minutes: 10
+    # The push to the tap uses the HOMEBREW_TAP_TOKEN PAT; GITHUB_TOKEN needs nothing.
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: packaging/homebrew
+          path: src
+
+      # A fine-grained PAT with contents: write on Joessst-Dev/homebrew-tap only.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Joessst-Dev/homebrew-tap
+          ref: main
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          persist-credentials: false
+          path: tap
+
+      - name: Render cask
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+          SHA256: ${{ needs.build.outputs.sha256 }}
+        run: |
+          printf '%s' "$SHA256" | grep -Eq '^[0-9a-f]{64}$' || { echo "::error::bad sha256"; exit 1; }
+          mkdir -p tap/Casks
+          sed -e "s/@VERSION@/$VERSION/" -e "s/@SHA256@/$SHA256/" \
+            src/packaging/homebrew/pr-helper.rb.in > tap/Casks/pr-helper.rb
+          brew style tap/Casks/pr-helper.rb
+
+      - name: Commit and push
+        working-directory: tap
+        env:
+          TAG: ${{ github.ref_name }}
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          git add Casks/pr-helper.rb
+          if git diff --cached --quiet; then
+            echo "Cask already up to date."
+            exit 0
+          fi
+          git -c user.name="github-actions[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit -m "brew: pr-helper $TAG"
+          # The token is only handed to this one push, never written to .git/config.
+          auth=$(printf 'x-access-token:%s' "$TAP_TOKEN" | base64 | tr -d '\n')
+          echo "::add-mask::$auth"
+          git -c http.https://github.com/.extraheader="AUTHORIZATION: basic $auth" push origin HEAD:main
