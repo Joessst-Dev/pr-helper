@@ -76,4 +76,40 @@ describe("ReviewResults", () => {
     await waitFor(() => expect(postFindings).toHaveBeenCalled());
     expect(postFindings.mock.calls[0][0].summary).toBeNull();
   });
+
+  it("leaves hidden findings out of the post", async () => {
+    renderResults();
+    await userEvent.click(screen.getByRole("button", { name: /Critical 1/ }));
+    expect(screen.getByText(/of 3 selected/)).toHaveTextContent("0 of 3 selected (1 hidden, not posted)");
+    await userEvent.click(screen.getByRole("button", { name: "Post selected" }));
+    await waitFor(() => expect(postFindings).toHaveBeenCalled());
+    expect(postFindings.mock.calls[0][0].findingIds).toEqual([]);
+  });
+
+  it("waits for comment edits to save and refuses to post when a save failed", async () => {
+    let finishSave: () => void = () => {};
+    updateFinding.mockImplementationOnce(() => new Promise<void>((r) => (finishSave = r)));
+    renderResults();
+    const box = screen.getAllByRole("textbox", { name: "Proposed comment" })[0];
+    await userEvent.type(box, " Edited.");
+    await userEvent.click(screen.getByRole("button", { name: "Post selected" }));
+    expect(updateFinding).toHaveBeenCalledWith("a", true, expect.stringContaining("Edited."));
+    expect(postFindings).not.toHaveBeenCalled();
+    finishSave();
+    await waitFor(() => expect(postFindings).toHaveBeenCalledTimes(1));
+
+    updateFinding.mockRejectedValueOnce("database is locked");
+    await userEvent.type(box, " Again.");
+    await userEvent.click(screen.getByRole("button", { name: "Post selected" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Not saved: database is locked");
+    expect(screen.getByText(/could not be saved/)).toBeInTheDocument();
+    expect(postFindings).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not send the summary again after a successful post", async () => {
+    renderResults();
+    await userEvent.click(screen.getByRole("button", { name: "Post selected" }));
+    await waitFor(() => expect(postFindings).toHaveBeenCalledTimes(1));
+    expect(screen.getByRole("checkbox", { name: /Post the summary/ })).not.toBeChecked();
+  });
 });

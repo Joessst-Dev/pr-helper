@@ -25,9 +25,10 @@ pub fn slug(name: &str) -> String {
 }
 
 /// Inline skills without frontmatter get one generated from the stored name and description.
-fn with_frontmatter(skill: &Skill, body: &str) -> String {
+/// `name` is the skill's directory in the plugin, which is the name the reviewer invokes.
+fn with_frontmatter(skill: &Skill, body: &str, name: &str) -> String {
     if body.trim_start().starts_with("---") {
-        return body.to_string();
+        return set_frontmatter_name(body, name);
     }
     let description = if skill.description.trim().is_empty() {
         format!("Review guidance: {}", skill.name)
@@ -36,10 +37,37 @@ fn with_frontmatter(skill: &Skill, body: &str) -> String {
     };
     format!(
         "---\nname: {}\ndescription: {}\n---\n\n{}",
-        slug(&skill.name),
+        name,
         serde_json::to_string(&description).unwrap_or_default(),
         body
     )
+}
+
+/// Makes the frontmatter `name` match the plugin directory, so the name the prompt advertises
+/// (`pr-helper-review-skills:<dir>`) is the one Claude Code registers, even after renaming a
+/// duplicate or for a folder skill whose own name differs.
+fn set_frontmatter_name(text: &str, name: &str) -> String {
+    let body = text.trim_start();
+    let Some(rest) = body.strip_prefix("---") else {
+        return text.to_string();
+    };
+    let Some(end) = rest.find("\n---") else {
+        return text.to_string();
+    };
+    let (front, after) = rest.split_at(end);
+    let mut lines: Vec<String> = front
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(str::to_string)
+        .collect();
+    match lines
+        .iter_mut()
+        .find(|l| l.trim_start().starts_with("name:"))
+    {
+        Some(line) => *line = format!("name: {name}"),
+        None => lines.insert(0, format!("name: {name}")),
+    }
+    format!("---\n{}{after}", lines.join("\n"))
 }
 
 async fn copy_dir(src: &Path, dst: &Path) -> AppResult<()> {
@@ -108,10 +136,17 @@ pub async fn build_plugin(
                 let src = PathBuf::from(path);
                 validate_skill_dir(&src)?;
                 copy_dir(&src, &target).await?;
+                let md = target.join("SKILL.md");
+                let text = tokio::fs::read_to_string(&md).await?;
+                tokio::fs::write(&md, set_frontmatter_name(&text, &name)).await?;
             }
             (None, Some(content)) => {
                 tokio::fs::create_dir_all(&target).await?;
-                tokio::fs::write(target.join("SKILL.md"), with_frontmatter(skill, content)).await?;
+                tokio::fs::write(
+                    target.join("SKILL.md"),
+                    with_frontmatter(skill, content, &name),
+                )
+                .await?;
             }
             (None, None) => continue,
         }
@@ -174,7 +209,11 @@ mod tests {
         let inline = std::fs::read_to_string(dir.join("skills/api-rules/SKILL.md")).unwrap();
         assert!(inline.starts_with("---\nname: api-rules\ndescription: \"desc\""));
         assert!(dir.join("skills/folder-skill/refs/a.md").is_file());
-        assert!(dir.join("skills/api-rules-x/SKILL.md").is_file());
+        let folder = std::fs::read_to_string(dir.join("skills/folder-skill/SKILL.md")).unwrap();
+        assert_eq!(folder, "---\nname: folder-skill\ndescription: y\n---\nbody");
+        let dupe = std::fs::read_to_string(dir.join("skills/api-rules-x/SKILL.md")).unwrap();
+        assert!(dupe.starts_with("---\nname: api-rules-x\n"));
+        assert_eq!(infos[2].name, format!("{PLUGIN_NAME}:api-rules-x"));
         assert_eq!(infos[0].name, format!("{PLUGIN_NAME}:api-rules"));
         assert_eq!(infos.len(), 3);
     }

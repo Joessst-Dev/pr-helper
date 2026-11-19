@@ -60,3 +60,5 @@ API tokens are stored only in the OS keychain (`secrets.rs`, macOS Keychain via 
 ## Reviewer isolation
 
 The PR checkout is untrusted. The runner must keep `--setting-sources user` (otherwise the PR's `.claude/settings.json` hooks execute; verified), `--strict-mcp-config`, and `--tools Read Grep Glob Skill`. The reviewer has no Bash and no write access. Review material (diff, commits, description) goes into a context dir passed with `--add-dir`.
+
+Everything from the PR is author-controlled, including the title, description, commits and diff. The system prompt treats it as data. Before auto-approving, `review/guard.rs` checks the PR text for reviewer-directed wording, and if it finds any it skips the auto-approval and asks the user to approve by hand. Never weaken that check without a replacement. Git runs with LFS smudging and hooks disabled (`repo_cache.rs`).

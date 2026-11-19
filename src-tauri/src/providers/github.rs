@@ -225,7 +225,8 @@ impl GitHub {
     fn comment_json(c: &super::InlineComment) -> Value {
         let mut body = c.body.clone();
         if let (Some(s), Side::Right) = (&c.suggestion, c.side) {
-            body.push_str(&format!("\n\n```suggestion\n{s}\n```"));
+            let fence = super::fence_for(s);
+            body.push_str(&format!("\n\n{fence}suggestion\n{s}\n{fence}"));
         }
         let side = if c.side == Side::Left {
             "LEFT"
@@ -369,6 +370,7 @@ query($q: String!, $cursor: String) {
                 .collect(),
             folded,
             review_url,
+            error: None,
         })
     }
 

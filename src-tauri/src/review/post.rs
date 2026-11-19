@@ -60,7 +60,10 @@ pub fn build_inline(
         let body = finalize_body(&f.proposed_comment, settings)
             .map_err(|e| AppError::invalid(format!("finding \"{}\": {e}", f.title)))?;
         if body.is_empty() {
-            continue;
+            return Err(AppError::invalid(format!(
+                "finding \"{}\" has no comment left after applying the comment rules; edit it or deselect it",
+                f.title
+            )));
         }
         let anchor_line = f.line_end.or(f.line_start);
         let anchor = match (&f.file, anchor_line) {
@@ -123,6 +126,12 @@ pub async fn post_findings(svc: &Arc<Service>, req: PostRequest) -> AppResult<Po
 
     let mut pr = provider.get_pr(&review.project_id, review.number).await?;
     let head_moved = pr.head_sha != review.head_sha;
+    if head_moved && req.mode == SubmitMode::Approve && server.kind == ProviderKind::Gitlab {
+        // GitLab approves the merge request as a whole, which now includes unreviewed commits.
+        return Err(AppError::invalid(
+            "new commits arrived after this review; run a new review before approving",
+        ));
+    }
 
     // Rebuild the diff index for the reviewed commit to validate anchors.
     let base = review
@@ -189,18 +198,27 @@ pub async fn post_findings(svc: &Arc<Service>, req: PostRequest) -> AppResult<Po
     }
     let submission = ReviewSubmission {
         event,
-        body: body_parts.join("\n\n"),
+        // The joined body goes through the rules too (fold headings are generated text).
+        body: finalize_body(&body_parts.join("\n\n"), &settings)?,
         inline,
     };
-    // The joined body must also pass the rules (fold headings are generated text).
-    finalize_body(&submission.body, &settings)?;
 
     let result = provider.post_review(&pr, &submission).await?;
+    // Record whatever reached the server before reporting any failure, so a retry never
+    // posts the same comment twice.
     for (finding_id, posted_ref) in &result.posted {
         svc.db.mark_finding_posted(
             finding_id,
             posted_ref.as_deref().or(result.review_url.as_deref()),
         )?;
+    }
+    if let Some(error) = &result.error {
+        svc.publish_review(&review.id);
+        return Err(AppError::invalid(format!(
+            "posting stopped after {} of {} comment(s): {error}. Posted comments are marked; posting again sends only the rest.",
+            result.posted.len(),
+            findings.len()
+        )));
     }
     for id in &folded_ids {
         svc.db
@@ -212,7 +230,7 @@ pub async fn post_findings(svc: &Arc<Service>, req: PostRequest) -> AppResult<Po
     svc.publish_review(&review.id);
 
     Ok(PostOutcome {
-        posted: findings.len(),
+        posted: result.posted.len() + folded_ids.len(),
         folded: folded_ids.len() + result.folded.len(),
         review_url: result.review_url,
         head_moved,

@@ -107,21 +107,30 @@ impl Service {
         if input.name.trim().is_empty() || input.base_url.trim().is_empty() {
             return Err(AppError::invalid("name and URL are required"));
         }
+        let base_url = crate::db::normalize_base_url(&input.base_url);
         let new_token = input
             .token
             .as_deref()
             .map(str::trim)
             .filter(|t| !t.is_empty());
-        let token = match (new_token, id) {
+        let existing = id.map(|id| self.db.get_server(id)).transpose()?;
+        let token = match (new_token, &existing) {
             (Some(t), _) => t.to_string(),
-            (None, Some(existing)) => self.secrets.require(existing)?,
+            // A stored token is only reused for the host it was issued for; sending it to a
+            // newly typed URL would leak it to whatever that URL points at.
+            (None, Some(old)) if old.base_url != base_url || old.kind != input.kind => {
+                return Err(AppError::invalid(
+                    "enter the access token again when changing the server URL or type",
+                ));
+            }
+            (None, Some(old)) => self.secrets.require(&old.id)?,
             (None, None) => return Err(AppError::invalid("an access token is required")),
         };
         let probe = Server {
             id: id.unwrap_or_default().to_string(),
             kind: input.kind,
             name: input.name.clone(),
-            base_url: crate::db::normalize_base_url(&input.base_url),
+            base_url,
             username: None,
             pr_scope: input.pr_scope.clone(),
             settings: SettingsOverrides::default(),
@@ -131,19 +140,38 @@ impl Service {
             .current_user()
             .await?;
 
-        let server = match id {
-            Some(existing) => self.db.update_server(existing, input)?,
-            None => self.db.insert_server(input)?,
-        };
-        if new_token.is_some()
-            && let Err(e) = self.secrets.set(&server.id, &token)
-        {
-            // Never keep a server whose token could not be stored securely.
-            if id.is_none() {
-                let _ = self.db.delete_server(&server.id);
+        let server = match &existing {
+            Some(old) => {
+                // Token before row: a failed keychain write must not leave the new URL paired
+                // with the old token.
+                let previous_token = match new_token {
+                    Some(t) => {
+                        let previous = self.secrets.get(&old.id)?;
+                        self.secrets.set(&old.id, t)?;
+                        previous
+                    }
+                    None => None,
+                };
+                match self.db.update_server(&old.id, input) {
+                    Ok(server) => server,
+                    Err(e) => {
+                        if let Some(previous) = previous_token {
+                            let _ = self.secrets.set(&old.id, &previous);
+                        }
+                        return Err(e);
+                    }
+                }
             }
-            return Err(e);
-        }
+            None => {
+                let server = self.db.insert_server(input)?;
+                if let Err(e) = self.secrets.set(&server.id, &token) {
+                    // Never keep a server whose token could not be stored securely.
+                    let _ = self.db.delete_server(&server.id);
+                    return Err(e);
+                }
+                server
+            }
+        };
         self.db.set_server_username(&server.id, &username)?;
         self.db.get_server(&server.id)
     }

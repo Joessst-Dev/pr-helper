@@ -44,10 +44,21 @@ impl RepoCache {
     }
 
     pub fn bare_path(&self, server_id: &str, repo: &str) -> PathBuf {
+        // The hash keeps `group/sub_proj` and `group_sub/proj` apart after sanitizing.
         self.root
             .join("repos")
             .join(sanitize(server_id))
-            .join(format!("{}.git", sanitize(repo)))
+            .join(format!("{}-{:016x}.git", sanitize(repo), fnv1a(repo)))
+    }
+
+    /// Deletes every bare clone of a server (used when the server is removed).
+    pub fn remove_server(&self, server_id: &str) {
+        let dir = self.root.join("repos").join(sanitize(server_id));
+        if dir.exists()
+            && let Err(e) = std::fs::remove_dir_all(&dir)
+        {
+            tracing::warn!("could not remove {}: {e}", dir.display());
+        }
     }
 
     pub fn review_dir(&self, review_id: &str) -> PathBuf {
@@ -71,6 +82,14 @@ impl RepoCache {
             .env("GIT_ASKPASS", "")
             .env("SSH_ASKPASS", "")
             .env("LC_ALL", "C")
+            // PR checkouts are untrusted: never run LFS smudge filters (they fetch from a URL
+            // the PR's own .lfsconfig controls) or the user's global hooks on them.
+            .env("GIT_LFS_SKIP_SMUDGE", "1")
+            .args(["-c", "core.hooksPath=/dev/null"])
+            .args(["-c", "core.quotePath=false"])
+            .args(["-c", "diff.noprefix=false"])
+            .args(["-c", "diff.mnemonicPrefix=false"])
+            .args(["-c", "diff.relative=false"])
             .kill_on_drop(true);
         if let Some(h) = auth_header {
             c.env("GIT_CONFIG_COUNT", "1")
@@ -123,16 +142,20 @@ impl RepoCache {
             tokio::fs::create_dir_all(&bare).await?;
             self.run(Some(&bare), &["init", "--bare", "--quiet"], None)
                 .await?;
+        }
+        // `set-url` fails when an earlier run died between `init` and `remote add`.
+        if self
+            .run(
+                Some(&bare),
+                &["remote", "set-url", "origin", spec.clone_url],
+                None,
+            )
+            .await
+            .is_err()
+        {
             self.run(
                 Some(&bare),
                 &["remote", "add", "origin", spec.clone_url],
-                None,
-            )
-            .await?;
-        } else {
-            self.run(
-                Some(&bare),
-                &["remote", "set-url", "origin", spec.clone_url],
                 None,
             )
             .await?;
@@ -206,6 +229,8 @@ impl RepoCache {
             &[
                 "diff",
                 "--no-color",
+                "--src-prefix=a/",
+                "--dst-prefix=b/",
                 "--no-ext-diff",
                 "--no-textconv",
                 "-U3",
@@ -224,6 +249,8 @@ impl RepoCache {
             &[
                 "diff",
                 "--no-color",
+                "--src-prefix=a/",
+                "--dst-prefix=b/",
                 "--no-ext-diff",
                 "--no-textconv",
                 "-U3",
@@ -283,6 +310,13 @@ impl RepoCache {
         let _ = self.run(Some(bare), &["worktree", "prune"], None).await;
         Ok(())
     }
+}
+
+/// Stable 64-bit FNV-1a hash (std's hasher is not guaranteed stable across releases).
+fn fnv1a(s: &str) -> u64 {
+    s.bytes().fold(0xcbf2_9ce4_8422_2325, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    })
 }
 
 /// Filesystem-safe name that keeps nested group paths readable.

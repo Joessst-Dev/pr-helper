@@ -13,7 +13,7 @@ import type { Verdict } from "../lib/bindings/Verdict";
 import { useReviewProgress } from "../lib/events";
 import { formatCost, relativeTime, SEVERITIES, SEVERITY_LABEL, shortSha } from "../lib/format";
 import { ReviewStatusBadge, VerdictBadge } from "../components/badges";
-import { FindingCard } from "../components/FindingCard";
+import { FindingCard, RulesWarning, useCommentCheck } from "../components/FindingCard";
 import { Badge, Button, Card, EmptyState, ErrorBanner, PageHeader, Select, Spinner, TextArea } from "../components/ui";
 
 export function ReviewPage() {
@@ -28,7 +28,12 @@ export function ReviewPage() {
     enabled: !!review,
   });
 
-  const cancel = useMutation({ mutationFn: () => api.cancelReview(reviewId) });
+  const cancel = useMutation({
+    mutationFn: async () => {
+      if (!(await api.cancelReview(reviewId))) throw new Error("The review is no longer running.");
+    },
+    onSettled: () => qc.invalidateQueries({ queryKey: ["review", reviewId] }),
+  });
 
   if (detail.isLoading) {
     return (
@@ -88,7 +93,8 @@ export function ReviewPage() {
       <div className="grid grid-cols-[minmax(0,1fr)_240px] gap-6 px-6 py-5">
         <div className="min-w-0 space-y-4">
           {review.status === "failed" && <ErrorBanner error={review.error ?? "The review failed"} />}
-          {(running || review.status !== "done") && <ProgressLog reviewId={reviewId} initial={detail.data.log} live={running} />}
+          {cancel.error && <ErrorBanner error={errorMessage(cancel.error)} />}
+          {review.status !== "done" && <ProgressLog key={reviewId} reviewId={reviewId} initial={detail.data.log} live={running} />}
           {review.status === "done" && (
             <ReviewResults
               key={review.id}
@@ -213,11 +219,25 @@ export function ReviewResults({
 
   const check = useCallback((text: string) => api.checkCommentText(serverId, repo, text), [serverId, repo]);
 
+  // Edits are saved in the background; posting waits for them so it never sends stale text.
+  const pendingSaves = useRef(new Map<string, Promise<void>>());
+  const [saveErrors, setSaveErrors] = useState<Record<string, string>>({});
+
   const update = (id: string, patch: Partial<Finding>) => {
     setFindings((fs) => fs.map((f) => (f.id === id ? { ...f, ...patch } : f)));
     const f = findings.find((x) => x.id === id)!;
     const next = { ...f, ...patch };
-    api.updateFinding(id, next.selected, next.proposedComment).catch(() => {});
+    const save = api
+      .updateFinding(id, next.selected, next.proposedComment)
+      .then(() => setSaveErrors(({ [id]: _, ...rest }) => rest))
+      .catch((e) => {
+        setSaveErrors((errs) => ({ ...errs, [id]: errorMessage(e) }));
+        throw e;
+      })
+      .finally(() => {
+        if (pendingSaves.current.get(id) === save) pendingSaves.current.delete(id);
+      });
+    pendingSaves.current.set(id, save);
   };
 
   const counts = useMemo(() => {
@@ -227,17 +247,31 @@ export function ReviewResults({
   }, [findings]);
 
   const selectable = findings.filter((f) => !f.postedAt);
-  const selected = selectable.filter((f) => f.selected);
+  // Only what is on screen gets posted: hiding a severity also leaves it out of the post.
+  const selected = selectable.filter((f) => f.selected && !hidden.has(f.severity));
+  const hiddenSelected = selectable.filter((f) => f.selected && hidden.has(f.severity)).length;
+  const summaryCheck = useCommentCheck(summary, check);
 
   const post = useMutation({
-    mutationFn: () =>
-      api.postFindings({
+    mutationFn: async () => {
+      const results = await Promise.allSettled(pendingSaves.current.values());
+      if (results.some((r) => r.status === "rejected")) {
+        throw new Error("Some edits could not be saved. Fix them before posting.");
+      }
+      return api.postFindings({
         reviewId,
         findingIds: selected.map((f) => f.id),
         mode,
         summary: includeSummary ? summary : null,
-      }),
-    onSuccess: onChanged,
+      });
+    },
+    onSuccess: () => {
+      // The summary (and any approval) went out with this post; don't send it twice.
+      setIncludeSummary(false);
+      setMode("comment");
+      onChanged();
+    },
+    onError: onChanged,
   });
 
   const setAll = (value: boolean) => {
@@ -255,6 +289,7 @@ export function ReviewResults({
           <span className="ml-auto text-xs text-muted">{findings.length} finding(s)</span>
         </div>
         <TextArea aria-label="Review summary" rows={3} value={summary} onChange={(e) => setSummary(e.target.value)} />
+        <RulesWarning text={summary} result={summaryCheck} />
         <label className="mt-2 flex items-center gap-2 text-xs text-muted">
           <input
             type="checkbox"
@@ -275,6 +310,7 @@ export function ReviewResults({
               <button
                 key={s}
                 type="button"
+                aria-pressed={!hidden.has(s)}
                 onClick={() =>
                   setHidden((h) => {
                     const n = new Set(h);
@@ -311,6 +347,7 @@ export function ReviewResults({
                   check={check}
                   onToggle={(selected) => update(f.id, { selected })}
                   onEdit={(proposedComment) => update(f.id, { proposedComment })}
+                  saveError={saveErrors[f.id]}
                 />
               ))}
           </div>
@@ -320,6 +357,7 @@ export function ReviewResults({
       <div className="sticky bottom-0 -mx-1 flex items-center gap-3 rounded-lg border border-line bg-panel/95 px-4 py-3 shadow-sm backdrop-blur">
         <span className="text-[13px]">
           <strong>{selected.length}</strong> of {selectable.length} selected
+          {hiddenSelected > 0 && <span className="text-muted"> ({hiddenSelected} hidden, not posted)</span>}
         </span>
         {post.data && (
           <span className="text-xs text-ok">

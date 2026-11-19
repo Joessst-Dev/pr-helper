@@ -83,14 +83,20 @@ impl DiffIndex {
             };
 
             if !in_hunk || raw.starts_with("@@") {
+                // `/dev/null` marks an added or deleted file: keep the header's path for that
+                // side, since GitHub and GitLab both expect the file's real path there.
                 if let Some(p) = raw.strip_prefix("--- ") {
-                    file.old_path = strip_prefix_path(p, "a/").unwrap_or_default();
+                    if let Some(p) = strip_prefix_path(p, "a/") {
+                        file.old_path = p;
+                    }
                 } else if let Some(p) = raw.strip_prefix("+++ ") {
-                    file.new_path = strip_prefix_path(p, "b/").unwrap_or_default();
+                    if let Some(p) = strip_prefix_path(p, "b/") {
+                        file.new_path = p;
+                    }
                 } else if let Some(p) = raw.strip_prefix("rename from ") {
-                    file.old_path = p.to_string();
+                    file.old_path = unquote(p);
                 } else if let Some(p) = raw.strip_prefix("rename to ") {
-                    file.new_path = p.to_string();
+                    file.new_path = unquote(p);
                 } else if raw.starts_with("@@")
                     && let Some((o, n)) = parse_hunk_header(raw)
                 {
@@ -215,8 +221,50 @@ fn strip_prefix_path(p: &str, prefix: &str) -> Option<String> {
     if p == "/dev/null" {
         return None;
     }
-    let p = p.trim_matches('"');
-    Some(p.strip_prefix(prefix).unwrap_or(p).to_string())
+    let p = unquote(p);
+    Some(p.strip_prefix(prefix).unwrap_or(&p).to_string())
+}
+
+/// Undoes git's C-style path quoting (`"caf\303\251.rs"`, `"a\tb"`), which it applies to
+/// paths with control characters, quotes or backslashes (and non-ASCII unless
+/// `core.quotePath=false`).
+fn unquote(p: &str) -> String {
+    let Some(inner) = p.strip_prefix('"').and_then(|rest| rest.strip_suffix('"')) else {
+        return p.to_string();
+    };
+    let bytes = inner.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'\\' || i + 1 >= bytes.len() {
+            out.push(bytes[i]);
+            i += 1;
+            continue;
+        }
+        let next = bytes[i + 1];
+        let octal = bytes
+            .get(i + 1..i + 4)
+            .filter(|d| d.iter().all(|b| (b'0'..=b'7').contains(b)));
+        if let Some(d) = octal {
+            let value =
+                u32::from(d[0] - b'0') * 64 + u32::from(d[1] - b'0') * 8 + u32::from(d[2] - b'0');
+            out.push(value as u8);
+            i += 4;
+            continue;
+        }
+        out.push(match next {
+            b'n' => b'\n',
+            b't' => b'\t',
+            b'r' => b'\r',
+            b'a' => 0x07,
+            b'b' => 0x08,
+            b'f' => 0x0c,
+            b'v' => 0x0b,
+            other => other,
+        });
+        i += 2;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// `a/foo b/foo` -> (foo, foo). Paths with spaces are ambiguous here, but the `---`/`+++`
@@ -334,5 +382,30 @@ deleted file mode 100644
         );
         assert_eq!(parse_hunk_header("@@ -3 +3 @@"), Some((3, 3)));
         assert_eq!(parse_hunk_header("@@ garbage"), None);
+    }
+
+    #[test]
+    fn added_and_deleted_files_keep_their_path_on_both_sides() {
+        let diff = "diff --git a/gone.txt b/gone.txt\ndeleted file mode 100644\n--- a/gone.txt\n+++ /dev/null\n@@ -1,2 +0,0 @@\n-one\n-two\ndiff --git a/new.txt b/new.txt\nnew file mode 100644\n--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1 @@\n+hello\n";
+        let idx = DiffIndex::parse(diff);
+        let gone = idx.file("gone.txt").expect("deleted file indexed");
+        assert_eq!(
+            (gone.old_path.as_str(), gone.new_path.as_str()),
+            ("gone.txt", "gone.txt")
+        );
+        let new = idx.file("new.txt").expect("added file indexed");
+        assert_eq!(
+            (new.old_path.as_str(), new.new_path.as_str()),
+            ("new.txt", "new.txt")
+        );
+    }
+
+    #[test]
+    fn quoted_paths_are_unescaped() {
+        assert_eq!(unquote("\"a/caf\\303\\251.rs\""), "a/café.rs");
+        assert_eq!(unquote("\"tab\\there \\\"q\\\"\""), "tab\there \"q\"");
+        assert_eq!(unquote("plain.rs"), "plain.rs");
+        let diff = "diff --git \"a/caf\\303\\251.rs\" \"b/caf\\303\\251.rs\"\n--- \"a/caf\\303\\251.rs\"\n+++ \"b/caf\\303\\251.rs\"\n@@ -1 +1 @@\n-a\n+b\n";
+        assert!(DiffIndex::parse(diff).file("café.rs").is_some());
     }
 }

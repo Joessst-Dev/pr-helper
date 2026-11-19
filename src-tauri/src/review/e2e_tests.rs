@@ -53,6 +53,7 @@ impl GitProvider for FakeProvider {
                 .collect(),
             folded: vec![],
             review_url: Some("https://forge/review/1".into()),
+            error: None,
         })
     }
     async fn approve(&self, _pr: &PullRequest, body: &str) -> AppResult<()> {
@@ -571,4 +572,62 @@ async fn a_failed_keychain_write_does_not_leave_a_server_behind() {
         .unwrap_err();
     assert!(err.to_string().contains("keychain is locked"));
     assert!(db.list_servers().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_stored_token_is_never_sent_to_a_changed_url() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Arc::new(Db::open_in_memory().unwrap());
+    let secrets = Arc::new(MemoryStore::default());
+    let svc = service_with(db.clone(), secrets.clone(), tmp.path().join("cache"));
+    let server = svc
+        .save_server(None, &gitlab_input(Some("glpat-x")))
+        .await
+        .unwrap();
+
+    let mut moved = gitlab_input(None);
+    moved.base_url = "https://attacker.example".into();
+    let err = svc.save_server(Some(&server.id), &moved).await.unwrap_err();
+    assert!(
+        err.to_string().contains("enter the access token again"),
+        "{err}"
+    );
+    assert_eq!(
+        db.get_server(&server.id).unwrap().base_url,
+        "https://gitlab.corp"
+    );
+}
+
+/// Has a token but refuses to store a new one.
+struct ReadOnlyKeychain;
+
+impl SecretStore for ReadOnlyKeychain {
+    fn get(&self, _id: &str) -> AppResult<Option<String>> {
+        Ok(Some("old-token".into()))
+    }
+    fn set(&self, _id: &str, _token: &str) -> AppResult<()> {
+        Err(crate::error::AppError::Secret("keychain is locked".into()))
+    }
+    fn delete(&self, _id: &str) -> AppResult<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_failed_keychain_write_on_edit_keeps_the_old_url() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Arc::new(Db::open_in_memory().unwrap());
+    let server = db.insert_server(&gitlab_input(None)).unwrap();
+    let svc = service_with(
+        db.clone(),
+        Arc::new(ReadOnlyKeychain),
+        tmp.path().join("cache"),
+    );
+    let mut moved = gitlab_input(Some("new-token"));
+    moved.base_url = "https://elsewhere.example".into();
+    assert!(svc.save_server(Some(&server.id), &moved).await.is_err());
+    assert_eq!(
+        db.get_server(&server.id).unwrap().base_url,
+        "https://gitlab.corp"
+    );
 }

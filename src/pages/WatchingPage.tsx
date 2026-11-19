@@ -5,7 +5,7 @@ import { api, errorMessage } from "../lib/api";
 import type { TrackedPr } from "../lib/bindings/TrackedPr";
 import { relativeTime, shortSha } from "../lib/format";
 import { ReviewStatusBadge, VerdictBadge } from "../components/badges";
-import { Badge, Button, Card, EmptyState, PageHeader } from "../components/ui";
+import { Badge, Button, Card, EmptyState, ErrorBanner, PageHeader, Spinner } from "../components/ui";
 
 function TrackedRow({ t }: { t: TrackedPr }) {
   const qc = useQueryClient();
@@ -38,7 +38,7 @@ function TrackedRow({ t }: { t: TrackedPr }) {
       <Button size="sm" variant={t.hasNewChanges ? "primary" : "secondary"} busy={review.isPending} onClick={() => review.mutate()}>
         <Play className="size-3" /> Review again
       </Button>
-      <Button size="sm" variant="ghost" title="Stop watching" busy={untrack.isPending} onClick={() => untrack.mutate()}>
+      <Button size="sm" variant="ghost" title="Stop watching" aria-label="Stop watching" busy={untrack.isPending} onClick={() => untrack.mutate()}>
         <EyeOff className="size-3.5" />
       </Button>
     </div>
@@ -57,7 +57,11 @@ export function WatchingPage() {
         subtitle="Open PRs you've reviewed. They're polled for new commits; auto-review and auto-approve follow your settings."
       />
       <div className="space-y-6 px-6 py-5">
-        {sorted.length === 0 ? (
+        {tracked.error ? (
+          <ErrorBanner error={errorMessage(tracked.error)} />
+        ) : tracked.isLoading ? (
+          <Spinner className="m-2" />
+        ) : sorted.length === 0 ? (
           <EmptyState icon={<Bell className="size-8" />} title="Nothing watched yet">
             Review a pull request and it shows up here.
           </EmptyState>

@@ -27,7 +27,6 @@ pub fn decide(
     state: PrState,
     head_sha: &str,
     auto_review_enabled: bool,
-    review_active: bool,
 ) -> Decision {
     if state != PrState::Open {
         return Decision {
@@ -45,7 +44,6 @@ pub fn decide(
         notify_new_changes: unreviewed,
         auto_review: unreviewed
             && auto_review_enabled
-            && !review_active
             && tracked.last_verdict != Some(Verdict::Approve),
     }
 }
@@ -111,42 +109,56 @@ async fn tick(
             }
         };
 
-        let active = svc.queue.is_active(&t.server_id, &t.repo, t.number);
+        // A review still running for an older head is superseded by the queue.
         let d = decide(
             &t,
             fresh.state,
             &fresh.head_sha,
             settings.auto_review_on_new_commits.value,
-            active,
         );
         if d.deactivate {
-            let _ = svc
+            if let Err(e) = svc
                 .db
-                .set_tracked_active(&t.server_id, &t.repo, t.number, false);
+                .set_tracked_active(&t.server_id, &t.repo, t.number, false)
+            {
+                tracing::warn!("deactivating {}#{} failed: {e}", t.repo, t.number);
+            }
             changed = true;
         }
-        if let Some((head, new_changes)) = &d.update_head {
-            let _ = svc
-                .db
-                .set_tracked_head(&t.server_id, &t.repo, t.number, head, *new_changes);
-            changed = true;
-        }
+        let title = format!("New changes on {}#{}", t.repo, t.number);
         if d.auto_review {
             match queue::enqueue(svc, fresh.clone(), ReviewTrigger::Auto) {
                 Ok(_) => svc.sink.notify(
-                    &format!("New changes on {}#{}", t.repo, t.number),
+                    &title,
                     &format!("\"{}\" changed. An auto-review has started.", fresh.title),
                 ),
-                Err(e) => tracing::warn!("auto-review enqueue failed: {e}"),
+                Err(e) => {
+                    // Leave the stored head alone so the next poll tries again.
+                    tracing::warn!(
+                        "auto-review of {}#{} failed to queue: {e}",
+                        t.repo,
+                        t.number
+                    );
+                    continue;
+                }
             }
         } else if d.notify_new_changes {
             svc.sink.notify(
-                &format!("New changes on {}#{}", t.repo, t.number),
+                &title,
                 &format!(
                     "\"{}\" has new commits since your last review.",
                     fresh.title
                 ),
             );
+        }
+        if let Some((head, new_changes)) = &d.update_head {
+            if let Err(e) =
+                svc.db
+                    .set_tracked_head(&t.server_id, &t.repo, t.number, head, *new_changes)
+            {
+                tracing::warn!("updating {}#{} failed: {e}", t.repo, t.number);
+            }
+            changed = true;
         }
     }
     if changed {
@@ -179,45 +191,47 @@ mod tests {
     #[test]
     fn no_change_means_no_action() {
         let t = tracked("a", Some("a"), Some(Verdict::RequestChanges));
-        assert_eq!(
-            decide(&t, PrState::Open, "a", true, false),
-            Decision::default()
-        );
+        assert_eq!(decide(&t, PrState::Open, "a", true), Decision::default());
     }
 
     #[test]
     fn new_commits_alert_and_auto_review_when_not_approved() {
         let t = tracked("a", Some("a"), Some(Verdict::RequestChanges));
-        let d = decide(&t, PrState::Open, "b", true, false);
+        let d = decide(&t, PrState::Open, "b", true);
         assert_eq!(d.update_head, Some(("b".into(), true)));
         assert!(d.notify_new_changes && d.auto_review);
 
-        let d = decide(&t, PrState::Open, "b", false, false);
+        let d = decide(&t, PrState::Open, "b", false);
         assert!(d.notify_new_changes && !d.auto_review);
     }
 
     #[test]
-    fn no_auto_review_after_approve_or_while_running() {
+    fn no_auto_review_after_approve() {
         let approved = tracked("a", Some("a"), Some(Verdict::Approve));
-        let d = decide(&approved, PrState::Open, "b", true, false);
+        let d = decide(&approved, PrState::Open, "b", true);
         assert!(d.notify_new_changes && !d.auto_review);
+    }
 
-        let t = tracked("a", Some("a"), Some(Verdict::Comment));
-        assert!(!decide(&t, PrState::Open, "b", true, true).auto_review);
+    #[test]
+    fn new_commits_during_a_running_review_still_auto_review() {
+        // The queue supersedes the running review of the older head.
+        let t = tracked("a", None, None);
+        let d = decide(&t, PrState::Open, "b", true);
+        assert!(d.auto_review);
     }
 
     #[test]
     fn closed_or_merged_prs_are_deactivated() {
         let t = tracked("a", Some("a"), None);
-        assert!(decide(&t, PrState::Merged, "a", true, false).deactivate);
-        assert!(decide(&t, PrState::Closed, "z", true, false).deactivate);
+        assert!(decide(&t, PrState::Merged, "a", true).deactivate);
+        assert!(decide(&t, PrState::Closed, "z", true).deactivate);
     }
 
     #[test]
     fn head_matching_last_review_is_not_new() {
         // E.g. a force-push back to the reviewed commit.
         let t = tracked("x", Some("a"), Some(Verdict::Comment));
-        let d = decide(&t, PrState::Open, "a", true, false);
+        let d = decide(&t, PrState::Open, "a", true);
         assert_eq!(d.update_head, Some(("a".into(), false)));
         assert!(!d.notify_new_changes && !d.auto_review);
     }

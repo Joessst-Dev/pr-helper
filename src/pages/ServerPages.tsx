@@ -24,7 +24,7 @@ const TOKEN_HINT: Record<ProviderKind, string> = {
 
 const SCOPE_HINT: Record<ProviderKind, string> = {
   github: "Search qualifiers limiting \"All visible\", e.g. org:acme repo:acme/app. Empty = your account and all your orgs.",
-  gitlab: "Comma separated group paths limiting \"All visible\", e.g. platform, team/backend. Empty = everything you can see.",
+  gitlab: "Comma separated group paths for \"All visible\", e.g. platform, team/backend. Required for that filter.",
 };
 
 function ConnectionForm({ server, onSaved }: { server?: Server; onSaved: (s: Server) => void }) {
@@ -119,6 +119,11 @@ type Tab = "connection" | "review" | "repos" | "skills";
 
 export function ServerSettingsPage() {
   const { serverId = "" } = useParams();
+  // Keyed so switching servers starts from fresh form state instead of the previous server's.
+  return <ServerSettings key={serverId} serverId={serverId} />;
+}
+
+function ServerSettings({ serverId }: { serverId: string }) {
   const navigate = useNavigate();
   const qc = useQueryClient();
   const [tab, setTab] = useState<Tab>("review");
@@ -128,7 +133,10 @@ export function ServerSettingsPage() {
   const remove = useMutation({
     mutationFn: () => api.deleteServer(serverId),
     onSuccess: () => {
+      // Drop it from the cache before navigating, so Home can't redirect back to it.
+      qc.setQueryData<Server[]>(["servers"], (list) => list?.filter((s) => s.id !== serverId));
       qc.invalidateQueries({ queryKey: ["servers"] });
+      qc.invalidateQueries({ queryKey: ["tracked"] });
       navigate("/");
     },
   });
@@ -153,6 +161,11 @@ export function ServerSettingsPage() {
           </Button>
         }
       />
+      {remove.error && (
+        <div className="px-6 pt-3">
+          <ErrorBanner error={errorMessage(remove.error)} />
+        </div>
+      )}
       <div className="px-6 py-4">
         <Segmented
           value={tab}
@@ -196,7 +209,11 @@ function ServerReviewSettings({ server }: { server: Server }) {
   });
   const save = useMutation({
     mutationFn: () => api.saveServerSettings(server.id, value),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["servers"] }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["servers"] });
+      // Repository overrides show these values as "inherited".
+      qc.invalidateQueries({ queryKey: ["inherited", server.id] });
+    },
   });
   return (
     <Card className="max-w-3xl px-5 py-2">
@@ -231,6 +248,11 @@ function RepoOverrides({ serverId }: { serverId: string }) {
     },
   });
 
+  const clear = useMutation({
+    mutationFn: (repo: string) => api.saveRepoSettings(serverId, repo, EMPTY_OVERRIDES),
+    onSettled: () => qc.invalidateQueries({ queryKey: ["repo-settings", serverId] }),
+  });
+
   const edit = (repo: string, settings: SettingsOverrides) => {
     setEditing(repo);
     setValue(settings);
@@ -254,6 +276,7 @@ function RepoOverrides({ serverId }: { serverId: string }) {
         </Button>
       </div>
 
+      {clear.error && <ErrorBanner error={errorMessage(clear.error)} />}
       {list.data?.map((r) => (
         <Card key={r.repo} className="flex items-center justify-between px-4 py-2.5">
           <span className="font-mono text-[13px]">{r.repo}</span>
@@ -264,11 +287,12 @@ function RepoOverrides({ serverId }: { serverId: string }) {
             <Button
               size="sm"
               variant="ghost"
-              onClick={() =>
-                api
-                  .saveRepoSettings(serverId, r.repo, EMPTY_OVERRIDES)
-                  .then(() => qc.invalidateQueries({ queryKey: ["repo-settings", serverId] }))
-              }
+              aria-label={`Remove the override for ${r.repo}`}
+              title="Remove override"
+              busy={clear.isPending && clear.variables === r.repo}
+              onClick={() => {
+                if (confirm(`Remove the overrides for ${r.repo}?`)) clear.mutate(r.repo);
+              }}
             >
               <Trash2 className="size-3.5" />
             </Button>
@@ -318,10 +342,11 @@ function SkillsEditor({ serverId }: { serverId: string }) {
     },
   });
 
-  const toggle = (s: Skill) =>
-    api
-      .saveSkill(s.id, { ...s, enabled: !s.enabled })
-      .then(() => qc.invalidateQueries({ queryKey: ["skills", serverId] }));
+  const change = useMutation({
+    mutationFn: (fn: () => Promise<unknown>) => fn(),
+    onSettled: () => qc.invalidateQueries({ queryKey: ["skills", serverId] }),
+  });
+  const toggle = (s: Skill) => change.mutate(() => api.saveSkill(s.id, { ...s, enabled: !s.enabled }));
 
   const pickFolder = async () => {
     const dir = await openDialog({ directory: true, title: "Choose a folder containing SKILL.md" });
@@ -345,6 +370,7 @@ function SkillsEditor({ serverId }: { serverId: string }) {
         <Plus className="size-3.5" /> Add skill
       </Button>
 
+      {change.error && <ErrorBanner error={errorMessage(change.error)} />}
       {skills.data?.map((s) => (
         <Card key={s.id} className="flex items-center gap-3 px-4 py-2.5">
           <input
@@ -381,7 +407,11 @@ function SkillsEditor({ serverId }: { serverId: string }) {
           <Button
             size="sm"
             variant="ghost"
-            onClick={() => api.deleteSkill(s.id).then(() => qc.invalidateQueries({ queryKey: ["skills", serverId] }))}
+            aria-label={`Delete skill ${s.name}`}
+            title="Delete skill"
+            onClick={() => {
+              if (confirm(`Delete the skill ${s.name}?`)) change.mutate(() => api.deleteSkill(s.id));
+            }}
           >
             <Trash2 className="size-3.5" />
           </Button>

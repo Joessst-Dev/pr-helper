@@ -11,6 +11,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::{AppError, AppResult};
 
+/// How long the CLI may take to exit after its final result line.
+const EXIT_GRACE: Duration = Duration::from_secs(10);
+
 /// Built-in tools the reviewer gets. No Bash, no writes, no network.
 pub const REVIEWER_TOOLS: &[&str] = &["Read", "Grep", "Glob", "Skill"];
 
@@ -240,8 +243,11 @@ pub async fn run(
             for e in events {
                 on_event(e);
             }
+            // The result is the last thing that matters; don't let a CLI that lingers after
+            // it turn a finished review into a timeout.
             if res.is_some() {
                 result = res;
+                break;
             }
         }
         Ok::<_, std::io::Error>(result)
@@ -263,8 +269,18 @@ pub async fn run(
         }
     };
 
-    let status = child.wait().await?;
-    let stderr_tail = stderr_task.await.unwrap_or_default();
+    let status = match tokio::time::timeout(EXIT_GRACE, child.wait()).await {
+        Ok(status) => status?,
+        Err(_) => {
+            let _ = child.kill().await;
+            child.wait().await?
+        }
+    };
+    let stderr_tail = tokio::time::timeout(EXIT_GRACE, stderr_task)
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default();
     match result {
         Some(v) => parse_result(&v),
         None => Err(AppError::Reviewer(format!(

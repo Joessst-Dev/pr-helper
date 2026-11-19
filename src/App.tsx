@@ -48,6 +48,7 @@ function Layout() {
               <NavLink
                 to={`/servers/${s.id}/edit`}
                 title="Server settings"
+                aria-label="Server settings"
                 className="absolute top-1.5 right-1.5 hidden rounded p-1 text-muted group-hover:block hover:bg-panel hover:text-fg"
               >
                 <SlidersHorizontal className="size-3.5" />

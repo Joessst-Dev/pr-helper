@@ -46,7 +46,11 @@ export function SettingsPage() {
   });
   const saveGlobal = useMutation({
     mutationFn: () => api.saveGlobalSettings(overrides),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["global-settings"] }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["global-settings"] });
+      // Server and repository forms show these values as "inherited".
+      qc.invalidateQueries({ queryKey: ["inherited"] });
+    },
   });
 
   return (

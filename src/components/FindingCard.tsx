@@ -28,6 +28,26 @@ export function useCommentCheck(text: string, check: CheckFn, delay = 300) {
   return result;
 }
 
+/** Live warning about text that breaks the comment rules and will be rewritten on posting. */
+export function RulesWarning({ text, result }: { text: string; result: CommentCheck | null }) {
+  if (!result) return null;
+  const problems = [...result.dashViolations, ...result.attributionViolations];
+  if (problems.length > 0) {
+    return (
+      <div className="mt-1.5 flex items-start gap-1.5 text-xs text-warn">
+        <TriangleAlert className="mt-0.5 size-3.5 shrink-0" />
+        <span>
+          Breaks the comment rules ({problems.map((p) => `"${p}"`).join(", ")}). It will be rewritten before posting.
+        </span>
+      </div>
+    );
+  }
+  if (result.sanitized !== text.trim()) {
+    return <div className="mt-1.5 text-xs text-muted">Formatting will be normalized before posting.</div>;
+  }
+  return null;
+}
+
 function DiffExcerpt({ excerpt }: { excerpt: string }) {
   return (
     <pre className="overflow-x-auto rounded-md border border-line bg-bg py-1 font-mono text-[12px] leading-5">
@@ -52,19 +72,20 @@ export function FindingCard({
   check,
   onToggle,
   onEdit,
+  saveError,
 }: {
   finding: Finding;
   check: CheckFn;
   onToggle: (selected: boolean) => void;
   onEdit: (text: string) => void;
+  /** Set when the last change to this finding could not be saved. */
+  saveError?: string;
 }) {
   const [text, setText] = useState(finding.proposedComment);
   const [open, setOpen] = useState(finding.severity !== "nit");
   const [showDiff, setShowDiff] = useState(false);
   const posted = !!finding.postedAt;
   const result = useCommentCheck(text, check);
-  const problems = result ? [...result.dashViolations, ...result.attributionViolations] : [];
-  const willChange = result && result.sanitized !== text.trim();
 
   useEffect(() => setText(finding.proposedComment), [finding.id, finding.proposedComment]);
 
@@ -97,6 +118,11 @@ export function FindingCard({
               </Badge>
             )}
           </div>
+          {saveError && (
+            <div role="alert" className="mt-1 pl-5 text-xs text-danger">
+              Not saved: {saveError}
+            </div>
+          )}
           <div className="mt-1 flex items-center gap-2 pl-5 font-mono text-xs text-muted">
             {location(finding.file, finding.lineStart, finding.lineEnd)}
             {finding.file && !finding.inDiff && (
@@ -109,6 +135,7 @@ export function FindingCard({
             type="button"
             className="rounded p-1 text-muted hover:text-fg"
             title="Open posted comment"
+            aria-label="Open posted comment"
             onClick={() => openUrl(finding.postedRef!)}
           >
             <ExternalLink className="size-3.5" />
@@ -143,18 +170,7 @@ export function FindingCard({
               onChange={(e) => setText(e.target.value)}
               onBlur={() => text !== finding.proposedComment && onEdit(text)}
             />
-            {problems.length > 0 && (
-              <div className="mt-1.5 flex items-start gap-1.5 text-xs text-warn">
-                <TriangleAlert className="mt-0.5 size-3.5 shrink-0" />
-                <span>
-                  Breaks the comment rules ({problems.map((p) => `"${p}"`).join(", ")}). It will be rewritten before
-                  posting.
-                </span>
-              </div>
-            )}
-            {willChange && problems.length === 0 && (
-              <div className="mt-1.5 text-xs text-muted">Formatting will be normalized before posting.</div>
-            )}
+            <RulesWarning text={text} result={result} />
           </div>
 
           {finding.suggestion && (

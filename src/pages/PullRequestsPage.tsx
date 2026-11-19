@@ -46,7 +46,7 @@ export function PullRequestsPage() {
         title={server?.name ?? "Pull requests"}
         subtitle={server && `${server.baseUrl}${server.username ? ` · signed in as ${server.username}` : ""}`}
         actions={
-          <Button onClick={() => prs.refetch()} busy={prs.isFetching} variant="ghost" title="Refresh">
+          <Button onClick={() => prs.refetch()} busy={prs.isFetching} variant="ghost" title="Refresh" aria-label="Refresh">
             <RefreshCw className="size-3.5" />
             Refresh
           </Button>
@@ -133,7 +133,7 @@ function PrRow({ item, serverId }: { item: PrListItem; serverId: string }) {
             <ReviewStatusBadge review={latestReview} />
           </Link>
         )}
-        <Button variant="ghost" size="sm" title="Open in browser" onClick={() => openUrl(pr.webUrl)}>
+        <Button variant="ghost" size="sm" title="Open in browser" aria-label="Open in browser" onClick={() => openUrl(pr.webUrl)}>
           <ExternalLink className="size-3.5" />
         </Button>
         <Button

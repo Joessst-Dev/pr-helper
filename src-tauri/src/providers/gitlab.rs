@@ -181,7 +181,8 @@ impl GitLab {
         let mut body = c.body.clone();
         if let (Some(s), Side::Right) = (&c.suggestion, c.side) {
             let above = c.start_line.map_or(0, |start| c.line.saturating_sub(start));
-            body.push_str(&format!("\n\n```suggestion:-{above}+0\n{s}\n```"));
+            let fence = super::fence_for(s);
+            body.push_str(&format!("\n\n{fence}suggestion:-{above}+0\n{s}\n{fence}"));
         }
         body
     }
@@ -213,10 +214,12 @@ impl GitProvider for GitLab {
                     raw.extend(self.paged(&path, &with(&[("scope", "all".into())])).await?);
                 }
             }
+            // Without a group, `scope=all` means every merge request the token can see, which
+            // on gitlab.com includes every public project.
             PrFilter::All => {
-                raw = self
-                    .paged("/merge_requests", &with(&[("scope", "all".into())]))
-                    .await?
+                return Err(AppError::invalid(
+                    "\"All visible\" needs a group scope on GitLab: list your groups (e.g. platform, team/backend) under Scope in the server's connection settings",
+                ));
             }
             PrFilter::ReviewRequested => {
                 raw = self
@@ -274,6 +277,7 @@ impl GitProvider for GitLab {
     async fn post_review(&self, pr: &PullRequest, sub: &ReviewSubmission) -> AppResult<PostResult> {
         let mut result = PostResult::default();
         let mut folded_text = Vec::new();
+        let mut folded_ids = Vec::new();
         for c in &sub.inline {
             let mut position = json!({
                 "position_type": "text",
@@ -289,29 +293,41 @@ impl GitProvider for GitLab {
             if let Some(o) = c.old_line {
                 position["old_line"] = json!(o);
             }
-            let resp = self
+            let sent = self
                 .req(
                     reqwest::Method::POST,
                     &format!("{}/discussions", Self::mr_path(pr)),
                 )
                 .json(&json!({ "body": Self::discussion_body(c), "position": position }))
                 .send()
-                .await?;
-            match check(NAME, resp).await {
+                .await;
+            let checked = match sent {
+                Ok(resp) => check(NAME, resp).await,
+                Err(e) => Err(e.into()),
+            };
+            match checked {
                 Ok(resp) => {
-                    let v: Value = resp.json().await.unwrap_or_default();
-                    let note_ref = v["notes"][0]["id"]
-                        .as_u64()
-                        .map(|id| format!("{}#note_{id}", pr.web_url));
+                    let note_ref = match resp.json::<Value>().await {
+                        Ok(v) => v["notes"][0]["id"]
+                            .as_u64()
+                            .map(|id| format!("{}#note_{id}", pr.web_url)),
+                        Err(e) => {
+                            tracing::warn!("unreadable GitLab discussion response: {e}");
+                            None
+                        }
+                    };
                     result.posted.push((c.finding_id.clone(), note_ref));
                 }
                 // A position GitLab can't resolve: keep the comment, attach it to the summary.
                 Err(AppError::Api { status: 400, .. }) => {
                     folded_text.push(fold_comment(c, ""));
-                    result.folded.push(c.finding_id.clone());
-                    result.posted.push((c.finding_id.clone(), None));
+                    folded_ids.push(c.finding_id.clone());
                 }
-                Err(e) => return Err(e),
+                // Discussions already created stay in `result.posted`.
+                Err(e) => {
+                    result.error = Some(e.to_string());
+                    return Ok(result);
+                }
             }
         }
 
@@ -322,13 +338,26 @@ impl GitProvider for GitLab {
             }
             body.push_str(&f);
         }
-        if sub.event == ReviewEvent::Approve {
-            self.approve(pr, &body).await?;
+        let finished = if sub.event == ReviewEvent::Approve {
+            self.approve(pr, &body).await
         } else if !body.trim().is_empty() {
-            let note = self.note(pr, &body).await?;
-            result.review_url = note["id"]
-                .as_u64()
-                .map(|id| format!("{}#note_{id}", pr.web_url));
+            self.note(pr, &body).await.map(|note| {
+                result.review_url = note["id"]
+                    .as_u64()
+                    .map(|id| format!("{}#note_{id}", pr.web_url));
+            })
+        } else {
+            Ok(())
+        };
+        match finished {
+            Ok(()) => {
+                // Folded comments only exist once the summary note is posted.
+                for id in folded_ids {
+                    result.posted.push((id.clone(), None));
+                    result.folded.push(id);
+                }
+            }
+            Err(e) => result.error = Some(e.to_string()),
         }
         Ok(result)
     }

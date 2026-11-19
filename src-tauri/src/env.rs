@@ -8,6 +8,7 @@ use std::sync::OnceLock;
 use crate::error::{AppError, AppResult};
 
 static LOGIN_PATH: OnceLock<String> = OnceLock::new();
+const SHELL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// PATH from the user's login shell, merged with the current process PATH and common install dirs.
 pub fn login_path() -> &'static str {
@@ -42,12 +43,41 @@ fn shell_path() -> Option<String> {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
     // `-i` loads rc files where tools like nvm add themselves; the marker isolates PATH
     // from anything those files print.
-    let out = std::process::Command::new(shell)
+    let mut child = std::process::Command::new(shell)
         .args(["-ilc", "printf '__PRH__%s__PRH__' \"$PATH\""])
         .stdin(std::process::Stdio::null())
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
         .ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
+    // Drain stdout on a thread so chatty rc files can't fill the pipe and stall the shell.
+    let mut pipe = child.stdout.take()?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut pipe, &mut buf);
+        let _ = tx.send(buf);
+    });
+    // An rc file that blocks (`exec tmux`, a slow network call) must not hang the app:
+    // give up after a few seconds and fall back to the static PATH.
+    let deadline = std::time::Instant::now() + SHELL_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            _ => {
+                tracing::warn!("login shell did not report its PATH in time; using defaults");
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+    // A daemon started by an rc file can keep the pipe open after the shell exits.
+    let stdout = rx.recv_timeout(std::time::Duration::from_secs(1)).ok()?;
+    let text = String::from_utf8_lossy(&stdout);
     let start = text.find("__PRH__")? + 7;
     let end = text[start..].find("__PRH__")? + start;
     Some(text[start..end].to_string())

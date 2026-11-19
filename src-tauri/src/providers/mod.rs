@@ -58,6 +58,16 @@ pub struct PostResult {
     /// Inline comments the provider rejected; they were folded into the review body instead.
     pub folded: Vec<String>,
     pub review_url: Option<String>,
+    /// Set when posting stopped partway. Everything in `posted` did reach the server and must
+    /// be recorded, so a retry doesn't post it twice.
+    pub error: Option<String>,
+}
+
+/// A markdown code fence that `content` can't close early: one backtick longer than the
+/// longest backtick run inside it (minimum three).
+pub fn fence_for(content: &str) -> String {
+    let longest = content.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+    "`".repeat((longest + 1).max(3))
 }
 
 #[async_trait]
@@ -137,7 +147,8 @@ pub async fn check(
 pub fn fold_comment(c: &InlineComment, suggestion_fence: &str) -> String {
     let mut s = format!("**{}:{}**\n\n{}", c.path, c.line, c.body);
     if let Some(sugg) = &c.suggestion {
-        s.push_str(&format!("\n\n```{suggestion_fence}\n{sugg}\n```"));
+        let fence = fence_for(sugg);
+        s.push_str(&format!("\n\n{fence}{suggestion_fence}\n{sugg}\n{fence}"));
     }
     s
 }

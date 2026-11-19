@@ -26,12 +26,44 @@ const PH_CLOSE: char = '\u{E001}';
 
 static URL_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://[^\s<>()\[\]]+").unwrap());
 
-/// Apply `f` to every prose line. Fenced code blocks are skipped entirely; inline code spans and
+/// Which lines count as code (left alone) rather than prose.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CodeBlocks {
+    /// Only fenced blocks are code.
+    Fenced,
+    /// Fenced blocks plus markdown indented code blocks (4 spaces or a tab, after a blank line).
+    /// Used for the dash rule, where rewriting code would change commands; not for attribution,
+    /// which must not get an indentation loophole.
+    FencedAndIndented,
+}
+
+/// Apply `f` to every prose line. Code blocks are skipped entirely; inline code spans and
 /// URLs inside prose lines are swapped for placeholders while `f` runs. `f` may drop a line.
-fn map_prose_lines(text: &str, mut f: impl FnMut(&str, &[String]) -> Option<String>) -> String {
+fn map_prose_lines(
+    text: &str,
+    blocks: CodeBlocks,
+    mut f: impl FnMut(&str, &[String]) -> Option<String>,
+) -> String {
     let mut out: Vec<String> = Vec::new();
     let mut fence: Option<(char, usize)> = None;
+    // Markdown indented code starts after a blank line and runs until a non-indented line.
+    let mut prev_blank = true;
+    let mut in_indented = false;
     for line in text.split('\n') {
+        if fence.is_none() && blocks == CodeBlocks::FencedAndIndented {
+            let indented = line.starts_with("    ") || line.starts_with('\t');
+            let blank = line.trim().is_empty();
+            in_indented = if blank {
+                in_indented
+            } else {
+                indented && (prev_blank || in_indented)
+            };
+            prev_blank = blank;
+            if in_indented && !blank {
+                out.push(line.to_string());
+                continue;
+            }
+        }
         let trimmed = line.trim_start();
         let fence_marker = ['`', '~'].into_iter().find_map(|ch| {
             let n = trimmed.chars().take_while(|c| *c == ch).count();
@@ -66,8 +98,8 @@ fn map_prose_lines(text: &str, mut f: impl FnMut(&str, &[String]) -> Option<Stri
 }
 
 /// Visit prose fragments (code and URLs removed) without changing anything.
-fn for_each_prose_line(text: &str, mut f: impl FnMut(&str, &[String])) {
-    map_prose_lines(text, |l, stash| {
+fn for_each_prose_line(text: &str, blocks: CodeBlocks, mut f: impl FnMut(&str, &[String])) {
+    map_prose_lines(text, blocks, |l, stash| {
         f(l, stash);
         Some(l.to_string())
     });
@@ -202,19 +234,21 @@ fn sanitize_dash_line(line: &str) -> Option<String> {
 
 pub fn sanitize_dashes(text: &str) -> String {
     // Bare CLI flags become code spans first, so the dash pass below leaves them intact.
-    let flags_wrapped = map_prose_lines(text, |l, _| {
+    let flags_wrapped = map_prose_lines(text, CodeBlocks::FencedAndIndented, |l, _| {
         if HR_RE.is_match(l) || TABLE_DELIM_RE.is_match(l) {
             Some(l.to_string())
         } else {
             Some(FLAG_RE.replace_all(l, "$1`$2`").into_owned())
         }
     });
-    map_prose_lines(&flags_wrapped, |l, _| sanitize_dash_line(l))
+    map_prose_lines(&flags_wrapped, CodeBlocks::FencedAndIndented, |l, _| {
+        sanitize_dash_line(l)
+    })
 }
 
 pub fn dash_violations(text: &str) -> Vec<String> {
     let mut found = Vec::new();
-    for_each_prose_line(text, |line, _| {
+    for_each_prose_line(text, CodeBlocks::FencedAndIndented, |line, _| {
         for m in FORBIDDEN_DASH_RE.find_iter(line) {
             let start = line[..m.start()]
                 .char_indices()
@@ -239,7 +273,7 @@ static ATTRIBUTION_LINE_RES: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     [
         r"(?i)^\s*co-authored-by\s*:",
         r"🤖",
-        r"(?i)^\s*(?:[-*_]\s*)?(?:sent|reviewed|signed)?\s*(?:by|from|via)?\s*(?:claude|anthropic)(?:\s+code)?\s*$",
+        r"(?i)^\s*(?:[-*_—–]+\s*)?(?:sent|reviewed|signed)?\s*(?:by|from|via)?\s*(?:claude|anthropic)(?:\s+code)?\s*$",
     ]
     .iter()
     .map(|p| Regex::new(p).unwrap())
@@ -248,8 +282,15 @@ static ATTRIBUTION_LINE_RES: LazyLock<Vec<Regex>> = LazyLock::new(|| {
 
 static ATTRIBUTION_SENTENCE_RES: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     vec![
+        // "This review was generated with Claude": the subject is the text itself.
         Regex::new(&format!(
-            r"(?i)\b(generated|written|created|produced|reviewed|drafted|authored|assisted|powered|brought to you|composed|made)\b[^.!?\n]{{0,40}}\b(with|by|using|via|from|through)\b[^.!?\n]{{0,40}}\b{AI_TERMS}"
+            r"(?i)\b(this|the|my|our|these)\s+(review|comment|feedback|analysis|suggestion|summary|response|reply|text|message|note)s?\b[^.!?\n]{{0,30}}\b(generated|written|created|produced|drafted|authored|assisted|powered|composed|made|reviewed)\b[^.!?\n]{{0,25}}\b(with|by|using|via|from|through)\b[^.!?\n]{{0,25}}\b{AI_TERMS}"
+        ))
+        .unwrap(),
+        // Sentence-initial passive signature: "Generated with Claude Code", "Written by an AI".
+        // A mid-sentence "errors produced by the Claude CLI" is a legitimate code remark.
+        Regex::new(&format!(
+            r"(?i)(?:^|[.!?]\s+)[\s*_—–-]*(generated|written|created|produced|drafted|authored|assisted|powered|brought to you|composed|made|reviewed)\s+(with|by|using|via|from|through)\b[^.!?\n]{{0,25}}\b{AI_TERMS}"
         ))
         .unwrap(),
         Regex::new(r"(?i)\bas an? (ai|language model|llm|assistant|automated (reviewer|tool))\b").unwrap(),
@@ -328,12 +369,12 @@ fn strip_attribution_line(line: &str, stash: &[String]) -> Option<String> {
 }
 
 pub fn strip_attribution(text: &str) -> String {
-    map_prose_lines(text, strip_attribution_line)
+    map_prose_lines(text, CodeBlocks::Fenced, strip_attribution_line)
 }
 
 pub fn attribution_violations(text: &str) -> Vec<String> {
     let mut found = Vec::new();
-    for_each_prose_line(text, |line, stash| {
+    for_each_prose_line(text, CodeBlocks::Fenced, |line, stash| {
         if ATTRIBUTION_LINE_RES.iter().any(|r| r.is_match(line)) || attribution_hit(line, stash) {
             found.push(unmask(line, stash).trim().to_string());
         }
@@ -712,5 +753,42 @@ mod tests {
         );
         assert_eq!(p.findings.len(), 1);
         assert_eq!(p.verdict, Verdict::Approve);
+    }
+
+    #[test]
+    fn code_remarks_about_ai_tools_are_not_attribution() {
+        for text in [
+            "Errors produced by the Claude CLI are swallowed here. Return them.",
+            "The token is created by the OpenAI client but never closed.",
+        ] {
+            assert_eq!(sanitize_comment(text, true), text);
+            assert!(attribution_violations(text).is_empty(), "{text}");
+        }
+        assert_eq!(
+            sanitize_comment("Looks good. Generated with Claude Code.", true),
+            "Looks good."
+        );
+        assert_eq!(
+            sanitize_comment("Fine. This review was written by an AI.", true),
+            "Fine."
+        );
+    }
+
+    #[test]
+    fn em_dash_signatures_are_stripped_not_blocked() {
+        let out = sanitize_comment("Thanks!\n\n— Claude", true);
+        assert_eq!(out, "Thanks!");
+        assert!(check_comment(&out, true).attribution_violations.is_empty());
+    }
+
+    #[test]
+    fn indented_code_blocks_keep_their_dashes() {
+        let text = "Run the tests with output:\n\n    cargo test -- --nocapture\n\nThen check -- carefully.";
+        let out = sanitize_comment(text, true);
+        assert!(out.contains("    cargo test -- --nocapture"), "{out}");
+        assert!(!out.contains("check --"), "{out}");
+        assert!(dash_violations(&out).is_empty());
+        // Indentation is no loophole for attribution.
+        assert!(!attribution_violations("Done.\n\n    Generated with Claude Code").is_empty());
     }
 }

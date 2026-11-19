@@ -1,5 +1,6 @@
 #[cfg(test)]
 mod e2e_tests;
+pub mod guard;
 pub mod pipeline;
 pub mod post;
 pub mod postprocess;

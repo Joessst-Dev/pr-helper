@@ -11,6 +11,7 @@ use crate::env;
 use crate::error::{AppError, AppResult};
 use crate::git::diff::DiffIndex;
 use crate::git::repo_cache::FetchSpec;
+use crate::review::guard::steering_attempt;
 use crate::review::postprocess::{finalize_body, process};
 use crate::review::prompt::{PreviousReview, PromptInput, system_prompt, user_prompt};
 use crate::review::runner::{self, RunEvent, RunRequest};
@@ -51,7 +52,7 @@ pub async fn run_review(
     }
 
     match outcome {
-        Ok(verdict) => {
+        Ok((verdict, steering)) => {
             svc.progress(
                 review_id,
                 ProgressKind::Status,
@@ -59,7 +60,7 @@ pub async fn run_review(
             );
             svc.publish_review(review_id);
             svc.sink.tracked_updated();
-            after_review(svc, review_id, &pr, verdict, trigger).await;
+            after_review(svc, review_id, &pr, verdict, trigger, steering.as_deref()).await;
         }
         Err(e) if cancel.is_cancelled() => {
             let _ =
@@ -98,7 +99,7 @@ async fn execute(
     pr: &PullRequest,
     review_dir: &Path,
     cancel: CancellationToken,
-) -> AppResult<Verdict> {
+) -> AppResult<(Verdict, Option<String>)> {
     let (_server, provider) = svc.provider_for(&pr.server_id)?;
     let settings = svc.effective_settings(&pr.server_id, Some(&pr.repo))?;
     let config = svc.db.app_config()?;
@@ -147,6 +148,8 @@ async fn execute(
         .commit_log(&bare, &merge_base, &pr.head_sha)
         .await
         .unwrap_or_default();
+
+    let steering = steering_attempt(&pr.title, &pr.description, &commits, &diff);
 
     // Context files live next to (not inside) the worktree so they never show up as repo files.
     let context_dir = review_dir.join("context");
@@ -268,7 +271,7 @@ async fn execute(
         &pr.head_sha,
         Some(processed.verdict),
     )?;
-    Ok(processed.verdict)
+    Ok((processed.verdict, steering))
 }
 
 fn check_cancel(cancel: &CancellationToken) -> AppResult<()> {
@@ -286,6 +289,7 @@ async fn after_review(
     pr: &PullRequest,
     verdict: Verdict,
     trigger: ReviewTrigger,
+    steering: Option<&str>,
 ) {
     let Ok(settings) = svc.effective_settings(&pr.server_id, Some(&pr.repo)) else {
         return;
@@ -296,6 +300,23 @@ async fn after_review(
         .map(|f| f.len())
         .unwrap_or(0);
     let label = format!("{}#{}", pr.repo, pr.number);
+
+    if verdict == Verdict::Approve
+        && settings.auto_approve_on_approve_verdict.value
+        && let Some(excerpt) = steering
+    {
+        // The model may have been talked into approving; a human has to decide.
+        svc.progress(
+            review_id,
+            ProgressKind::Error,
+            format!("Auto-approve skipped: the PR text addresses the reviewer (\"{excerpt}\")"),
+        );
+        svc.sink.notify(
+            &format!("Approve manually? {label}"),
+            "The reviewer approved, but the PR text seems to address the reviewer, so nothing was posted automatically.",
+        );
+        return;
+    }
 
     if verdict == Verdict::Approve && settings.auto_approve_on_approve_verdict.value {
         match auto_approve(svc, review_id, pr, &settings).await {

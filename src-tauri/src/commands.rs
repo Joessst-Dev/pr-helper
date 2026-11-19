@@ -36,10 +36,15 @@ pub async fn save_server(
     svc.save_server(id.as_deref(), &input).await
 }
 
-#[tauri::command]
+// Keychain access can block on a macOS permission prompt, so this runs off the main thread.
+#[tauri::command(async)]
 pub fn delete_server(svc: Svc<'_>, id: String) -> AppResult<()> {
-    svc.db.delete_server(&id)?;
+    // Token first: if the keychain refuses, the server stays visible so it can be retried
+    // instead of leaving an orphaned token behind.
     svc.secrets.delete(&id)?;
+    svc.queue.cancel_server(&id);
+    svc.db.delete_server(&id)?;
+    svc.cache.remove_server(&id);
     svc.sink.tracked_updated();
     Ok(())
 }
@@ -187,11 +192,14 @@ pub fn resume_command(svc: Svc<'_>, review_id: String) -> AppResult<String> {
     let session = review
         .session_id
         .ok_or_else(|| AppError::invalid("this review has no session"))?;
-    let dir = review.worktree_path.ok_or_else(|| {
-        AppError::invalid(
-            "the worktree was cleaned up; enable \"Keep worktrees\" in Settings to resume sessions",
-        )
-    })?;
+    let dir = review
+        .worktree_path
+        .filter(|p| std::path::Path::new(p).is_dir())
+        .ok_or_else(|| {
+            AppError::invalid(
+                "the worktree was cleaned up; enable \"Keep worktrees\" in Settings to resume sessions",
+            )
+        })?;
     Ok(format!(
         "cd '{}' && claude --resume {session}",
         dir.replace('\'', "'\\''")
@@ -297,7 +305,7 @@ pub fn get_app_config(svc: Svc<'_>) -> AppResult<AppConfig> {
     svc.db.app_config()
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn save_app_config(app: tauri::AppHandle, svc: Svc<'_>, config: AppConfig) -> AppResult<()> {
     use tauri_plugin_autostart::ManagerExt;
     let autolaunch = app.autolaunch();
@@ -306,12 +314,12 @@ pub fn save_app_config(app: tauri::AppHandle, svc: Svc<'_>, config: AppConfig) -
     } else {
         autolaunch.disable()
     };
-    if let Err(e) = result {
-        tracing::warn!("autostart update failed: {e}");
-    }
+    result.map_err(|e| AppError::invalid(format!("could not update launch at login: {e}")))?;
     if let Ok(git) = env::resolve_tool("git", config.git_path.as_deref()) {
         svc.cache.set_git(git);
     }
+    svc.queue
+        .set_limit(config.max_concurrent_reviews.max(1) as usize);
     svc.db.set_app_config(&config)
 }
 
@@ -322,7 +330,7 @@ pub fn list_skills(svc: Svc<'_>, server_id: String) -> AppResult<Vec<Skill>> {
     svc.db.list_skills(&server_id)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn save_skill(svc: Svc<'_>, id: Option<String>, input: SkillInput) -> AppResult<Skill> {
     if input.name.trim().is_empty() {
         return Err(AppError::invalid("skill name is required"));
