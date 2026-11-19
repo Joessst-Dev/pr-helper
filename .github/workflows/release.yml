@@ -90,7 +90,12 @@ jobs:
           fi
           dmg="PR-Helper_${VERSION}_universal.dmg"
           cp "$src" "out/$dmg"
-          app="src-tauri/target/universal-apple-darwin/release/bundle/macos/PR Helper.app"
+          # Verify what ships: mount the dmg read-only and check the app inside it.
+          # (Tauri deletes the intermediate .app after packing the dmg.)
+          mnt=$(mktemp -d)
+          hdiutil attach -nobrowse -readonly -mountpoint "$mnt" "out/$dmg" > /dev/null
+          trap 'hdiutil detach "$mnt" > /dev/null || true' EXIT
+          app="$mnt/PR Helper.app"
           found=0
           for exe in "$app"/Contents/MacOS/*; do
             archs=$(lipo -archs "$exe")
@@ -100,8 +105,8 @@ jobs:
               *) echo "::error::$(basename "$exe") is not universal: $archs"; exit 1 ;;
             esac
           done
-          [ "$found" = 1 ] || { echo "::error::no executable in $app/Contents/MacOS"; exit 1; }
-          codesign --verify --verbose "$app"
+          [ "$found" = 1 ] || { echo "::error::no executable in the app inside the dmg"; exit 1; }
+          codesign --verify --strict --verbose=2 "$app"
           (cd out && shasum -a 256 "$dmg" > SHA256SUMS)
           echo "sha256=$(cut -d' ' -f1 out/SHA256SUMS)" >> "$GITHUB_OUTPUT"
 
