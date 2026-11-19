@@ -91,10 +91,16 @@ jobs:
           dmg="PR-Helper_${VERSION}_universal.dmg"
           cp "$src" "out/$dmg"
           app="src-tauri/target/universal-apple-darwin/release/bundle/macos/PR Helper.app"
-          exe=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")
-          archs=$(lipo -archs "$app/Contents/MacOS/$exe")
-          echo "Architectures: $archs"
-          case "$archs" in *x86_64*arm64*|*arm64*x86_64*) ;; *) echo "::error::not universal: $archs"; exit 1 ;; esac
+          found=0
+          for exe in "$app"/Contents/MacOS/*; do
+            archs=$(lipo -archs "$exe")
+            echo "$(basename "$exe"): $archs"
+            case "$archs" in
+              *x86_64*arm64*|*arm64*x86_64*) found=1 ;;
+              *) echo "::error::$(basename "$exe") is not universal: $archs"; exit 1 ;;
+            esac
+          done
+          [ "$found" = 1 ] || { echo "::error::no executable in $app/Contents/MacOS"; exit 1; }
           codesign --verify --verbose "$app"
           (cd out && shasum -a 256 "$dmg" > SHA256SUMS)
           echo "sha256=$(cut -d' ' -f1 out/SHA256SUMS)" >> "$GITHUB_OUTPUT"
