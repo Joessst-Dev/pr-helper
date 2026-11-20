@@ -6,6 +6,7 @@ import type { EnvironmentStatus } from "./bindings/EnvironmentStatus";
 import type { Finding } from "./bindings/Finding";
 import type { PostOutcome } from "./bindings/PostOutcome";
 import type { PostRequest } from "./bindings/PostRequest";
+import type { PrDetail } from "./bindings/PrDetail";
 import type { PrFilter } from "./bindings/PrFilter";
 import type { PrListItem } from "./bindings/PrListItem";
 import type { RepoSettingsEntry } from "./bindings/RepoSettingsEntry";
@@ -16,6 +17,7 @@ import type { ServerInput } from "./bindings/ServerInput";
 import type { SettingsOverrides } from "./bindings/SettingsOverrides";
 import type { Skill } from "./bindings/Skill";
 import type { SkillInput } from "./bindings/SkillInput";
+import type { TicketLoad } from "./bindings/TicketLoad";
 import type { TicketSource } from "./bindings/TicketSource";
 import type { TicketSourceInput } from "./bindings/TicketSourceInput";
 import type { TrackedPr } from "./bindings/TrackedPr";
@@ -35,6 +37,11 @@ export const api = {
   testTicketSource: (id: string, key: string) => invoke<string>("test_ticket_source", { id, key }),
 
   listPrs: (serverId: string, filter: PrFilter) => invoke<PrListItem[]>("list_prs", { serverId, filter }),
+  getPrDetail: (serverId: string, projectId: string, number: number) =>
+    invoke<PrDetail>("get_pr_detail", { serverId, projectId, number }),
+  loadPrTickets: (serverId: string, repo: string, keys: string[], requestId: string) =>
+    invoke<TicketLoad[]>("load_pr_tickets", { serverId, repo, keys, requestId }),
+  cancelTicketLoad: (requestId: string) => invoke<boolean>("cancel_ticket_load", { requestId }),
   startReview: (serverId: string, projectId: string, number: number) =>
     invoke<Review>("start_review", { serverId, projectId, number }),
   cancelReview: (reviewId: string) => invoke<boolean>("cancel_review", { reviewId }),

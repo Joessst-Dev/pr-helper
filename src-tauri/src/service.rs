@@ -9,7 +9,7 @@ use serde::Serialize;
 use ts_rs::TS;
 
 use crate::db::models::{
-    Review, Server, ServerInput, TicketSource, TicketSourceInput, TicketSourceKind,
+    PullRequest, Review, Server, ServerInput, TicketSource, TicketSourceInput, TicketSourceKind,
 };
 use crate::db::{Db, now};
 use crate::env;
@@ -20,7 +20,7 @@ use crate::review::queue::ReviewQueue;
 use crate::secrets::SecretStore;
 use crate::settings::{EffectiveSettings, SettingsOverrides, resolve};
 use crate::tickets::jira::{JiraAuth, JiraClient, parse_extra_fields};
-use crate::tickets::{Ticket, is_valid_key, mcp, render};
+use crate::tickets::{self, Ticket, is_valid_key, mcp, render};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]
@@ -55,6 +55,45 @@ pub type ProviderFactory =
 
 const MAX_LOG_LINES: usize = 500;
 
+/// Which tickets a PR links to, per the resolved settings. Nothing is fetched yet.
+#[derive(Debug, Clone)]
+pub enum TicketPlan {
+    /// No ticket source is configured for this server or repo.
+    NotConfigured,
+    /// A source is configured but nothing can be loaded. `is_error` marks a configuration
+    /// problem rather than a PR without ticket keys.
+    Skipped {
+        source: Option<TicketSource>,
+        message: String,
+        is_error: bool,
+    },
+    Ready {
+        source: TicketSource,
+        keys: Vec<String>,
+    },
+}
+
+fn validate_request_id(id: &str) -> AppResult<()> {
+    let ok = !id.is_empty()
+        && id.len() <= 64
+        && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+    if ok {
+        Ok(())
+    } else {
+        Err(AppError::invalid("invalid request id"))
+    }
+}
+
+/// One ticket loaded for display, or why it could not be loaded.
+#[derive(Debug, Clone, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct TicketLoad {
+    pub key: String,
+    pub ticket: Option<Ticket>,
+    pub error: Option<String>,
+}
+
 pub struct Service {
     pub db: Arc<Db>,
     pub secrets: Arc<dyn SecretStore>,
@@ -63,6 +102,20 @@ pub struct Service {
     pub queue: ReviewQueue,
     provider_factory: Box<ProviderFactory>,
     logs: Mutex<HashMap<String, Vec<ProgressEvent>>>,
+    /// Running ticket loads of the PR view, by request id, so the UI can cancel them.
+    ticket_loads: Mutex<HashMap<String, CancellationToken>>,
+}
+
+/// Unregisters a ticket load when it ends, also when the command future is dropped.
+struct TicketLoadGuard<'a> {
+    loads: &'a Mutex<HashMap<String, CancellationToken>>,
+    id: String,
+}
+
+impl Drop for TicketLoadGuard<'_> {
+    fn drop(&mut self) {
+        self.loads.lock().unwrap().remove(&self.id);
+    }
 }
 
 impl Service {
@@ -88,6 +141,7 @@ impl Service {
             sink,
             provider_factory: provider_factory.unwrap_or_else(|| Box::new(make_provider)),
             logs: Mutex::new(HashMap::new()),
+            ticket_loads: Mutex::new(HashMap::new()),
         }))
     }
 
@@ -361,6 +415,125 @@ impl Service {
             .await;
         let _ = tokio::fs::remove_dir_all(&work_dir).await;
         Ok(render::render(&[result?]))
+    }
+
+    /// The ticket source and allow-listed ticket keys for a PR.
+    pub fn ticket_plan(&self, settings: &EffectiveSettings, pr: &PullRequest) -> TicketPlan {
+        let Some(source_id) = settings.ticket_source_id.value.as_deref() else {
+            return TicketPlan::NotConfigured;
+        };
+        let source = match self.db.get_ticket_source(source_id) {
+            Ok(s) => s,
+            Err(e) => {
+                return TicketPlan::Skipped {
+                    source: None,
+                    message: format!("Tickets skipped: {e}"),
+                    is_error: true,
+                };
+            }
+        };
+        let projects = tickets::parse_project_keys(&settings.ticket_project_keys.value);
+        if projects.is_empty() {
+            return TicketPlan::Skipped {
+                source: Some(source),
+                message: "Tickets skipped: no Jira project keys are configured".into(),
+                is_error: true,
+            };
+        }
+        let keys = tickets::extract_keys(&pr.head_ref, &pr.title, &pr.description, &projects);
+        if keys.is_empty() {
+            return TicketPlan::Skipped {
+                source: Some(source),
+                message: format!(
+                    "No ticket key for {} found in the branch, title or description",
+                    projects.join(", ")
+                ),
+                is_error: false,
+            };
+        }
+        TicketPlan::Ready { source, keys }
+    }
+
+    /// Loads tickets for display in the PR view. The keys come from the UI, so they are
+    /// validated and checked against the allowed projects of the server or repo again.
+    /// A ticket that fails to load is reported in its entry and never fails the call.
+    pub async fn load_pr_tickets(
+        &self,
+        server_id: &str,
+        repo: &str,
+        keys: &[String],
+        request_id: &str,
+    ) -> AppResult<Vec<TicketLoad>> {
+        validate_request_id(request_id)?;
+        // A cancel can arrive before the load starts; it leaves a cancelled token behind.
+        let cancel = self
+            .ticket_loads
+            .lock()
+            .unwrap()
+            .entry(request_id.to_string())
+            .or_default()
+            .clone();
+        let _guard = TicketLoadGuard {
+            loads: &self.ticket_loads,
+            id: request_id.to_string(),
+        };
+        let cancelled = || AppError::Reviewer("cancelled".into());
+
+        let settings = self.effective_settings(server_id, Some(repo))?;
+        let Some(source_id) = settings.ticket_source_id.value.as_deref() else {
+            return Err(AppError::invalid(
+                "no ticket source is configured for this repository",
+            ));
+        };
+        let source = self.db.get_ticket_source(source_id)?;
+        let projects = tickets::parse_project_keys(&settings.ticket_project_keys.value);
+        let keys = tickets::filter_keys(keys, &projects);
+        let mut loaded = Vec::with_capacity(keys.len());
+        for key in keys {
+            if cancel.is_cancelled() {
+                return Err(cancelled());
+            }
+            let work_dir = self
+                .cache
+                .review_dir(&format!("ticket-view-{}", crate::db::new_id()));
+            let result = self
+                .fetch_ticket(&source, &key, &work_dir, cancel.clone())
+                .await;
+            let _ = tokio::fs::remove_dir_all(&work_dir).await;
+            if cancel.is_cancelled() {
+                return Err(cancelled());
+            }
+            loaded.push(match result {
+                Ok(t) => TicketLoad {
+                    key,
+                    ticket: Some(t),
+                    error: None,
+                },
+                Err(e) => TicketLoad {
+                    key,
+                    ticket: None,
+                    error: Some(e.to_string()),
+                },
+            });
+        }
+        Ok(loaded)
+    }
+
+    /// Cancels a running ticket load of the PR view, including an MCP fetcher run.
+    /// Returns whether a load with this id was running.
+    pub fn cancel_ticket_load(&self, request_id: &str) -> AppResult<bool> {
+        validate_request_id(request_id)?;
+        let mut loads = self.ticket_loads.lock().unwrap();
+        let running = loads.contains_key(request_id);
+        loads.entry(request_id.to_string()).or_default().cancel();
+        if !running {
+            // Nothing to stop yet. Keep the cancelled token only for a load that is about
+            // to start, and bound what a stream of stray cancels can leave behind.
+            if loads.len() > 64 {
+                loads.retain(|_, t| !t.is_cancelled());
+            }
+        }
+        Ok(running)
     }
 
     pub fn effective_settings(
