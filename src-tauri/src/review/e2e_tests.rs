@@ -919,3 +919,96 @@ async fn a_rejected_jira_token_is_not_saved() {
     );
     assert!(db.list_ticket_sources().unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn pr_view_tickets_follow_settings_and_the_project_allow_list() {
+    use crate::service::TicketPlan;
+    use wiremock::matchers::{method, path};
+    let jira = wiremock::MockServer::start().await;
+    mock_myself(&jira).await;
+    wiremock::Mock::given(method("GET"))
+        .and(path("/rest/api/2/issue/ABC-7"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "key": "ABC-7",
+                "fields": {"summary": "Reset password", "description": "As a user"}
+            })),
+        )
+        .expect(1)
+        .mount(&jira)
+        .await;
+    wiremock::Mock::given(method("GET"))
+        .and(path("/rest/api/2/issue/ABC-8"))
+        .respond_with(wiremock::ResponseTemplate::new(404))
+        .mount(&jira)
+        .await;
+    // Anything outside the allow-list must never be requested.
+    wiremock::Mock::given(method("GET"))
+        .and(path("/rest/api/2/issue/SECRET-1"))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&jira)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Arc::new(Db::open_in_memory().unwrap());
+    let server = db.insert_server(&gitlab_input(None)).unwrap();
+    let svc = service_with(
+        db.clone(),
+        Arc::new(MemoryStore::default()),
+        tmp.path().join("cache"),
+    );
+    let mut pr = dummy_pr();
+    pr.server_id = server.id.clone();
+    pr.head_ref = "feature/abc-7-reset".into();
+
+    let settings = svc.effective_settings(&server.id, Some(&pr.repo)).unwrap();
+    assert!(matches!(
+        svc.ticket_plan(&settings, &pr),
+        TicketPlan::NotConfigured
+    ));
+    assert!(
+        svc.load_pr_tickets(&server.id, &pr.repo, &["ABC-7".into()])
+            .await
+            .is_err()
+    );
+
+    let source = svc
+        .save_ticket_source(None, &jira_input(&jira.uri(), Some("tok")))
+        .await
+        .unwrap();
+    let mut overrides = SettingsOverrides {
+        ticket_source_id: Some(source.id.clone()),
+        ..Default::default()
+    };
+    db.set_server_settings(&server.id, &overrides).unwrap();
+    let settings = svc.effective_settings(&server.id, Some(&pr.repo)).unwrap();
+    assert!(matches!(
+        svc.ticket_plan(&settings, &pr),
+        TicketPlan::Skipped { is_error: true, .. }
+    ));
+
+    overrides.ticket_project_keys = Some("abc".into());
+    db.set_server_settings(&server.id, &overrides).unwrap();
+    let settings = svc.effective_settings(&server.id, Some(&pr.repo)).unwrap();
+    match svc.ticket_plan(&settings, &pr) {
+        TicketPlan::Ready { keys, .. } => assert_eq!(keys, vec!["ABC-7"]),
+        other => panic!("{other:?}"),
+    }
+
+    let loaded = svc
+        .load_pr_tickets(
+            &server.id,
+            &pr.repo,
+            &["SECRET-1".into(), "abc-7".into(), "ABC-8".into()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        loaded.iter().map(|t| t.key.as_str()).collect::<Vec<_>>(),
+        vec!["ABC-7", "ABC-8"]
+    );
+    assert_eq!(loaded[0].ticket.as_ref().unwrap().summary, "Reset password");
+    assert!(loaded[1].ticket.is_none());
+    assert!(loaded[1].error.is_some());
+}

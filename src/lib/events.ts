@@ -13,10 +13,12 @@ export function useBackendEvents() {
         qc.invalidateQueries({ queryKey: ["review", e.payload.id] });
         qc.invalidateQueries({ queryKey: ["reviews"] });
         qc.invalidateQueries({ queryKey: ["prs"] });
+        qc.invalidateQueries({ queryKey: ["pr"] });
       }),
       listen("tracked-updated", () => {
         qc.invalidateQueries({ queryKey: ["tracked"] });
         qc.invalidateQueries({ queryKey: ["prs"] });
+        qc.invalidateQueries({ queryKey: ["pr"] });
       }),
     ];
     return () => {

@@ -4,6 +4,7 @@ import { createHashRouter, Navigate, NavLink, Outlet, RouterProvider } from "rea
 import { useQuery } from "@tanstack/react-query";
 import { api } from "./lib/api";
 import { useBackendEvents } from "./lib/events";
+import { PrDetailPage } from "./pages/PrDetailPage";
 import { PullRequestsPage } from "./pages/PullRequestsPage";
 import { ReviewPage } from "./pages/ReviewPage";
 import { ServerFormPage, ServerSettingsPage } from "./pages/ServerPages";
@@ -98,6 +99,7 @@ const router = createHashRouter([
       { path: "servers/new", element: <ServerFormPage /> },
       { path: "servers/:serverId", element: <PullRequestsPage /> },
       { path: "servers/:serverId/edit", element: <ServerSettingsPage /> },
+      { path: "servers/:serverId/prs/:projectId/:number", element: <PrDetailPage /> },
       { path: "reviews/:reviewId", element: <ReviewPage /> },
       { path: "watching", element: <WatchingPage /> },
       { path: "settings", element: <SettingsPage /> },

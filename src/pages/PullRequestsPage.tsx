@@ -1,12 +1,13 @@
 import { useMemo, useState } from "react";
-import { Link, useNavigate, useParams } from "react-router";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { Link, useParams } from "react-router";
+import { useQuery } from "@tanstack/react-query";
 import { ExternalLink, GitPullRequest, Play, RefreshCw, Search } from "lucide-react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { api, errorMessage } from "../lib/api";
 import type { PrFilter } from "../lib/bindings/PrFilter";
 import type { PrListItem } from "../lib/bindings/PrListItem";
 import { relativeTime } from "../lib/format";
+import { prDetailPath, useStartReview } from "../lib/useStartReview";
 import { ReviewStatusBadge } from "../components/badges";
 import { Badge, Button, EmptyState, ErrorBanner, Input, PageHeader, Segmented, Spinner } from "../components/ui";
 
@@ -91,15 +92,7 @@ export function PullRequestsPage() {
 
 function PrRow({ item, serverId }: { item: PrListItem; serverId: string }) {
   const { pr, tracked, latestReview } = item;
-  const navigate = useNavigate();
-  const qc = useQueryClient();
-  const start = useMutation({
-    mutationFn: () => api.startReview(serverId, pr.projectId, pr.number),
-    onSuccess: (review) => {
-      qc.invalidateQueries({ queryKey: ["prs", serverId] });
-      navigate(`/reviews/${review.id}`);
-    },
-  });
+  const start = useStartReview(serverId, pr.projectId, pr.number);
   const running = latestReview && (latestReview.status === "running" || latestReview.status === "queued");
 
   return (
@@ -107,7 +100,9 @@ function PrRow({ item, serverId }: { item: PrListItem; serverId: string }) {
       <GitPullRequest className={pr.draft ? "size-4 shrink-0 text-muted" : "size-4 shrink-0 text-ok"} />
       <div className="min-w-0 flex-1">
         <div className="flex items-center gap-2">
-          <span className="truncate font-medium">{pr.title}</span>
+          <Link to={prDetailPath(serverId, pr.projectId, pr.number)} className="truncate font-medium hover:underline">
+            {pr.title}
+          </Link>
           {pr.draft && <Badge>Draft</Badge>}
           {pr.reviewRequested && <Badge tone="accent">Review requested</Badge>}
           {tracked?.hasNewChanges && <Badge tone="warn">New changes</Badge>}

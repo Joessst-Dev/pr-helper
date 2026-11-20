@@ -14,7 +14,7 @@ use crate::review::post::{self, PostOutcome, PostRequest};
 use crate::review::postprocess::{CommentCheck, check_comment};
 use crate::review::queue;
 use crate::review::skills::validate_skill_dir;
-use crate::service::{ProgressEvent, Service};
+use crate::service::{ProgressEvent, Service, TicketLoad, TicketPlan};
 use crate::settings::{AppConfig, EffectiveSettings, SettingsOverrides};
 
 type Svc<'a> = State<'a, Arc<Service>>;
@@ -121,6 +121,76 @@ pub async fn list_prs(
             })
         })
         .collect()
+}
+
+/// Linked tickets of a PR as far as they are known without fetching them.
+#[derive(Debug, Clone, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct PrTicketInfo {
+    pub source_name: String,
+    pub source_kind: Option<TicketSourceKind>,
+    pub keys: Vec<String>,
+    /// Why no tickets can be loaded, if so.
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct PrDetail {
+    pub pr: PullRequest,
+    pub tracked: Option<TrackedPr>,
+    pub reviews: Vec<Review>,
+    /// `None` when no ticket source is configured for the server or repo.
+    pub tickets: Option<PrTicketInfo>,
+}
+
+#[tauri::command]
+pub async fn get_pr_detail(
+    svc: Svc<'_>,
+    server_id: String,
+    project_id: String,
+    number: u64,
+) -> AppResult<PrDetail> {
+    let (_server, provider) = svc.provider_for(&server_id)?;
+    let pr = provider.get_pr(&project_id, number).await?;
+    let settings = svc.effective_settings(&server_id, Some(&pr.repo))?;
+    let tickets = match svc.ticket_plan(&settings, &pr) {
+        TicketPlan::NotConfigured => None,
+        TicketPlan::Skipped {
+            source, message, ..
+        } => Some(PrTicketInfo {
+            source_name: source.as_ref().map(|s| s.name.clone()).unwrap_or_default(),
+            source_kind: source.map(|s| s.kind),
+            keys: Vec::new(),
+            message: Some(message),
+        }),
+        TicketPlan::Ready { source, keys } => Some(PrTicketInfo {
+            source_name: source.name,
+            source_kind: Some(source.kind),
+            keys,
+            message: None,
+        }),
+    };
+    Ok(PrDetail {
+        tracked: svc.db.get_tracked(&server_id, &pr.repo, pr.number)?,
+        reviews: svc
+            .db
+            .list_reviews_for_pr(&server_id, &pr.repo, pr.number)?,
+        tickets,
+        pr,
+    })
+}
+
+#[tauri::command]
+pub async fn load_pr_tickets(
+    svc: Svc<'_>,
+    server_id: String,
+    repo: String,
+    keys: Vec<String>,
+) -> AppResult<Vec<TicketLoad>> {
+    svc.load_pr_tickets(&server_id, &repo, &keys).await
 }
 
 #[tauri::command]

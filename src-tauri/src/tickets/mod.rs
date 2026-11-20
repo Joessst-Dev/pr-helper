@@ -15,6 +15,7 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 
 /// At most this many tickets are loaded for one PR.
 pub const MAX_TICKETS: usize = 3;
@@ -32,14 +33,18 @@ static FIND_RE: LazyLock<Regex> = LazyLock::new(|| {
     .unwrap()
 });
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct TicketComment {
     pub author: String,
     pub created: String,
     pub body: String,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct Ticket {
     pub key: String,
     pub url: Option<String>,
@@ -54,6 +59,7 @@ pub struct Ticket {
     /// The most recent comments, oldest first.
     pub comments: Vec<TicketComment>,
     /// Total number of comments on the ticket.
+    #[ts(type = "number")]
     pub comment_total: usize,
 }
 
@@ -100,6 +106,26 @@ pub fn extract_keys(
                 }
             }
             rest = &rest[m.end()..];
+        }
+    }
+    keys
+}
+
+/// Keys requested from outside (the UI): uppercased, validated with [`KEY_RE`], limited to
+/// the allowed projects, deduplicated, at most [`MAX_TICKETS`].
+pub fn filter_keys(requested: &[String], allowed_projects: &[String]) -> Vec<String> {
+    let mut keys: Vec<String> = Vec::new();
+    for key in requested {
+        let key = key.trim().to_ascii_uppercase();
+        let project = key.rsplit_once('-').map_or("", |(p, _)| p);
+        if is_valid_key(&key)
+            && allowed_projects.iter().any(|p| p == project)
+            && !keys.contains(&key)
+        {
+            keys.push(key);
+            if keys.len() == MAX_TICKETS {
+                break;
+            }
         }
     }
     keys
@@ -155,6 +181,28 @@ mod tests {
             extract_keys("", "uses utf-8 now", "", &allowed),
             vec!["UTF-8"]
         );
+    }
+
+    #[test]
+    fn requested_keys_are_validated_and_allow_listed() {
+        let requested: Vec<String> = [
+            "abc-1",
+            "SECRET-2",
+            "ABC-1",
+            "ABC-0",
+            "ABC-1/../x",
+            "ABC-2",
+            "ABC-3",
+            "ABC-4",
+        ]
+        .iter()
+        .map(|k| k.to_string())
+        .collect();
+        assert_eq!(
+            filter_keys(&requested, &allow(&["ABC"])),
+            vec!["ABC-1", "ABC-2", "ABC-3"]
+        );
+        assert!(filter_keys(&requested, &[]).is_empty());
     }
 
     #[test]

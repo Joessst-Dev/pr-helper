@@ -205,6 +205,8 @@ pub fn run() {
             commands::delete_ticket_source,
             commands::test_ticket_source,
             commands::list_prs,
+            commands::get_pr_detail,
+            commands::load_pr_tickets,
             commands::start_review,
             commands::cancel_review,
             commands::get_review,

@@ -17,9 +17,9 @@ use crate::review::prompt::{PreviousReview, PromptInput, system_prompt, user_pro
 use crate::review::runner::{self, RunEvent, RunRequest, ToolPolicy};
 use crate::review::schema::{RawReview, review_schema};
 use crate::review::skills::build_plugin;
-use crate::service::{ProgressKind, Service};
+use crate::service::{ProgressKind, Service, TicketPlan};
 use crate::settings::EffectiveSettings;
-use crate::tickets::{self, Ticket, render};
+use crate::tickets::{Ticket, render};
 
 pub async fn run_review(
     svc: &Arc<Service>,
@@ -309,41 +309,21 @@ async fn load_tickets(
     review_dir: &Path,
     cancel: &CancellationToken,
 ) -> Vec<Ticket> {
-    let Some(source_id) = settings.ticket_source_id.value.as_deref() else {
-        return Vec::new();
-    };
-    let projects = tickets::parse_project_keys(&settings.ticket_project_keys.value);
-    if projects.is_empty() {
-        svc.progress(
-            review_id,
-            ProgressKind::Error,
-            "Tickets skipped: no Jira project keys are configured",
-        );
-        return Vec::new();
-    }
-    let source = match svc.db.get_ticket_source(source_id) {
-        Ok(s) => s,
-        Err(e) => {
-            svc.progress(
-                review_id,
-                ProgressKind::Error,
-                format!("Tickets skipped: {e}"),
-            );
+    let (source, keys) = match svc.ticket_plan(settings, pr) {
+        TicketPlan::NotConfigured => return Vec::new(),
+        TicketPlan::Skipped {
+            message, is_error, ..
+        } => {
+            let kind = if is_error {
+                ProgressKind::Error
+            } else {
+                ProgressKind::Status
+            };
+            svc.progress(review_id, kind, message);
             return Vec::new();
         }
+        TicketPlan::Ready { source, keys } => (source, keys),
     };
-    let keys = tickets::extract_keys(&pr.head_ref, &pr.title, &pr.description, &projects);
-    if keys.is_empty() {
-        svc.progress(
-            review_id,
-            ProgressKind::Status,
-            format!(
-                "No ticket key for {} found in the branch, title or description",
-                projects.join(", ")
-            ),
-        );
-        return Vec::new();
-    }
     let mut loaded = Vec::new();
     for key in keys {
         if cancel.is_cancelled() {
