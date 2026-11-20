@@ -23,6 +23,7 @@ Settings resolve **defaults → global → server → repo**. The most specific 
    - `src/lib/settings.ts`: add the key to `EMPTY_OVERRIDES` (tsc fails until you do).
    - `src/components/SettingsForm.tsx`: add a `<Row>`. Use `BoolSelect` for booleans and `inheritLabel(inherited?.field, fmt)` so "Inherit: X (source)" shows. The same form serves the global, server and repo levels.
    - `src/test/fixtures.ts`: add the field to `effective`.
+   - Settings that need app data (like the ticket source list) get it as a `SettingsForm` prop, which the callers load with React Query. That way the form stays a pure component.
 5. Run the `verify-changes` skill.
 
-Existing settings and their defaults: `commentLanguage` English, `forbidAiAttribution` true, `attributionFooter` "", `skipNits` false, `autoReviewOnNewCommits` false, `autoApproveOnApproveVerdict` false, `pollIntervalSecs` 300 (min 60), `model`/`effort`/`maxBudgetUsd` unset, `defaultSelectedMinSeverity` medium. App-wide (non-hierarchical) options belong in `AppConfig` instead.
+Existing settings and their defaults: `commentLanguage` English, `forbidAiAttribution` true, `attributionFooter` "", `skipNits` false, `autoReviewOnNewCommits` false, `autoApproveOnApproveVerdict` false, `pollIntervalSecs` 300 (min 60), `model`/`effort`/`maxBudgetUsd` unset, `defaultSelectedMinSeverity` medium, `ticketSourceId` unset (`""` = explicitly off), `ticketProjectKeys` "", `ticketScopeCheck` true. App-wide (non-hierarchical) options belong in `AppConfig` instead.

@@ -6,6 +6,8 @@
 //! - No `--`, em dash or en dash in prose. Inline code, fenced code and URLs are left untouched.
 //! - Optional: no AI attribution of any kind.
 //! - Optional: drop nits.
+//! - `scope` findings (unmet ticket requirements) only exist when a ticket was loaded and the
+//!   scope check is on, and are never above medium.
 //! - Findings sorted by severity, then file and line.
 
 use std::sync::LazyLock;
@@ -468,21 +470,33 @@ pub struct Processed {
     pub findings: Vec<Finding>,
 }
 
-/// Turn raw model output into stored findings.
+pub const SCOPE_CATEGORY: &str = "scope";
+
+/// Turn raw model output into stored findings. `has_tickets`: whether ticket context was given
+/// to the reviewer.
 pub fn process(
     raw: RawReview,
     review_id: &str,
     settings: &EffectiveSettings,
     diff: &DiffIndex,
+    has_tickets: bool,
 ) -> Processed {
     let forbid = settings.forbid_ai_attribution.value;
     let min_selected = settings.default_selected_min_severity.value;
+    let scope_allowed = has_tickets && settings.ticket_scope_check.value;
 
     let mut findings: Vec<Finding> = raw
         .findings
         .into_iter()
         .filter_map(|f| to_finding(f, review_id, forbid, diff))
         .filter(|f| !(settings.skip_nits.value && f.severity == Severity::Nit))
+        .filter(|f| scope_allowed || f.category != SCOPE_CATEGORY)
+        .map(|mut f| {
+            if f.category == SCOPE_CATEGORY && f.severity.rank() < Severity::Medium.rank() {
+                f.severity = Severity::Medium;
+            }
+            f
+        })
         .collect();
     sort_findings(&mut findings);
     for f in &mut findings {
@@ -553,7 +567,11 @@ fn to_finding(f: RawFinding, review_id: &str, forbid: bool, diff: &DiffIndex) ->
         review_id: review_id.to_string(),
         position: 0,
         severity,
-        category: f.category.unwrap_or_else(|| "general".into()),
+        category: f
+            .category
+            .map(|c| c.trim().to_ascii_lowercase())
+            .filter(|c| !c.is_empty())
+            .unwrap_or_else(|| "general".into()),
         title,
         file,
         line_start,
@@ -717,7 +735,7 @@ mod tests {
             skip_nits: Some(true),
             ..Default::default()
         });
-        let p = process(raw_review, "r1", &s, &diff);
+        let p = process(raw_review, "r1", &s, &diff, false);
         let sev: Vec<_> = p.findings.iter().map(|f| f.severity).collect();
         assert_eq!(
             sev,
@@ -750,9 +768,42 @@ mod tests {
             "r1",
             &settings(SettingsOverrides::default()),
             &diff,
+            false,
         );
         assert_eq!(p.findings.len(), 1);
         assert_eq!(p.verdict, Verdict::Approve);
+    }
+
+    #[test]
+    fn scope_findings_are_capped_and_need_a_ticket() {
+        let diff = DiffIndex::parse(DIFF);
+        let review = || RawReview {
+            verdict: "request_changes".into(),
+            summary: "s".into(),
+            findings: vec![
+                RawFinding {
+                    category: Some(" Scope".into()),
+                    file: None,
+                    line_start: None,
+                    ..raw("critical", "", 0, "The ticket asks for an expiry")
+                },
+                raw("low", "a.rs", 2, "low"),
+            ],
+        };
+        let on = settings(SettingsOverrides::default());
+        let p = process(review(), "r1", &on, &diff, true);
+        assert_eq!(p.findings[0].category, "scope");
+        assert_eq!(p.findings[0].severity, Severity::Medium);
+
+        // No ticket loaded, or the check is off: scope findings are dropped.
+        let p = process(review(), "r1", &on, &diff, false);
+        assert_eq!(p.findings.len(), 1);
+        let off = settings(SettingsOverrides {
+            ticket_scope_check: Some(false),
+            ..Default::default()
+        });
+        let p = process(review(), "r1", &off, &diff, true);
+        assert!(p.findings.iter().all(|f| f.category != "scope"));
     }
 
     #[test]

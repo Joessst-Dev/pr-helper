@@ -259,6 +259,17 @@ pub struct Review {
     pub approval_posted: bool,
     pub created_at: String,
     pub finished_at: Option<String>,
+    /// Tickets that were loaded as context for this review.
+    pub tickets: Vec<TicketRef>,
+}
+
+/// A ticket that was given to the reviewer, for linking in the UI.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct TicketRef {
+    pub key: String,
+    pub url: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -323,4 +334,79 @@ pub struct SkillInput {
     pub path: Option<String>,
     pub content: Option<String>,
     pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum TicketSourceKind {
+    /// Atlassian Cloud: email plus API token (Basic auth).
+    JiraCloud,
+    /// Jira Server / Data Center: personal access token (Bearer).
+    JiraServer,
+    /// An MCP server configured in the user's Claude Code. The app stores no credentials.
+    Mcp,
+}
+
+impl TicketSourceKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::JiraCloud => "jira_cloud",
+            Self::JiraServer => "jira_server",
+            Self::Mcp => "mcp",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "jira_cloud" => Some(Self::JiraCloud),
+            "jira_server" => Some(Self::JiraServer),
+            "mcp" => Some(Self::Mcp),
+            _ => None,
+        }
+    }
+
+    pub fn needs_token(self) -> bool {
+        self != Self::Mcp
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct TicketSource {
+    pub id: String,
+    pub kind: TicketSourceKind,
+    pub name: String,
+    /// Jira site URL, e.g. `https://acme.atlassian.net`. Optional for MCP (only used for links).
+    pub base_url: String,
+    /// Jira Cloud account email (Basic auth user).
+    pub email: Option<String>,
+    /// MCP server name as configured in Claude Code, e.g. `atlassian`.
+    pub mcp_server: Option<String>,
+    /// Comma separated MCP tool names the fetcher may call.
+    pub mcp_tools: Option<String>,
+    /// Model for the MCP fetcher run. Empty = haiku.
+    pub model: Option<String>,
+    /// Comma separated extra field ids, e.g. `customfield_10035` (acceptance criteria).
+    pub extra_fields: Option<String>,
+    /// Jira account the token belongs to, filled in on save.
+    pub username: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct TicketSourceInput {
+    pub kind: TicketSourceKind,
+    pub name: String,
+    pub base_url: String,
+    pub email: Option<String>,
+    pub mcp_server: Option<String>,
+    pub mcp_tools: Option<String>,
+    pub model: Option<String>,
+    pub extra_fields: Option<String>,
+    /// Only set when the token should be (re)stored.
+    pub token: Option<String>,
 }

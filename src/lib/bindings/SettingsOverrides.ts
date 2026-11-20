@@ -8,4 +8,16 @@ export type SettingsOverrides = { commentLanguage: string | null, forbidAiAttrib
 /**
  * Footer appended to posted reviews when attribution is allowed. Empty = no footer.
  */
-attributionFooter: string | null, skipNits: boolean | null, autoReviewOnNewCommits: boolean | null, autoApproveOnApproveVerdict: boolean | null, pollIntervalSecs: number | null, model: string | null, effort: string | null, maxBudgetUsd: number | null, defaultSelectedMinSeverity: Severity | null, };
+attributionFooter: string | null, skipNits: boolean | null, autoReviewOnNewCommits: boolean | null, autoApproveOnApproveVerdict: boolean | null, pollIntervalSecs: number | null, model: string | null, effort: string | null, maxBudgetUsd: number | null, defaultSelectedMinSeverity: Severity | null, 
+/**
+ * Ticket source to load linked tickets from. `""` turns tickets off at this level.
+ */
+ticketSourceId: string | null, 
+/**
+ * Comma separated Jira project keys whose tickets may be loaded, e.g. `ABC, PAY`.
+ */
+ticketProjectKeys: string | null, 
+/**
+ * Let the reviewer report requirements from the ticket that the PR misses.
+ */
+ticketScopeCheck: boolean | null, };

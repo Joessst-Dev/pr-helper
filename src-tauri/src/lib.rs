@@ -8,6 +8,7 @@ pub mod review;
 pub mod secrets;
 pub mod service;
 pub mod settings;
+pub mod tickets;
 pub mod watcher;
 
 use std::sync::Arc;
@@ -199,6 +200,10 @@ pub fn run() {
             commands::save_server,
             commands::delete_server,
             commands::save_server_settings,
+            commands::list_ticket_sources,
+            commands::save_ticket_source,
+            commands::delete_ticket_source,
+            commands::test_ticket_source,
             commands::list_prs,
             commands::start_review,
             commands::cancel_review,

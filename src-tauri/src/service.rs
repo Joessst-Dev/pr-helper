@@ -8,7 +8,9 @@ use std::sync::{Arc, Mutex};
 use serde::Serialize;
 use ts_rs::TS;
 
-use crate::db::models::{Review, Server, ServerInput};
+use crate::db::models::{
+    Review, Server, ServerInput, TicketSource, TicketSourceInput, TicketSourceKind,
+};
 use crate::db::{Db, now};
 use crate::env;
 use crate::error::{AppError, AppResult};
@@ -17,6 +19,9 @@ use crate::providers::{GitProvider, make_provider};
 use crate::review::queue::ReviewQueue;
 use crate::secrets::SecretStore;
 use crate::settings::{EffectiveSettings, SettingsOverrides, resolve};
+use crate::tickets::jira::{JiraAuth, JiraClient, parse_extra_fields};
+use crate::tickets::{Ticket, is_valid_key, mcp, render};
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]
 #[serde(rename_all = "lowercase")]
@@ -174,6 +179,188 @@ impl Service {
         };
         self.db.set_server_username(&server.id, &username)?;
         self.db.get_server(&server.id)
+    }
+
+    /// Keychain account for a ticket source's token. Prefixed so it never collides with a
+    /// server id.
+    pub fn ticket_secret_id(source_id: &str) -> String {
+        format!("ticket-source:{source_id}")
+    }
+
+    fn jira_client(&self, source: &TicketSource, token: String) -> AppResult<JiraClient> {
+        let auth = match source.kind {
+            TicketSourceKind::JiraCloud => JiraAuth::Basic {
+                email: source
+                    .email
+                    .clone()
+                    .filter(|e| !e.trim().is_empty())
+                    .ok_or_else(|| AppError::invalid("Jira Cloud needs the account email"))?,
+                token,
+            },
+            TicketSourceKind::JiraServer => JiraAuth::Bearer(token),
+            TicketSourceKind::Mcp => {
+                return Err(AppError::invalid("MCP ticket sources have no REST client"));
+            }
+        };
+        Ok(JiraClient::new(
+            &source.base_url,
+            auth,
+            crate::providers::http_client(),
+        ))
+    }
+
+    /// Like [`Self::save_server`]: verifies the token with Jira, stores it only in the secret
+    /// store (keychain) and never in the database. MCP sources have no token.
+    pub async fn save_ticket_source(
+        &self,
+        id: Option<&str>,
+        input: &TicketSourceInput,
+    ) -> AppResult<TicketSource> {
+        if input.name.trim().is_empty() {
+            return Err(AppError::invalid("a name is required"));
+        }
+        let base_url = crate::db::normalize_base_url(&input.base_url);
+        let existing = id.map(|id| self.db.get_ticket_source(id)).transpose()?;
+        let probe = TicketSource {
+            id: id.unwrap_or_default().to_string(),
+            kind: input.kind,
+            name: input.name.clone(),
+            base_url: base_url.clone(),
+            email: input.email.clone(),
+            mcp_server: input.mcp_server.clone(),
+            mcp_tools: input.mcp_tools.clone(),
+            model: input.model.clone(),
+            extra_fields: input.extra_fields.clone(),
+            username: None,
+            created_at: String::new(),
+        };
+
+        if !input.kind.needs_token() {
+            mcp::allowed_tools(&probe)?;
+            let saved = self.db.upsert_ticket_source(id, input, None)?;
+            // A source switched to MCP must not keep an old Jira token around.
+            if existing.is_some_and(|old| old.kind.needs_token()) {
+                self.secrets.delete(&Self::ticket_secret_id(&saved.id))?;
+            }
+            return Ok(saved);
+        }
+
+        if !base_url.starts_with("https://") && !base_url.starts_with("http://") {
+            return Err(AppError::invalid(
+                "enter the Jira URL, e.g. https://acme.atlassian.net",
+            ));
+        }
+        let new_token = input
+            .token
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty());
+        let token = match (new_token, &existing) {
+            (Some(t), _) => t.to_string(),
+            // Never send a stored token to a newly typed URL.
+            (None, Some(old)) if old.base_url != base_url || old.kind != input.kind => {
+                return Err(AppError::invalid(
+                    "enter the API token again when changing the Jira URL or type",
+                ));
+            }
+            (None, Some(old)) => self.secrets.require(&Self::ticket_secret_id(&old.id))?,
+            (None, None) => return Err(AppError::invalid("an API token is required")),
+        };
+        let username = self.jira_client(&probe, token.clone())?.myself().await?;
+
+        match &existing {
+            Some(old) => {
+                let secret_id = Self::ticket_secret_id(&old.id);
+                let previous = match new_token {
+                    Some(t) => {
+                        let previous = self.secrets.get(&secret_id)?;
+                        self.secrets.set(&secret_id, t)?;
+                        previous
+                    }
+                    None => None,
+                };
+                match self
+                    .db
+                    .upsert_ticket_source(Some(&old.id), input, Some(&username))
+                {
+                    Ok(s) => Ok(s),
+                    Err(e) => {
+                        if let Some(previous) = previous {
+                            let _ = self.secrets.set(&secret_id, &previous);
+                        }
+                        Err(e)
+                    }
+                }
+            }
+            None => {
+                let saved = self.db.upsert_ticket_source(None, input, Some(&username))?;
+                if let Err(e) = self.secrets.set(&Self::ticket_secret_id(&saved.id), &token) {
+                    let _ = self.db.delete_ticket_source(&saved.id);
+                    return Err(e);
+                }
+                Ok(saved)
+            }
+        }
+    }
+
+    pub fn delete_ticket_source(&self, id: &str) -> AppResult<()> {
+        // Token first, so a refusing keychain leaves the source visible for a retry.
+        self.secrets.delete(&Self::ticket_secret_id(id))?;
+        self.db.delete_ticket_source(id)
+    }
+
+    /// Loads one ticket. `work_dir` is a scratch directory for the MCP fetcher.
+    pub async fn fetch_ticket(
+        &self,
+        source: &TicketSource,
+        key: &str,
+        work_dir: &std::path::Path,
+        cancel: CancellationToken,
+    ) -> AppResult<Ticket> {
+        if !is_valid_key(key) {
+            return Err(AppError::invalid(format!("invalid ticket key {key:?}")));
+        }
+        let extra = parse_extra_fields(source.extra_fields.as_deref());
+        match source.kind {
+            TicketSourceKind::Mcp => {
+                let config = self.db.app_config()?;
+                let claude = env::resolve_tool("claude", config.claude_path.as_deref())?;
+                mcp::fetch(
+                    source,
+                    key,
+                    &extra,
+                    mcp::FetchEnv {
+                        claude,
+                        path_env: env::login_path().to_string(),
+                        work_dir,
+                        cancel,
+                    },
+                )
+                .await
+            }
+            _ => {
+                let token = self.secrets.require(&Self::ticket_secret_id(&source.id))?;
+                let client = self.jira_client(source, token)?;
+                tokio::select! {
+                    t = client.issue(key, &extra) => t,
+                    _ = cancel.cancelled() => Err(AppError::Reviewer("cancelled".into())),
+                }
+            }
+        }
+    }
+
+    /// Loads a ticket with a saved source and returns what the reviewer would see.
+    pub async fn test_ticket_source(&self, id: &str, key: &str) -> AppResult<String> {
+        let source = self.db.get_ticket_source(id)?;
+        let key = key.trim().to_ascii_uppercase();
+        let work_dir = self
+            .cache
+            .review_dir(&format!("ticket-test-{}", crate::db::new_id()));
+        let result = self
+            .fetch_ticket(&source, &key, &work_dir, CancellationToken::new())
+            .await;
+        let _ = tokio::fs::remove_dir_all(&work_dir).await;
+        Ok(render::render(&[result?]))
     }
 
     pub fn effective_settings(

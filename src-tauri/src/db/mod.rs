@@ -333,6 +333,93 @@ impl Db {
         Ok(())
     }
 
+    // ---- ticket sources --------------------------------------------------
+
+    fn ticket_source_from_row(r: &Row) -> rusqlite::Result<TicketSource> {
+        let kind: String = r.get("kind")?;
+        Ok(TicketSource {
+            id: r.get("id")?,
+            kind: TicketSourceKind::parse(&kind).unwrap_or(TicketSourceKind::JiraCloud),
+            name: r.get("name")?,
+            base_url: r.get("base_url")?,
+            email: r.get("email")?,
+            mcp_server: r.get("mcp_server")?,
+            mcp_tools: r.get("mcp_tools")?,
+            model: r.get("model")?,
+            extra_fields: r.get("extra_fields")?,
+            username: r.get("username")?,
+            created_at: r.get("created_at")?,
+        })
+    }
+
+    pub fn list_ticket_sources(&self) -> AppResult<Vec<TicketSource>> {
+        self.with(|c| {
+            let mut stmt =
+                c.prepare("SELECT * FROM ticket_sources ORDER BY name COLLATE NOCASE")?;
+            let rows = stmt.query_map([], Self::ticket_source_from_row)?;
+            rows.collect()
+        })
+    }
+
+    pub fn get_ticket_source(&self, id: &str) -> AppResult<TicketSource> {
+        self.with(|c| {
+            c.query_row(
+                "SELECT * FROM ticket_sources WHERE id = ?1",
+                [id],
+                Self::ticket_source_from_row,
+            )
+            .optional()
+        })?
+        .ok_or_else(|| AppError::NotFound(format!("ticket source {id}")))
+    }
+
+    /// Inserts (`id` = None) or updates a ticket source. Never stores a token.
+    pub fn upsert_ticket_source(
+        &self,
+        id: Option<&str>,
+        input: &TicketSourceInput,
+        username: Option<&str>,
+    ) -> AppResult<TicketSource> {
+        let id = id.map(str::to_string).unwrap_or_else(new_id);
+        let opt = |v: &Option<String>| {
+            v.as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        };
+        self.with(|c| {
+            c.execute(
+                "INSERT INTO ticket_sources (id, kind, name, base_url, email, mcp_server, mcp_tools,
+                   model, extra_fields, username, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                 ON CONFLICT(id) DO UPDATE SET kind = excluded.kind, name = excluded.name,
+                   base_url = excluded.base_url, email = excluded.email,
+                   mcp_server = excluded.mcp_server, mcp_tools = excluded.mcp_tools,
+                   model = excluded.model, extra_fields = excluded.extra_fields,
+                   username = excluded.username",
+                params![
+                    id,
+                    input.kind.as_str(),
+                    input.name.trim(),
+                    normalize_base_url(&input.base_url),
+                    opt(&input.email),
+                    opt(&input.mcp_server),
+                    opt(&input.mcp_tools),
+                    opt(&input.model),
+                    opt(&input.extra_fields),
+                    username,
+                    now()
+                ],
+            )
+        })?;
+        self.get_ticket_source(&id)
+    }
+
+    pub fn delete_ticket_source(&self, id: &str) -> AppResult<()> {
+        self.with(|c| c.execute("DELETE FROM ticket_sources WHERE id = ?1", [id]))?;
+        Ok(())
+    }
+
     // ---- tracked PRs -----------------------------------------------------
 
     fn tracked_from_row(r: &Row) -> rusqlite::Result<TrackedPr> {
@@ -512,6 +599,10 @@ impl Db {
             approval_posted: r.get("approval_posted")?,
             created_at: r.get("created_at")?,
             finished_at: r.get("finished_at")?,
+            tickets: r
+                .get::<_, Option<String>>("tickets")?
+                .and_then(|t| serde_json::from_str(&t).ok())
+                .unwrap_or_default(),
         })
     }
 
@@ -691,6 +782,19 @@ impl Db {
             )?;
         }
         tx.commit()?;
+        Ok(())
+    }
+
+    pub fn set_review_tickets(&self, id: &str, tickets: &[TicketRef]) -> AppResult<()> {
+        let raw = (!tickets.is_empty())
+            .then(|| serde_json::to_string(tickets))
+            .transpose()?;
+        self.with(|c| {
+            c.execute(
+                "UPDATE reviews SET tickets = ?2 WHERE id = ?1",
+                params![id, raw],
+            )
+        })?;
         Ok(())
     }
 
@@ -936,6 +1040,43 @@ mod tests {
         assert_eq!(db.list_findings(&review.id).unwrap().len(), 1);
         let last = db.last_done_review(&s.id, "team/app", 7).unwrap().unwrap();
         assert_eq!(last.id, review.id);
+        assert!(last.tickets.is_empty());
+
+        let refs = vec![TicketRef {
+            key: "ABC-1".into(),
+            url: Some("https://jira/browse/ABC-1".into()),
+        }];
+        db.set_review_tickets(&review.id, &refs).unwrap();
+        assert_eq!(db.get_review(&review.id).unwrap().tickets, refs);
+    }
+
+    #[test]
+    fn ticket_source_crud() {
+        let db = Db::open_in_memory().unwrap();
+        let input = TicketSourceInput {
+            kind: TicketSourceKind::JiraCloud,
+            name: " Acme Jira ".into(),
+            base_url: "https://acme.atlassian.net/".into(),
+            email: Some("me@acme.test".into()),
+            mcp_server: Some("  ".into()),
+            mcp_tools: None,
+            model: None,
+            extra_fields: Some("customfield_10035".into()),
+            token: Some("must-not-be-stored".into()),
+        };
+        let s = db.upsert_ticket_source(None, &input, Some("Me")).unwrap();
+        assert_eq!(s.name, "Acme Jira");
+        assert_eq!(s.base_url, "https://acme.atlassian.net");
+        assert_eq!(s.mcp_server, None);
+        assert_eq!(s.username.as_deref(), Some("Me"));
+        let mut edited = input.clone();
+        edited.name = "Renamed".into();
+        db.upsert_ticket_source(Some(&s.id), &edited, None).unwrap();
+        let all = db.list_ticket_sources().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].name, "Renamed");
+        db.delete_ticket_source(&s.id).unwrap();
+        assert!(db.list_ticket_sources().unwrap().is_empty());
     }
 
     #[test]

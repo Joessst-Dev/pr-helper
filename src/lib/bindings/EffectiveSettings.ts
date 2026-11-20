@@ -2,4 +2,4 @@
 import type { Severity } from "./Severity";
 import type { Sourced } from "./Sourced";
 
-export type EffectiveSettings = { commentLanguage: Sourced<string>, forbidAiAttribution: Sourced<boolean>, attributionFooter: Sourced<string>, skipNits: Sourced<boolean>, autoReviewOnNewCommits: Sourced<boolean>, autoApproveOnApproveVerdict: Sourced<boolean>, pollIntervalSecs: Sourced<number>, model: Sourced<string | null>, effort: Sourced<string | null>, maxBudgetUsd: Sourced<number | null>, defaultSelectedMinSeverity: Sourced<Severity>, };
+export type EffectiveSettings = { commentLanguage: Sourced<string>, forbidAiAttribution: Sourced<boolean>, attributionFooter: Sourced<string>, skipNits: Sourced<boolean>, autoReviewOnNewCommits: Sourced<boolean>, autoApproveOnApproveVerdict: Sourced<boolean>, pollIntervalSecs: Sourced<number>, model: Sourced<string | null>, effort: Sourced<string | null>, maxBudgetUsd: Sourced<number | null>, defaultSelectedMinSeverity: Sourced<Severity>, ticketSourceId: Sourced<string | null>, ticketProjectKeys: Sourced<string>, ticketScopeCheck: Sourced<boolean>, };

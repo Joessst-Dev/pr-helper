@@ -16,6 +16,8 @@ import type { ServerInput } from "./bindings/ServerInput";
 import type { SettingsOverrides } from "./bindings/SettingsOverrides";
 import type { Skill } from "./bindings/Skill";
 import type { SkillInput } from "./bindings/SkillInput";
+import type { TicketSource } from "./bindings/TicketSource";
+import type { TicketSourceInput } from "./bindings/TicketSourceInput";
 import type { TrackedPr } from "./bindings/TrackedPr";
 
 /** Typed wrappers around the Tauri commands in `src-tauri/src/commands.rs`. */
@@ -25,6 +27,12 @@ export const api = {
   deleteServer: (id: string) => invoke<void>("delete_server", { id }),
   saveServerSettings: (id: string, settings: SettingsOverrides) =>
     invoke<void>("save_server_settings", { id, settings }),
+
+  listTicketSources: () => invoke<TicketSource[]>("list_ticket_sources"),
+  saveTicketSource: (id: string | null, input: TicketSourceInput) =>
+    invoke<TicketSource>("save_ticket_source", { id, input }),
+  deleteTicketSource: (id: string) => invoke<void>("delete_ticket_source", { id }),
+  testTicketSource: (id: string, key: string) => invoke<string>("test_ticket_source", { id, key }),
 
   listPrs: (serverId: string, filter: PrFilter) => invoke<PrListItem[]>("list_prs", { serverId, filter }),
   startReview: (serverId: string, projectId: string, number: number) =>
