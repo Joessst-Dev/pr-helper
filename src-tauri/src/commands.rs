@@ -189,8 +189,15 @@ pub async fn load_pr_tickets(
     server_id: String,
     repo: String,
     keys: Vec<String>,
+    request_id: String,
 ) -> AppResult<Vec<TicketLoad>> {
-    svc.load_pr_tickets(&server_id, &repo, &keys).await
+    svc.load_pr_tickets(&server_id, &repo, &keys, &request_id)
+        .await
+}
+
+#[tauri::command]
+pub fn cancel_ticket_load(svc: Svc<'_>, request_id: String) -> AppResult<bool> {
+    svc.cancel_ticket_load(&request_id)
 }
 
 #[tauri::command]

@@ -11,10 +11,12 @@ import type { TicketLoad } from "../lib/bindings/TicketLoad";
 vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: vi.fn() }));
 const loadPrTickets = vi.fn();
 const getPrDetail = vi.fn();
+const cancelTicketLoad = vi.fn();
 vi.mock("../lib/api", () => ({
   api: {
     loadPrTickets: (...a: unknown[]) => loadPrTickets(...a),
     getPrDetail: (...a: unknown[]) => getPrDetail(...a),
+    cancelTicketLoad: (...a: unknown[]) => cancelTicketLoad(...a),
   },
   errorMessage: (e: unknown) => String(e),
 }));
@@ -56,7 +58,7 @@ describe("TicketsSection", () => {
   it("loads Jira REST tickets right away", async () => {
     renderSection({ sourceName: "Acme Jira", sourceKind: "jira_cloud", keys: ["ABC-7", "ABC-8"], message: null });
     expect(await screen.findByText("Reset password")).toBeInTheDocument();
-    expect(loadPrTickets).toHaveBeenCalledWith("s1", "acme/app", ["ABC-7", "ABC-8"]);
+    expect(loadPrTickets).toHaveBeenCalledWith("s1", "acme/app", ["ABC-7", "ABC-8"], expect.any(String));
     expect(screen.getByText("Email is sent")).toBeInTheDocument();
     expect(screen.getByText(/could not be loaded: not found/)).toBeInTheDocument();
   });
@@ -68,6 +70,21 @@ describe("TicketsSection", () => {
     await userEvent.click(screen.getByRole("button", { name: "Load tickets" }));
     await waitFor(() => expect(loadPrTickets).toHaveBeenCalledTimes(1));
     expect(await screen.findByText("Reset password")).toBeInTheDocument();
+  });
+
+  it("cancels the backend load when the page is left", async () => {
+    let requestId = "";
+    loadPrTickets.mockImplementation((_s, _r, _k, id: string) => {
+      requestId = id;
+      return new Promise(() => {});
+    });
+    cancelTicketLoad.mockResolvedValue(true);
+    const { unmount } = renderSection({ sourceName: "Atlassian MCP", sourceKind: "mcp", keys: ["ABC-7"], message: null });
+    await userEvent.click(screen.getByRole("button", { name: "Load tickets" }));
+    await waitFor(() => expect(loadPrTickets).toHaveBeenCalledTimes(1));
+    unmount();
+    await waitFor(() => expect(cancelTicketLoad).toHaveBeenCalledWith(requestId));
+    expect(requestId).not.toBe("");
   });
 
   it("explains why nothing is loaded", () => {

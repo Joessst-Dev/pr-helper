@@ -73,6 +73,17 @@ pub enum TicketPlan {
     },
 }
 
+fn validate_request_id(id: &str) -> AppResult<()> {
+    let ok = !id.is_empty()
+        && id.len() <= 64
+        && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+    if ok {
+        Ok(())
+    } else {
+        Err(AppError::invalid("invalid request id"))
+    }
+}
+
 /// One ticket loaded for display, or why it could not be loaded.
 #[derive(Debug, Clone, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -91,6 +102,20 @@ pub struct Service {
     pub queue: ReviewQueue,
     provider_factory: Box<ProviderFactory>,
     logs: Mutex<HashMap<String, Vec<ProgressEvent>>>,
+    /// Running ticket loads of the PR view, by request id, so the UI can cancel them.
+    ticket_loads: Mutex<HashMap<String, CancellationToken>>,
+}
+
+/// Unregisters a ticket load when it ends, also when the command future is dropped.
+struct TicketLoadGuard<'a> {
+    loads: &'a Mutex<HashMap<String, CancellationToken>>,
+    id: String,
+}
+
+impl Drop for TicketLoadGuard<'_> {
+    fn drop(&mut self) {
+        self.loads.lock().unwrap().remove(&self.id);
+    }
 }
 
 impl Service {
@@ -116,6 +141,7 @@ impl Service {
             sink,
             provider_factory: provider_factory.unwrap_or_else(|| Box::new(make_provider)),
             logs: Mutex::new(HashMap::new()),
+            ticket_loads: Mutex::new(HashMap::new()),
         }))
     }
 
@@ -436,7 +462,23 @@ impl Service {
         server_id: &str,
         repo: &str,
         keys: &[String],
+        request_id: &str,
     ) -> AppResult<Vec<TicketLoad>> {
+        validate_request_id(request_id)?;
+        // A cancel can arrive before the load starts; it leaves a cancelled token behind.
+        let cancel = self
+            .ticket_loads
+            .lock()
+            .unwrap()
+            .entry(request_id.to_string())
+            .or_default()
+            .clone();
+        let _guard = TicketLoadGuard {
+            loads: &self.ticket_loads,
+            id: request_id.to_string(),
+        };
+        let cancelled = || AppError::Reviewer("cancelled".into());
+
         let settings = self.effective_settings(server_id, Some(repo))?;
         let Some(source_id) = settings.ticket_source_id.value.as_deref() else {
             return Err(AppError::invalid(
@@ -448,13 +490,19 @@ impl Service {
         let keys = tickets::filter_keys(keys, &projects);
         let mut loaded = Vec::with_capacity(keys.len());
         for key in keys {
+            if cancel.is_cancelled() {
+                return Err(cancelled());
+            }
             let work_dir = self
                 .cache
                 .review_dir(&format!("ticket-view-{}", crate::db::new_id()));
             let result = self
-                .fetch_ticket(&source, &key, &work_dir, CancellationToken::new())
+                .fetch_ticket(&source, &key, &work_dir, cancel.clone())
                 .await;
             let _ = tokio::fs::remove_dir_all(&work_dir).await;
+            if cancel.is_cancelled() {
+                return Err(cancelled());
+            }
             loaded.push(match result {
                 Ok(t) => TicketLoad {
                     key,
@@ -469,6 +517,23 @@ impl Service {
             });
         }
         Ok(loaded)
+    }
+
+    /// Cancels a running ticket load of the PR view, including an MCP fetcher run.
+    /// Returns whether a load with this id was running.
+    pub fn cancel_ticket_load(&self, request_id: &str) -> AppResult<bool> {
+        validate_request_id(request_id)?;
+        let mut loads = self.ticket_loads.lock().unwrap();
+        let running = loads.contains_key(request_id);
+        loads.entry(request_id.to_string()).or_default().cancel();
+        if !running {
+            // Nothing to stop yet. Keep the cancelled token only for a load that is about
+            // to start, and bound what a stream of stray cancels can leave behind.
+            if loads.len() > 64 {
+                loads.retain(|_, t| !t.is_cancelled());
+            }
+        }
+        Ok(running)
     }
 
     pub fn effective_settings(

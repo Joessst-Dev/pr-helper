@@ -39,8 +39,9 @@ export const api = {
   listPrs: (serverId: string, filter: PrFilter) => invoke<PrListItem[]>("list_prs", { serverId, filter }),
   getPrDetail: (serverId: string, projectId: string, number: number) =>
     invoke<PrDetail>("get_pr_detail", { serverId, projectId, number }),
-  loadPrTickets: (serverId: string, repo: string, keys: string[]) =>
-    invoke<TicketLoad[]>("load_pr_tickets", { serverId, repo, keys }),
+  loadPrTickets: (serverId: string, repo: string, keys: string[], requestId: string) =>
+    invoke<TicketLoad[]>("load_pr_tickets", { serverId, repo, keys, requestId }),
+  cancelTicketLoad: (requestId: string) => invoke<boolean>("cancel_ticket_load", { requestId }),
   startReview: (serverId: string, projectId: string, number: number) =>
     invoke<Review>("start_review", { serverId, projectId, number }),
   cancelReview: (reviewId: string) => invoke<boolean>("cancel_review", { reviewId }),

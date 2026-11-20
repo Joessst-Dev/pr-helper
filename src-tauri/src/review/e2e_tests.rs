@@ -968,7 +968,7 @@ async fn pr_view_tickets_follow_settings_and_the_project_allow_list() {
         TicketPlan::NotConfigured
     ));
     assert!(
-        svc.load_pr_tickets(&server.id, &pr.repo, &["ABC-7".into()])
+        svc.load_pr_tickets(&server.id, &pr.repo, &["ABC-7".into()], "req-1")
             .await
             .is_err()
     );
@@ -1001,6 +1001,7 @@ async fn pr_view_tickets_follow_settings_and_the_project_allow_list() {
             &server.id,
             &pr.repo,
             &["SECRET-1".into(), "abc-7".into(), "ABC-8".into()],
+            "req-2",
         )
         .await
         .unwrap();
@@ -1011,4 +1012,73 @@ async fn pr_view_tickets_follow_settings_and_the_project_allow_list() {
     assert_eq!(loaded[0].ticket.as_ref().unwrap().summary, "Reset password");
     assert!(loaded[1].ticket.is_none());
     assert!(loaded[1].error.is_some());
+}
+
+#[tokio::test]
+async fn pr_view_ticket_loads_can_be_cancelled() {
+    use wiremock::matchers::{method, path};
+    let jira = wiremock::MockServer::start().await;
+    mock_myself(&jira).await;
+    wiremock::Mock::given(method("GET"))
+        .and(path("/rest/api/2/issue/ABC-1"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"key": "ABC-1", "fields": {}}))
+                .set_delay(Duration::from_secs(30)),
+        )
+        .mount(&jira)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Arc::new(Db::open_in_memory().unwrap());
+    let server = db.insert_server(&gitlab_input(None)).unwrap();
+    let svc = service_with(
+        db.clone(),
+        Arc::new(MemoryStore::default()),
+        tmp.path().join("cache"),
+    );
+    let source = svc
+        .save_ticket_source(None, &jira_input(&jira.uri(), Some("tok")))
+        .await
+        .unwrap();
+    db.set_server_settings(
+        &server.id,
+        &SettingsOverrides {
+            ticket_source_id: Some(source.id),
+            ticket_project_keys: Some("ABC".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    assert!(svc.cancel_ticket_load("../bad id").is_err());
+
+    // Cancelled while the fetch is in flight.
+    let load = {
+        let svc = svc.clone();
+        let server_id = server.id.clone();
+        tokio::spawn(async move {
+            svc.load_pr_tickets(&server_id, "acme/app", &["ABC-1".into()], "req-a")
+                .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(svc.cancel_ticket_load("req-a").unwrap());
+    let result = tokio::time::timeout(Duration::from_secs(5), load)
+        .await
+        .expect("load stops promptly")
+        .unwrap();
+    assert!(result.unwrap_err().to_string().contains("cancelled"));
+    // Finished loads are unregistered.
+    assert!(!svc.cancel_ticket_load("req-a").unwrap());
+
+    // Cancelled before it started.
+    assert!(!svc.cancel_ticket_load("req-b").unwrap());
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        svc.load_pr_tickets(&server.id, "acme/app", &["ABC-1".into()], "req-b"),
+    )
+    .await
+    .expect("load stops promptly");
+    assert!(result.is_err());
 }

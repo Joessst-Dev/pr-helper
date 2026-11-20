@@ -157,12 +157,28 @@ function ReviewItem({ review }: { review: Review }) {
   );
 }
 
+/**
+ * Loads tickets and stops the backend fetch (an MCP fetcher run is a paid Claude run) when
+ * React Query aborts the query, e.g. because the page was left.
+ */
+async function loadTickets(serverId: string, repo: string, keys: string[], signal: AbortSignal) {
+  const requestId = crypto.randomUUID();
+  const cancel = () => void api.cancelTicketLoad(requestId).catch(() => {});
+  if (signal.aborted) throw signal.reason;
+  signal.addEventListener("abort", cancel, { once: true });
+  try {
+    return await api.loadPrTickets(serverId, repo, keys, requestId);
+  } finally {
+    signal.removeEventListener("abort", cancel);
+  }
+}
+
 export function TicketsSection({ serverId, repo, info }: { serverId: string; repo: string; info: PrTicketInfo }) {
   // MCP fetches spawn a Claude run, so they only start on request. Jira REST loads right away.
   const [requested, setRequested] = useState(info.sourceKind !== "mcp");
   const tickets = useQuery({
     queryKey: ["pr-tickets", serverId, repo, info.sourceKind, info.sourceName, info.keys],
-    queryFn: () => api.loadPrTickets(serverId, repo, info.keys),
+    queryFn: ({ signal }) => loadTickets(serverId, repo, info.keys, signal),
     enabled: requested && info.keys.length > 0,
     staleTime: 5 * 60_000,
   });
