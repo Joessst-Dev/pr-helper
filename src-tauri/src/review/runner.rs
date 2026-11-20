@@ -17,7 +17,19 @@ const EXIT_GRACE: Duration = Duration::from_secs(10);
 /// Built-in tools the reviewer gets. No Bash, no writes, no network.
 pub const REVIEWER_TOOLS: &[&str] = &["Read", "Grep", "Glob", "Skill"];
 
+/// Which tools a run may use.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ToolPolicy {
+    /// The PR reviewer: read-only built-ins, no MCP servers at all.
+    Reviewer,
+    /// The ticket fetcher: no built-in tools, only the named MCP tools
+    /// (`mcp__<server>__<tool>`). It never sees PR content and runs in an empty directory.
+    /// User-scoped MCP servers must load, so there is no `--strict-mcp-config`.
+    TicketFetcher { allowed: Vec<String> },
+}
+
 pub struct RunRequest {
+    pub policy: ToolPolicy,
     pub claude: PathBuf,
     pub path_env: String,
     pub cwd: PathBuf,
@@ -46,18 +58,32 @@ impl RunRequest {
             self.session_id.clone(),
             "--append-system-prompt".into(),
             self.system_prompt.clone(),
-            // The checkout is untrusted PR content: ignore its .claude/settings.json (hooks!)
-            // and any MCP servers it declares.
+            // The checkout is untrusted PR content: ignore its .claude/settings.json (hooks!).
             "--setting-sources".into(),
             "user".into(),
-            "--strict-mcp-config".into(),
-            "--permission-mode".into(),
-            "default".into(),
         ];
-        a.push("--tools".into());
-        a.extend(REVIEWER_TOOLS.iter().map(|t| t.to_string()));
-        a.push("--allowed-tools".into());
-        a.extend(REVIEWER_TOOLS.iter().map(|t| t.to_string()));
+        match &self.policy {
+            ToolPolicy::Reviewer => {
+                a.extend(["--permission-mode".into(), "default".into()]);
+                // ...and any MCP servers it declares.
+                a.push("--strict-mcp-config".into());
+                a.push("--tools".into());
+                a.extend(REVIEWER_TOOLS.iter().map(|t| t.to_string()));
+                a.push("--allowed-tools".into());
+                a.extend(REVIEWER_TOOLS.iter().map(|t| t.to_string()));
+            }
+            ToolPolicy::TicketFetcher { allowed } => {
+                // Every other loaded MCP tool (all of the user's servers and connectors are
+                // visible) is denied without a prompt. Verified with the real CLI, including
+                // calls routed through a gateway server.
+                a.extend(["--permission-mode".into(), "dontAsk".into()]);
+                // No built-in tools at all (no Read, Bash, web, ...).
+                a.push("--tools".into());
+                a.push(String::new());
+                a.push("--allowed-tools".into());
+                a.extend(allowed.iter().cloned());
+            }
+        }
         for d in &self.add_dirs {
             a.push("--add-dir".into());
             a.push(d.to_string_lossy().into_owned());
@@ -350,6 +376,7 @@ mod tests {
     #[test]
     fn args_lock_down_the_session() {
         let req = RunRequest {
+            policy: ToolPolicy::Reviewer,
             claude: "claude".into(),
             path_env: String::new(),
             cwd: ".".into(),
@@ -366,6 +393,7 @@ mod tests {
         };
         let args = req.args().join(" ");
         assert!(args.contains("--setting-sources user"));
+        assert!(args.contains("--permission-mode default"));
         assert!(args.contains("--strict-mcp-config"));
         assert!(args.contains("--tools Read Grep Glob Skill"));
         assert!(!args.contains("Bash"));
@@ -374,6 +402,47 @@ mod tests {
         assert!(args.contains("--model opus"));
         assert!(args.contains("--max-budget-usd 2.5"));
         assert!(!args.contains("--effort"));
+    }
+
+    #[test]
+    fn fetcher_args_allow_only_the_named_mcp_tools() {
+        let req = RunRequest {
+            policy: ToolPolicy::TicketFetcher {
+                allowed: vec!["mcp__atlassian__getJiraIssue".into()],
+            },
+            claude: "claude".into(),
+            path_env: String::new(),
+            cwd: "/empty".into(),
+            add_dirs: vec![],
+            plugin_dir: None,
+            system_prompt: "sys".into(),
+            prompt: "p".into(),
+            schema: serde_json::json!({}),
+            session_id: "sid".into(),
+            model: Some("haiku".into()),
+            effort: None,
+            max_budget_usd: None,
+            timeout: Duration::from_secs(60),
+        };
+        let args = req.args();
+        let tools = args.iter().position(|a| a == "--tools").unwrap();
+        assert_eq!(args[tools + 1], "");
+        let allowed = args.iter().position(|a| a == "--allowed-tools").unwrap();
+        assert_eq!(args[allowed + 1], "mcp__atlassian__getJiraIssue");
+        let joined = args.join(" ");
+        assert!(joined.contains("--setting-sources user"));
+        assert!(joined.contains("--permission-mode dontAsk"));
+        for forbidden in [
+            "Read",
+            "Grep",
+            "Glob",
+            "Bash",
+            "Skill",
+            "--add-dir",
+            "--plugin-dir",
+        ] {
+            assert!(!joined.contains(forbidden), "{forbidden} in {joined}");
+        }
     }
 
     /// Runs the real spawn path against a fake `claude` that replays the fixture.
@@ -397,6 +466,7 @@ mod tests {
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let req = RunRequest {
+            policy: ToolPolicy::Reviewer,
             claude: fake,
             path_env: std::env::var("PATH").unwrap(),
             cwd: tmp.path().into(),
@@ -432,6 +502,7 @@ mod tests {
         std::fs::write(&fake, "#!/bin/sh\nsleep 30\n").unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
         let req = RunRequest {
+            policy: ToolPolicy::Reviewer,
             claude: fake,
             path_env: std::env::var("PATH").unwrap(),
             cwd: tmp.path().into(),

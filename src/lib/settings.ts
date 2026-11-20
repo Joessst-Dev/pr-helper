@@ -13,4 +13,7 @@ export const EMPTY_OVERRIDES: SettingsOverrides = {
   effort: null,
   maxBudgetUsd: null,
   defaultSelectedMinSeverity: null,
+  ticketSourceId: null,
+  ticketProjectKeys: null,
+  ticketScopeCheck: null,
 };

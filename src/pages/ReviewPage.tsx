@@ -14,6 +14,7 @@ import { useReviewProgress } from "../lib/events";
 import { formatCost, relativeTime, SEVERITIES, SEVERITY_LABEL, shortSha } from "../lib/format";
 import { ReviewStatusBadge, VerdictBadge } from "../components/badges";
 import { FindingCard, RulesWarning, useCommentCheck } from "../components/FindingCard";
+import { TicketChips } from "../components/TicketChips";
 import { Badge, Button, Card, EmptyState, ErrorBanner, PageHeader, Select, Spinner, TextArea } from "../components/ui";
 
 export function ReviewPage() {
@@ -72,6 +73,7 @@ export function ReviewPage() {
             <span>· {relativeTime(review.createdAt)}</span>
             {review.costUsd != null && <span>· {formatCost(review.costUsd)}</span>}
             {review.approvalPosted && <Badge tone="ok">Approval posted</Badge>}
+            <TicketChips tickets={review.tickets} />
           </span>
         }
         actions={

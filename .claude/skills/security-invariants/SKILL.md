@@ -34,4 +34,12 @@ The worktree contains PR author-controlled files. `RunRequest::args()` in `revie
 
 `args_lock_down_the_session` and the e2e test `full_review_and_post_flow` assert these flags. Extend them if you add flags. Never add `--dangerously-skip-permissions` or Bash.
 
+## Ticket context (`tickets/`)
+
+- Jira tokens follow the token rules above. They are stored under the keychain account `ticket-source:<id>` (`Service::ticket_secret_id`), written only by `Service::save_ticket_source` (verified with `/rest/api/2/myself` first), and removed by `delete_ticket_source` or when a source switches to MCP. Guard test: `ticket_source_tokens_live_in_the_secret_store_never_in_the_database`.
+- Ticket keys come from author-controlled text. Only keys from the configured `ticketProjectKeys` are fetched, and every key must match `KEY_RE` before it goes into a URL or prompt.
+- Ticket text is untrusted. It is fenced in `tickets.md`, the prompt says it is data, and `steering_attempt` checks it before auto-approval.
+- The MCP fetcher (`ToolPolicy::TicketFetcher`) must keep `--tools ""`, `--permission-mode dontAsk` and an `--allowed-tools` list of validated `mcp__<server>__<tool>` names (no wildcards). It runs in an empty dir and never sees PR content. The user's other MCP servers are loaded and visible to it, and `dontAsk` is what denies them. `fetcher_args_allow_only_the_named_mcp_tools` and `fetch_runs_a_locked_down_session` assert this.
+- The reviewer never gets MCP or network access for tickets.
+
 Custom skills are copied into a per-review plugin dir (`review/skills.rs`). Symlinks inside skill folders are skipped on purpose.

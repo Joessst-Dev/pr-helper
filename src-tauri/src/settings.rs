@@ -22,6 +22,12 @@ pub struct SettingsOverrides {
     pub effort: Option<String>,
     pub max_budget_usd: Option<f64>,
     pub default_selected_min_severity: Option<Severity>,
+    /// Ticket source to load linked tickets from. `""` turns tickets off at this level.
+    pub ticket_source_id: Option<String>,
+    /// Comma separated Jira project keys whose tickets may be loaded, e.g. `ABC, PAY`.
+    pub ticket_project_keys: Option<String>,
+    /// Let the reviewer report requirements from the ticket that the PR misses.
+    pub ticket_scope_check: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -57,6 +63,9 @@ pub struct EffectiveSettings {
     pub effort: Sourced<Option<String>>,
     pub max_budget_usd: Sourced<Option<f64>>,
     pub default_selected_min_severity: Sourced<Severity>,
+    pub ticket_source_id: Sourced<Option<String>>,
+    pub ticket_project_keys: Sourced<String>,
+    pub ticket_scope_check: Sourced<bool>,
 }
 
 pub const MIN_POLL_INTERVAL_SECS: u32 = 60;
@@ -112,6 +121,8 @@ pub fn resolve(
     }
 
     let mut poll = pick(300, levels!(poll_interval_secs));
+    let mut ticket_source_id = pick_opt(levels!(ticket_source_id));
+    ticket_source_id.value = ticket_source_id.value.filter(|id| !id.trim().is_empty());
     poll.value = poll.value.max(MIN_POLL_INTERVAL_SECS);
 
     EffectiveSettings {
@@ -129,6 +140,9 @@ pub fn resolve(
             Severity::Medium,
             levels!(default_selected_min_severity),
         ),
+        ticket_source_id,
+        ticket_project_keys: pick(String::new(), levels!(ticket_project_keys)),
+        ticket_scope_check: pick(true, levels!(ticket_scope_check)),
     }
 }
 
@@ -211,6 +225,26 @@ mod tests {
         };
         let eff = resolve(&SettingsOverrides::default(), &server, None);
         assert_eq!(eff.poll_interval_secs.value, MIN_POLL_INTERVAL_SECS);
+    }
+
+    #[test]
+    fn an_empty_ticket_source_turns_tickets_off() {
+        let global = SettingsOverrides {
+            ticket_source_id: Some("jira".into()),
+            ..Default::default()
+        };
+        let eff = resolve(&global, &SettingsOverrides::default(), None);
+        assert_eq!(eff.ticket_source_id.value.as_deref(), Some("jira"));
+        assert!(eff.ticket_scope_check.value);
+        assert_eq!(eff.ticket_project_keys.value, "");
+
+        let repo = SettingsOverrides {
+            ticket_source_id: Some(String::new()),
+            ..Default::default()
+        };
+        let eff = resolve(&global, &SettingsOverrides::default(), Some(&repo));
+        assert_eq!(eff.ticket_source_id.value, None);
+        assert_eq!(eff.ticket_source_id.source, SettingSource::Repo);
     }
 
     #[test]

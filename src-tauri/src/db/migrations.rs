@@ -1,7 +1,8 @@
 use rusqlite::Connection;
 
 /// Append-only. Each entry bumps `PRAGMA user_version` by one.
-const MIGRATIONS: &[&str] = &[r#"
+const MIGRATIONS: &[&str] = &[
+    r#"
 CREATE TABLE app_kv (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -98,7 +99,25 @@ CREATE TABLE findings (
     posted_ref       TEXT
 );
 CREATE INDEX findings_review ON findings (review_id, position);
-"#];
+"#,
+    r#"
+CREATE TABLE ticket_sources (
+    id           TEXT PRIMARY KEY,
+    kind         TEXT NOT NULL,
+    name         TEXT NOT NULL,
+    base_url     TEXT NOT NULL DEFAULT '',
+    email        TEXT,
+    mcp_server   TEXT,
+    mcp_tools    TEXT,
+    model        TEXT,
+    extra_fields TEXT,
+    username     TEXT,
+    created_at   TEXT NOT NULL
+);
+
+ALTER TABLE reviews ADD COLUMN tickets TEXT;
+"#,
+];
 
 pub fn run(conn: &mut Connection) -> rusqlite::Result<()> {
     let current: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;

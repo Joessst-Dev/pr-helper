@@ -3,6 +3,7 @@ import type { EffectiveSettings } from "../lib/bindings/EffectiveSettings";
 import type { Severity } from "../lib/bindings/Severity";
 import type { SettingsOverrides } from "../lib/bindings/SettingsOverrides";
 import type { Sourced } from "../lib/bindings/Sourced";
+import type { TicketSource } from "../lib/bindings/TicketSource";
 import { SEVERITIES, SEVERITY_LABEL, SOURCE_LABEL } from "../lib/format";
 import { Input, Select } from "./ui";
 
@@ -57,17 +58,26 @@ function BoolSelect({
  * Edits one level of the settings hierarchy. Empty values mean "inherit"; `inherited` shows what
  * that resolves to.
  */
+/** Select value for "explicitly no ticket source" (stored as an empty string). */
+const NO_TICKETS = "__none__";
+
 export function SettingsForm({
   value,
   inherited,
+  ticketSources = [],
   onChange,
 }: {
   value: SettingsOverrides;
   inherited?: EffectiveSettings;
+  ticketSources?: TicketSource[];
   onChange: (v: SettingsOverrides) => void;
 }) {
   const set = <K extends keyof SettingsOverrides>(key: K, v: SettingsOverrides[K] | null | undefined) =>
     onChange({ ...value, [key]: v === undefined || v === "" ? null : v });
+  const sourceName = (id: string | null) =>
+    id == null ? "None" : (ticketSources.find((t) => t.id === id)?.name ?? "Unknown source");
+  const ticketSelectValue =
+    value.ticketSourceId == null ? "" : value.ticketSourceId === "" ? NO_TICKETS : value.ticketSourceId;
 
   return (
     <div>
@@ -185,6 +195,53 @@ export function SettingsForm({
           placeholder={inheritLabel(inherited?.maxBudgetUsd, (v) => (v == null ? "no limit" : `$${v}`))}
           value={value.maxBudgetUsd ?? ""}
           onChange={(e) => set("maxBudgetUsd", e.target.value ? Number(e.target.value) : null)}
+        />
+      </Row>
+      <Row
+        label="Ticket source"
+        description="Load the linked Jira ticket as context for the reviewer. Sources are managed in Settings."
+      >
+        <Select
+          aria-label="Ticket source"
+          value={ticketSelectValue}
+          onChange={(e) => {
+            const v = e.target.value;
+            // "" inherits; NO_TICKETS stores an explicit "off" for this level.
+            onChange({ ...value, ticketSourceId: v === "" ? null : v === NO_TICKETS ? "" : v });
+          }}
+        >
+          <option value="">{inheritLabel(inherited?.ticketSourceId, sourceName)}</option>
+          <option value={NO_TICKETS}>None</option>
+          {ticketSources.map((t) => (
+            <option key={t.id} value={t.id}>
+              {t.name}
+            </option>
+          ))}
+          {value.ticketSourceId && !ticketSources.some((t) => t.id === value.ticketSourceId) && (
+            <option value={value.ticketSourceId}>Deleted source</option>
+          )}
+        </Select>
+      </Row>
+      <Row
+        label="Jira project keys"
+        description="Only tickets from these projects are loaded, e.g. ABC, PAY. Keys are found in the branch, title or description."
+      >
+        <Input
+          aria-label="Jira project keys"
+          placeholder={inheritLabel(inherited?.ticketProjectKeys, (v) => v || "none")}
+          value={value.ticketProjectKeys ?? ""}
+          onChange={(e) => set("ticketProjectKeys", e.target.value)}
+        />
+      </Row>
+      <Row
+        label="Check PR against ticket"
+        description="Report requirements or acceptance criteria from the ticket that the PR misses (at most medium)."
+      >
+        <BoolSelect
+          label="Check PR against ticket"
+          value={value.ticketScopeCheck}
+          inherited={inherited?.ticketScopeCheck}
+          onChange={(v) => set("ticketScopeCheck", v)}
         />
       </Row>
     </div>

@@ -10,6 +10,7 @@ import type { SettingsOverrides } from "../lib/bindings/SettingsOverrides";
 import type { Skill } from "../lib/bindings/Skill";
 import { EMPTY_OVERRIDES } from "../lib/settings";
 import { SettingsForm } from "../components/SettingsForm";
+import { useTicketSources } from "../components/TicketSources";
 import { Badge, Button, Card, ErrorBanner, Field, Input, PageHeader, Segmented, Select, Spinner, TextArea } from "../components/ui";
 
 const URL_HINT: Record<ProviderKind, string> = {
@@ -207,6 +208,7 @@ function ServerReviewSettings({ server }: { server: Server }) {
     queryKey: ["inherited", server.id, null],
     queryFn: () => api.inheritedSettings(server.id, null),
   });
+  const ticketSources = useTicketSources();
   const save = useMutation({
     mutationFn: () => api.saveServerSettings(server.id, value),
     onSuccess: () => {
@@ -217,7 +219,7 @@ function ServerReviewSettings({ server }: { server: Server }) {
   });
   return (
     <Card className="max-w-3xl px-5 py-2">
-      <SettingsForm value={value} inherited={inherited.data} onChange={setValue} />
+      <SettingsForm value={value} inherited={inherited.data} ticketSources={ticketSources.data} onChange={setValue} />
       <SaveBar
         dirty={JSON.stringify(value) !== JSON.stringify(server.settings)}
         busy={save.isPending}
@@ -236,6 +238,7 @@ function RepoOverrides({ serverId }: { serverId: string }) {
     queryKey: ["inherited", serverId, "repo"],
     queryFn: () => api.inheritedSettings(serverId, "*"),
   });
+  const ticketSources = useTicketSources();
   const [editing, setEditing] = useState<string | null>(null);
   const [newRepo, setNewRepo] = useState("");
   const [value, setValue] = useState<SettingsOverrides>(EMPTY_OVERRIDES);
@@ -303,7 +306,7 @@ function RepoOverrides({ serverId }: { serverId: string }) {
       {editing && (
         <Card className="px-5 py-3">
           <div className="mb-1 font-mono text-[13px] font-medium">{editing}</div>
-          <SettingsForm value={value} inherited={inherited.data} onChange={setValue} />
+          <SettingsForm value={value} inherited={inherited.data} ticketSources={ticketSources.data} onChange={setValue} />
           <div className="flex gap-2">
             <SaveBar dirty busy={save.isPending} error={save.error} onSave={() => save.mutate()} />
             <Button variant="ghost" className="mt-4" onClick={() => setEditing(null)}>

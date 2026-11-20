@@ -49,6 +49,35 @@ pub fn delete_server(svc: Svc<'_>, id: String) -> AppResult<()> {
     Ok(())
 }
 
+// ---- ticket sources --------------------------------------------------------
+
+#[tauri::command]
+pub fn list_ticket_sources(svc: Svc<'_>) -> AppResult<Vec<TicketSource>> {
+    svc.db.list_ticket_sources()
+}
+
+/// Verifies Jira credentials before saving; the token goes to the keychain only.
+#[tauri::command]
+pub async fn save_ticket_source(
+    svc: Svc<'_>,
+    id: Option<String>,
+    input: TicketSourceInput,
+) -> AppResult<TicketSource> {
+    svc.save_ticket_source(id.as_deref(), &input).await
+}
+
+// Keychain access can block on a macOS permission prompt.
+#[tauri::command(async)]
+pub fn delete_ticket_source(svc: Svc<'_>, id: String) -> AppResult<()> {
+    svc.delete_ticket_source(&id)
+}
+
+/// Loads one ticket and returns the markdown the reviewer would get.
+#[tauri::command]
+pub async fn test_ticket_source(svc: Svc<'_>, id: String, key: String) -> AppResult<String> {
+    svc.test_ticket_source(&id, &key).await
+}
+
 #[tauri::command]
 pub fn save_server_settings(
     svc: Svc<'_>,

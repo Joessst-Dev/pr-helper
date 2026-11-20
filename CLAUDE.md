@@ -27,6 +27,7 @@ The user runs and builds the app on **macOS**. A Linux sandbox may be used only 
   - `postprocess` enforces the comment rules.
   - `post` posts the selected findings.
   - `skills` packages configured skills as a `--plugin-dir` plugin.
+- `tickets/`: linked Jira tickets as review context. `extract_keys` finds keys from allow-listed projects only. `jira.rs` is the REST v2 client (Cloud Basic auth, Server/DC Bearer). `mcp.rs` is the alternative MCP fetcher, and `render.rs` writes `tickets.md` into the context dir. Ticket sources are app-level (`ticket_sources` table). Each server or repo picks one through the `ticketSourceId`/`ticketProjectKeys`/`ticketScopeCheck` settings. A fetch failure never fails a review.
 - `watcher.rs` polls tracked PRs. `decide()` is the pure decision logic.
 - `settings.rs` resolves settings in the order defaults → global → server → repo.
 
@@ -53,13 +54,20 @@ Where a public skill conflicts with this file or a project skill, this file wins
 - Findings are sorted by severity: critical > high > medium > low > nit. `skip_nits` drops nits.
 - `finalize_body` runs again on user-edited text right before posting.
 - An approve verdict with any medium-or-higher finding is downgraded.
+- `scope` findings (unmet ticket requirements) are capped at medium. They are dropped unless a ticket was loaded and `ticketScopeCheck` is on.
 
 ## Tokens
 
-API tokens are stored only in the OS keychain (`secrets.rs`, macOS Keychain via `keyring` apple-native). They are never in SQLite, logs, files, git config or argv. `Service::save_server` is the only write path. Tests scan the raw DB files for the token.
+API tokens are stored only in the OS keychain (`secrets.rs`, macOS Keychain via `keyring` apple-native). They are never in SQLite, logs, files, git config or argv. `Service::save_server` is the only write path. Tests scan the raw DB files for the token. Jira ticket source tokens follow the same rules. They are stored under the keychain account `ticket-source:<id>`, the only write path is `Service::save_ticket_source`, and a changed URL or type needs the token again.
 
 ## Reviewer isolation
 
 The PR checkout is untrusted. The runner must keep `--setting-sources user` (otherwise the PR's `.claude/settings.json` hooks execute; verified), `--strict-mcp-config`, and `--tools Read Grep Glob Skill`. The reviewer has no Bash and no write access. Review material (diff, commits, description) goes into a context dir passed with `--add-dir`.
 
 Everything from the PR is author-controlled, including the title, description, commits and diff. The system prompt treats it as data. Before auto-approving, `review/guard.rs` checks the PR text for reviewer-directed wording, and if it finds any it skips the auto-approval and asks the user to approve by hand. Never weaken that check without a replacement. Git runs with LFS smudging and hooks disabled (`repo_cache.rs`).
+
+Tickets are fetched by the app before the review, never by the reviewer. Ticket text is untrusted too: it goes into `tickets.md` as fenced data and into the auto-approve guard. The optional MCP ticket fetcher is a separate run (`ToolPolicy::TicketFetcher` in `runner.rs`) with these properties:
+- `--tools ""`, so it has no built-in tools.
+- `--permission-mode dontAsk` with `--allowed-tools` limited to the configured `mcp__<server>__<tool>` names. Every other MCP tool is denied, which was verified with the real CLI.
+- It runs in an empty dir with an app-validated ticket key and never sees PR content.
+- It needs the user's MCP servers, so it has no `--strict-mcp-config`. Keep `dontAsk`.

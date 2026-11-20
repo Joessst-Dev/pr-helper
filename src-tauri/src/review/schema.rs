@@ -59,7 +59,7 @@ pub fn review_schema() -> serde_json::Value {
                         "severity": { "type": "string", "enum": ["critical", "high", "medium", "low", "nit"] },
                         "category": {
                             "type": "string",
-                            "description": "One of: bug, security, performance, concurrency, error-handling, api-design, maintainability, testing, documentation, style."
+                            "description": "One of: bug, security, performance, concurrency, error-handling, api-design, maintainability, testing, documentation, style, scope (only for requirements from a linked ticket)."
                         },
                         "title": { "type": "string", "description": "Short headline in English for the reviewer UI." },
                         "file": { "type": ["string", "null"], "description": "Repo-relative path, or null for PR-wide findings." },

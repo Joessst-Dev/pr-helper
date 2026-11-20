@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
-use crate::db::models::{PrState, PullRequest, ReviewStatus, ReviewTrigger, Verdict};
+use crate::db::models::{PrState, PullRequest, ReviewStatus, ReviewTrigger, TicketRef, Verdict};
 use crate::env;
 use crate::error::{AppError, AppResult};
 use crate::git::diff::DiffIndex;
@@ -14,11 +14,12 @@ use crate::git::repo_cache::FetchSpec;
 use crate::review::guard::steering_attempt;
 use crate::review::postprocess::{finalize_body, process};
 use crate::review::prompt::{PreviousReview, PromptInput, system_prompt, user_prompt};
-use crate::review::runner::{self, RunEvent, RunRequest};
+use crate::review::runner::{self, RunEvent, RunRequest, ToolPolicy};
 use crate::review::schema::{RawReview, review_schema};
 use crate::review::skills::build_plugin;
 use crate::service::{ProgressKind, Service};
 use crate::settings::EffectiveSettings;
+use crate::tickets::{self, Ticket, render};
 
 pub async fn run_review(
     svc: &Arc<Service>,
@@ -149,11 +150,33 @@ async fn execute(
         .await
         .unwrap_or_default();
 
-    let steering = steering_attempt(&pr.title, &pr.description, &commits, &diff);
+    let tickets = load_tickets(svc, review_id, pr, &settings, review_dir, &cancel).await;
+    check_cancel(&cancel)?;
+
+    let steering = steering_attempt(
+        &pr.title,
+        &pr.description,
+        &commits,
+        &diff,
+        &render::guard_text(&tickets),
+    );
 
     // Context files live next to (not inside) the worktree so they never show up as repo files.
     let context_dir = review_dir.join("context");
     tokio::fs::create_dir_all(&context_dir).await?;
+    let has_tickets = !tickets.is_empty();
+    if has_tickets {
+        tokio::fs::write(context_dir.join("tickets.md"), render::render(&tickets)).await?;
+        let refs: Vec<TicketRef> = tickets
+            .iter()
+            .map(|t| TicketRef {
+                key: t.key.clone(),
+                url: t.url.clone(),
+            })
+            .collect();
+        svc.db.set_review_tickets(review_id, &refs)?;
+        svc.publish_review(review_id);
+    }
     tokio::fs::write(context_dir.join("pr.diff"), &diff).await?;
     tokio::fs::write(context_dir.join("commits.txt"), &commits).await?;
     tokio::fs::write(
@@ -215,6 +238,7 @@ async fn execute(
             findings: &previous_findings,
         }),
         has_incremental_diff: has_incremental,
+        has_tickets,
     });
 
     let session_id = uuid::Uuid::new_v4().to_string();
@@ -222,12 +246,13 @@ async fn execute(
     svc.progress(review_id, ProgressKind::Status, "Reviewer running");
 
     let request = RunRequest {
+        policy: ToolPolicy::Reviewer,
         claude,
         path_env: env::login_path().to_string(),
         cwd: worktree.clone(),
         add_dirs: vec![context_dir.clone()],
         plugin_dir,
-        system_prompt: system_prompt(&settings),
+        system_prompt: system_prompt(&settings, has_tickets),
         prompt,
         schema: review_schema(),
         session_id,
@@ -256,7 +281,7 @@ async fn execute(
 
     let raw: RawReview = serde_json::from_value(outcome.output)
         .map_err(|e| AppError::Reviewer(format!("unexpected review format: {e}")))?;
-    let processed = process(raw, review_id, &settings, &index);
+    let processed = process(raw, review_id, &settings, &index, has_tickets);
     svc.db.complete_review(
         review_id,
         processed.verdict,
@@ -272,6 +297,78 @@ async fn execute(
         Some(processed.verdict),
     )?;
     Ok((processed.verdict, steering))
+}
+
+/// Loads the tickets linked from the PR, if a ticket source is configured. Never fails the
+/// review: problems are reported in the review log and the review runs without them.
+async fn load_tickets(
+    svc: &Arc<Service>,
+    review_id: &str,
+    pr: &PullRequest,
+    settings: &EffectiveSettings,
+    review_dir: &Path,
+    cancel: &CancellationToken,
+) -> Vec<Ticket> {
+    let Some(source_id) = settings.ticket_source_id.value.as_deref() else {
+        return Vec::new();
+    };
+    let projects = tickets::parse_project_keys(&settings.ticket_project_keys.value);
+    if projects.is_empty() {
+        svc.progress(
+            review_id,
+            ProgressKind::Error,
+            "Tickets skipped: no Jira project keys are configured",
+        );
+        return Vec::new();
+    }
+    let source = match svc.db.get_ticket_source(source_id) {
+        Ok(s) => s,
+        Err(e) => {
+            svc.progress(
+                review_id,
+                ProgressKind::Error,
+                format!("Tickets skipped: {e}"),
+            );
+            return Vec::new();
+        }
+    };
+    let keys = tickets::extract_keys(&pr.head_ref, &pr.title, &pr.description, &projects);
+    if keys.is_empty() {
+        svc.progress(
+            review_id,
+            ProgressKind::Status,
+            format!(
+                "No ticket key for {} found in the branch, title or description",
+                projects.join(", ")
+            ),
+        );
+        return Vec::new();
+    }
+    let mut loaded = Vec::new();
+    for key in keys {
+        if cancel.is_cancelled() {
+            break;
+        }
+        svc.progress(
+            review_id,
+            ProgressKind::Status,
+            format!("Loading ticket {key}"),
+        );
+        let work_dir = review_dir.join("ticket-fetch");
+        match svc
+            .fetch_ticket(&source, &key, &work_dir, cancel.clone())
+            .await
+        {
+            Ok(t) => loaded.push(t),
+            Err(e) => svc.progress(
+                review_id,
+                ProgressKind::Error,
+                format!("Ticket {key} could not be loaded: {e}"),
+            ),
+        }
+        let _ = tokio::fs::remove_dir_all(&work_dir).await;
+    }
+    loaded
 }
 
 fn check_cancel(cancel: &CancellationToken) -> AppResult<()> {

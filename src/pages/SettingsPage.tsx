@@ -7,6 +7,7 @@ import type { SettingsOverrides } from "../lib/bindings/SettingsOverrides";
 import type { ToolStatus } from "../lib/bindings/ToolStatus";
 import { EMPTY_OVERRIDES } from "../lib/settings";
 import { SettingsForm } from "../components/SettingsForm";
+import { TicketSources, useTicketSources } from "../components/TicketSources";
 import { Button, Card, ErrorBanner, Field, Input, PageHeader, Spinner } from "../components/ui";
 
 function ToolRow({ name, status }: { name: string; status: ToolStatus }) {
@@ -31,6 +32,7 @@ export function SettingsPage() {
   const config = useQuery({ queryKey: ["app-config"], queryFn: api.getAppConfig });
   const global = useQuery({ queryKey: ["global-settings"], queryFn: api.getGlobalSettings });
   const defaults = useQuery({ queryKey: ["inherited", null, null], queryFn: () => api.inheritedSettings(null, null) });
+  const ticketSources = useTicketSources();
 
   const [cfg, setCfg] = useState<AppConfig | null>(null);
   const [overrides, setOverrides] = useState<SettingsOverrides>(EMPTY_OVERRIDES);
@@ -144,10 +146,24 @@ export function SettingsPage() {
         )}
 
         <section>
+          <h2 className="mb-1 text-sm font-semibold">Ticket sources</h2>
+          <p className="mb-2 text-xs text-muted">
+            Jira connections the reviewer can load linked tickets from. Choose one per server or repository in the review
+            settings.
+          </p>
+          <TicketSources />
+        </section>
+
+        <section>
           <h2 className="mb-1 text-sm font-semibold">Review defaults</h2>
           <p className="mb-2 text-xs text-muted">Servers and repositories can override each of these.</p>
           <Card className="px-5 py-2">
-            <SettingsForm value={overrides} inherited={defaults.data} onChange={setOverrides} />
+            <SettingsForm
+              value={overrides}
+              inherited={defaults.data}
+              ticketSources={ticketSources.data}
+              onChange={setOverrides}
+            />
             <div className="py-3">
               <Button
                 variant="primary"
