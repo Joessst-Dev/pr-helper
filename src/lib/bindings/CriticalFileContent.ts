@@ -6,7 +6,7 @@ import type { FileDiffLine } from "./FileDiffLine";
  */
 export type CriticalFileContent = { 
 /**
- * The file at the reviewed head commit. `None` for deleted, binary or oversized files.
+ * The file at the reviewed head commit. `None` when `CriticalFile::note` says why.
  */
 content: string | null, 
 /**

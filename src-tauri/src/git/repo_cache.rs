@@ -277,22 +277,31 @@ impl RepoCache {
         .await
     }
 
-    /// Size of the blob at `sha:path`, or `None` when the path does not exist at that commit or
-    /// is not a regular blob (e.g. a submodule). Reads the object database, never a checkout, so
-    /// symlinks in the PR can't point it at files outside the repository.
-    pub async fn blob_size(&self, bare: &Path, sha: &str, path: &str) -> AppResult<Option<u64>> {
-        let spec = object_spec(sha, path)?;
-        match self.run(Some(bare), &["cat-file", "-t", &spec], None).await {
-            Ok(kind) if kind.trim() == "blob" => {}
-            _ => return Ok(None),
-        }
-        let size = self
-            .run(Some(bare), &["cat-file", "-s", &spec], None)
+    /// What `path` is at commit `sha`. Reads the object database, never a checkout, so symlinks
+    /// in the PR can't point it at files outside the repository. Git failures are errors; only
+    /// a path that really isn't in the commit is `Missing`.
+    pub async fn tree_entry(&self, bare: &Path, sha: &str, path: &str) -> AppResult<TreeEntry> {
+        object_spec(sha, path)?;
+        // `--literal-pathspecs`: the path is matched as is, not as a glob.
+        let out = self
+            .run(
+                Some(bare),
+                &[
+                    "--literal-pathspecs",
+                    "ls-tree",
+                    "-z",
+                    "-l",
+                    sha,
+                    "--",
+                    path,
+                ],
+                None,
+            )
             .await?;
-        Ok(size.trim().parse().ok())
+        Ok(parse_tree_entry(&out, path))
     }
 
-    /// The blob at `sha:path` as lossy UTF-8. Check the size with `blob_size` first.
+    /// The blob at `sha:path` as lossy UTF-8. Check the size with `tree_entry` first.
     pub async fn show_blob(&self, bare: &Path, sha: &str, path: &str) -> AppResult<String> {
         let spec = object_spec(sha, path)?;
         self.run(Some(bare), &["cat-file", "blob", &spec], None)
@@ -356,6 +365,36 @@ fn sanitize(s: &str) -> String {
         .to_string()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TreeEntry {
+    Missing,
+    Blob {
+        size: u64,
+    },
+    /// A tree or a submodule commit.
+    NotAFile,
+}
+
+/// Parses `ls-tree -z -l` output (`<mode> <type> <oid> <size>\t<path>\0`) for exactly `path`.
+fn parse_tree_entry(out: &str, path: &str) -> TreeEntry {
+    for record in out.split('\0') {
+        let Some((meta, entry_path)) = record.split_once('\t') else {
+            continue;
+        };
+        if entry_path != path {
+            continue;
+        }
+        let mut fields = meta.split_whitespace();
+        let kind = fields.nth(1);
+        let size = fields.nth(1).and_then(|s| s.parse().ok());
+        return match (kind, size) {
+            (Some("blob"), Some(size)) => TreeEntry::Blob { size },
+            _ => TreeEntry::NotAFile,
+        };
+    }
+    TreeEntry::Missing
+}
+
 /// `sha:path`. The commit must be a hex id, so the spec can never be read as an option.
 fn object_spec(sha: &str, path: &str) -> AppResult<String> {
     if sha.is_empty() || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -389,6 +428,18 @@ mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
         String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn parses_tree_entries() {
+        let out = "100644 blob 1111 42\tsrc/a.rs\x00160000 commit 2222       -\tvendor/lib\0";
+        assert_eq!(
+            parse_tree_entry(out, "src/a.rs"),
+            TreeEntry::Blob { size: 42 }
+        );
+        assert_eq!(parse_tree_entry(out, "vendor/lib"), TreeEntry::NotAFile);
+        assert_eq!(parse_tree_entry(out, "src"), TreeEntry::Missing);
+        assert_eq!(parse_tree_entry("", "src/a.rs"), TreeEntry::Missing);
     }
 
     #[test]
@@ -444,18 +495,30 @@ mod tests {
         assert!(log.contains("feature work"));
 
         assert_eq!(
-            cache.blob_size(&bare, &head, "a.txt").await.unwrap(),
-            Some(8)
+            cache.tree_entry(&bare, &head, "a.txt").await.unwrap(),
+            TreeEntry::Blob { size: 8 }
         );
         assert_eq!(
             cache.show_blob(&bare, &head, "a.txt").await.unwrap(),
             "one\ntwo\n"
         );
         assert_eq!(
-            cache.blob_size(&bare, &head, "missing.txt").await.unwrap(),
-            None
+            cache.tree_entry(&bare, &head, "missing.txt").await.unwrap(),
+            TreeEntry::Missing
         );
-        assert!(cache.blob_size(&bare, "--help", "a.txt").await.is_err());
+        // Matched literally, not as a glob.
+        assert_eq!(
+            cache.tree_entry(&bare, &head, "*.txt").await.unwrap(),
+            TreeEntry::Missing
+        );
+        assert!(cache.tree_entry(&bare, "--help", "a.txt").await.is_err());
+        // An unknown commit is a git error, not a missing file.
+        assert!(
+            cache
+                .tree_entry(&bare, "0123456789abcdef0123456789abcdef01234567", "a.txt")
+                .await
+                .is_err()
+        );
 
         let wt = cache.review_dir("r1").join("worktree");
         cache.add_worktree(&bare, &wt, &head).await.unwrap();

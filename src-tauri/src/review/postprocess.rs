@@ -542,7 +542,7 @@ const MAX_LINE: i64 = 1_000_000;
 fn critical_files(raw: Vec<RawCriticalFile>, diff: &DiffIndex) -> Vec<CriticalFile> {
     let mut out: Vec<CriticalFile> = Vec::new();
     for f in raw {
-        let wanted = normalize_path(&f.path);
+        let wanted = normalize_path(&f.path, diff);
         let Some(file) = diff.file(&wanted) else {
             continue;
         };
@@ -573,8 +573,7 @@ fn critical_files(raw: Vec<RawCriticalFile>, diff: &DiffIndex) -> Vec<CriticalFi
             path,
             reason: f.reason.trim().chars().take(MAX_REASON_CHARS).collect(),
             focus_lines,
-            binary: false,
-            truncated: false,
+            note: None,
         });
         if out.len() == MAX_CRITICAL_FILES {
             break;
@@ -583,10 +582,16 @@ fn critical_files(raw: Vec<RawCriticalFile>, diff: &DiffIndex) -> Vec<CriticalFi
     out
 }
 
-fn normalize_path(p: &str) -> String {
-    p.trim()
-        .trim_start_matches("./")
-        .trim_start_matches("b/")
+/// The model sometimes copies git's `b/` prefix or adds `./`. Strip at most one of each, and
+/// only when the path as given isn't in the diff, so a real top-level `b/` folder still works.
+fn normalize_path(p: &str, diff: &DiffIndex) -> String {
+    let p = p.trim();
+    let dot = p.strip_prefix("./").unwrap_or(p);
+    let candidates = [p, dot, dot.strip_prefix("b/").unwrap_or(dot)];
+    candidates
+        .iter()
+        .find(|c| diff.file(c).is_some())
+        .unwrap_or(&candidates[2])
         .to_string()
 }
 
@@ -596,7 +601,10 @@ fn to_finding(f: RawFinding, review_id: &str, forbid: bool, diff: &DiffIndex) ->
         Some("left") => Side::Left,
         _ => Side::Right,
     };
-    let file = f.file.map(|p| normalize_path(&p)).filter(|p| !p.is_empty());
+    let file = f
+        .file
+        .map(|p| normalize_path(&p, diff))
+        .filter(|p| !p.is_empty());
     let line_start = f.line_start.filter(|l| *l > 0);
     let line_end = f.line_end.filter(|l| *l > 0 && Some(*l) > line_start);
     let anchor_line = line_end.or(line_start);
@@ -814,6 +822,21 @@ mod tests {
                 end: MAX_LINE as u32
             }]
         );
+
+        // A real top-level `b/` folder is not mistaken for git's prefix.
+        let real_b = DiffIndex::parse(
+            "diff --git a/b/auth.rs b/b/auth.rs\n--- a/b/auth.rs\n+++ b/b/auth.rs\n@@ -1 +1 @@\n-a\n+b\n",
+        );
+        let found: Vec<_> = critical_files(
+            vec![file("b/auth.rs", &[]), file("b/b/auth.rs", &[])],
+            &real_b,
+        )
+        .into_iter()
+        .map(|f| f.path)
+        .collect();
+        assert_eq!(found, ["b/auth.rs"]);
+        assert_eq!(normalize_path("./b/b/auth.rs", &real_b), "b/auth.rs");
+        assert_eq!(normalize_path("b/x.rs", &real_b), "x.rs");
 
         let wide: String = (0..8)
             .map(|i| format!("diff --git a/f{i}.rs b/f{i}.rs\n--- a/f{i}.rs\n+++ b/f{i}.rs\n@@ -1 +1 @@\n-a\n+b\n"))

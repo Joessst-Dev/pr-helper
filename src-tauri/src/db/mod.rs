@@ -785,23 +785,32 @@ impl Db {
         tx.execute("DELETE FROM review_files WHERE review_id = ?1", [id])?;
         for (position, f) in files.iter().enumerate() {
             tx.execute(
-                "INSERT INTO review_files (review_id, position, path, reason, focus_lines, is_binary,
-                   truncated, content, diff, diff_truncated)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                "INSERT INTO review_files (review_id, position, path, reason, focus_lines, note,
+                   content, diff, diff_truncated)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     id,
                     position as i64,
                     f.meta.path,
                     f.meta.reason,
                     json_col(&f.meta.focus_lines)?,
-                    f.meta.binary,
-                    f.meta.truncated,
+                    f.meta.note.map(FileNote::as_str),
                     f.content.content,
                     json_col(&f.content.diff)?,
                     f.content.diff_truncated,
                 ],
             )?;
         }
+        // Only the latest review of a PR keeps file code; older snapshots would otherwise pile up
+        // with every auto-review. Their reasons stay so the review history still reads well.
+        tx.execute(
+            "UPDATE review_files SET content = NULL, diff = '[]', diff_truncated = 0, note = 'pruned'
+             WHERE (note IS NULL OR note != 'pruned') AND review_id IN (
+               SELECT o.id FROM reviews o JOIN reviews c ON c.id = ?1
+               WHERE o.server_id = c.server_id AND o.repo = c.repo AND o.number = c.number
+                 AND o.id != c.id AND o.created_at <= c.created_at)",
+            [id],
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -841,17 +850,17 @@ impl Db {
     pub fn list_review_files(&self, review_id: &str) -> AppResult<Vec<CriticalFile>> {
         self.with(|c| {
             let mut stmt = c.prepare(
-                "SELECT path, reason, focus_lines, is_binary, truncated FROM review_files
+                "SELECT path, reason, focus_lines, note FROM review_files
                  WHERE review_id = ?1 ORDER BY position",
             )?;
             let rows = stmt.query_map([review_id], |r| {
                 let focus: String = r.get("focus_lines")?;
+                let note: Option<String> = r.get("note")?;
                 Ok(CriticalFile {
                     path: r.get("path")?,
                     reason: r.get("reason")?,
                     focus_lines: serde_json::from_str(&focus).unwrap_or_default(),
-                    binary: r.get("is_binary")?,
-                    truncated: r.get("truncated")?,
+                    note: note.as_deref().and_then(FileNote::parse),
                 })
             })?;
             rows.collect()
@@ -1051,6 +1060,60 @@ mod tests {
     }
 
     #[test]
+    fn only_the_latest_review_of_a_pr_keeps_file_code() {
+        let db = Db::open_in_memory().unwrap();
+        let s = db.insert_server(&server_input()).unwrap();
+        let pr = sample_pr(&s.id);
+        let other_pr = PullRequest {
+            number: 8,
+            ..sample_pr(&s.id)
+        };
+        let file = |path: &str| ReviewFile {
+            meta: CriticalFile {
+                path: path.into(),
+                reason: "why".into(),
+                focus_lines: Vec::new(),
+                note: None,
+            },
+            content: CriticalFileContent {
+                content: Some("code".into()),
+                diff: vec![FileDiffLine {
+                    kind: DiffLineKind::Added,
+                    old: None,
+                    new: Some(1),
+                    text: "code".into(),
+                }],
+                diff_truncated: false,
+            },
+        };
+        let complete = |pr: &PullRequest| {
+            let r = db.insert_review(pr, ReviewTrigger::Auto).unwrap();
+            db.complete_review(&r.id, Verdict::Comment, "s", None, &[], &[file("a.rs")])
+                .unwrap();
+            r.id
+        };
+        let first = complete(&pr);
+        let other = complete(&other_pr);
+        let second = complete(&pr);
+
+        // The older review keeps the reason but loses the code.
+        let old = db.list_review_files(&first).unwrap();
+        assert_eq!(old[0].reason, "why");
+        assert_eq!(old[0].note, Some(FileNote::Pruned));
+        let old_content = db.get_review_file(&first, "a.rs").unwrap();
+        assert_eq!(old_content.content, None);
+        assert!(old_content.diff.is_empty());
+
+        for id in [&second, &other] {
+            assert_eq!(db.list_review_files(id).unwrap()[0].note, None);
+            assert_eq!(
+                db.get_review_file(id, "a.rs").unwrap().content.as_deref(),
+                Some("code")
+            );
+        }
+    }
+
+    #[test]
     fn review_lifecycle_updates_tracking() {
         let db = Db::open_in_memory().unwrap();
         let s = db.insert_server(&server_input()).unwrap();
@@ -1090,8 +1153,7 @@ mod tests {
                     path: "src/a.rs".into(),
                     reason: "Locking order changed".into(),
                     focus_lines: vec![LineRange { start: 2, end: 5 }],
-                    binary: false,
-                    truncated: false,
+                    note: None,
                 },
                 content: CriticalFileContent {
                     content: Some("fn a() {}\n".into()),

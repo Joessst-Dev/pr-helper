@@ -283,10 +283,52 @@ pub struct CriticalFile {
     pub reason: String,
     /// New-file line ranges the reviewer points at.
     pub focus_lines: Vec<LineRange>,
-    /// The file at the PR head is binary, so only the diff (if any) is shown.
-    pub binary: bool,
-    /// The file at the PR head is too large to store, so only the diff is shown.
-    pub truncated: bool,
+    /// Why the file's code is not available, if it isn't. The diff may still be.
+    pub note: Option<FileNote>,
+}
+
+/// Why a critical file has no stored code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum FileNote {
+    /// Binary at the reviewed commit.
+    Binary,
+    /// Too large to store.
+    TooLarge,
+    /// Deleted by the PR.
+    Deleted,
+    /// Not a regular file at the reviewed commit, e.g. a submodule.
+    NotAFile,
+    /// Reading it from git failed; the review log has the error.
+    Unreadable,
+    /// Only the latest review of a PR keeps the code; this is an older review.
+    Pruned,
+}
+
+impl FileNote {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Binary => "binary",
+            Self::TooLarge => "too_large",
+            Self::Deleted => "deleted",
+            Self::NotAFile => "not_a_file",
+            Self::Unreadable => "unreadable",
+            Self::Pruned => "pruned",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "binary" => Some(Self::Binary),
+            "too_large" => Some(Self::TooLarge),
+            "deleted" => Some(Self::Deleted),
+            "not_a_file" => Some(Self::NotAFile),
+            "unreadable" => Some(Self::Unreadable),
+            "pruned" => Some(Self::Pruned),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -301,7 +343,7 @@ pub struct LineRange {
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub struct CriticalFileContent {
-    /// The file at the reviewed head commit. `None` for deleted, binary or oversized files.
+    /// The file at the reviewed head commit. `None` when `CriticalFile::note` says why.
     pub content: Option<String>,
     /// The file's diff lines (merge base to head).
     pub diff: Vec<FileDiffLine>,

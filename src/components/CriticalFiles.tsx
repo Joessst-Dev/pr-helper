@@ -6,8 +6,9 @@ import { api, errorMessage } from "../lib/api";
 import type { CriticalFile } from "../lib/bindings/CriticalFile";
 import type { FileDiffLine } from "../lib/bindings/FileDiffLine";
 import type { LineRange } from "../lib/bindings/LineRange";
-import { tokenize, type Token } from "../lib/highlight";
-import { Badge, Card, ErrorBanner, Spinner } from "./ui";
+import type { FileNote } from "../lib/bindings/FileNote";
+import { isHunkGap, tokenize, tokenizeDiff, type Token } from "../lib/highlight";
+import { Badge, Button, Card, Spinner } from "./ui";
 
 /** Files the reviewer recommends reading by hand, each expandable to its highlighted code. */
 export function CriticalFiles({ reviewId, files }: { reviewId: string; files: CriticalFile[] }) {
@@ -65,6 +66,15 @@ function rangeLabel(r: LineRange) {
 
 type Mode = "file" | "diff";
 
+const NOTES: Record<FileNote, string> = {
+  binary: "Binary file, only the diff is shown.",
+  tooLarge: "The file is too large to show in full, only the diff is shown.",
+  deleted: "The PR deletes this file, only the diff is shown.",
+  notAFile: "Not a regular file (for example a submodule), only the diff is shown.",
+  unreadable: "The file could not be read from git (see the review log), only the diff is shown.",
+  pruned: "The code is only kept for the latest review of this PR. Open that review to see it.",
+};
+
 export function CodeView({ reviewId, file }: { reviewId: string; file: CriticalFile }) {
   const query = useQuery({
     queryKey: ["reviewFile", reviewId, file.path],
@@ -82,16 +92,20 @@ export function CodeView({ reviewId, file }: { reviewId: string; file: CriticalF
       </div>
     );
   }
-  if (query.error || !query.data) return <ErrorBanner error={errorMessage(query.error ?? "File not found")} />;
+  if (query.error || !query.data) {
+    return (
+      <div className="flex items-center gap-3 py-2 text-xs">
+        <span className="text-danger">The code of this file could not be loaded.</span>
+        <span className="truncate text-muted">{errorMessage(query.error ?? "")}</span>
+        <Button size="sm" variant="ghost" busy={query.isFetching} onClick={() => query.refetch()}>
+          Retry
+        </Button>
+      </div>
+    );
+  }
 
   const { diff, diffTruncated } = query.data;
-  const notice = file.binary
-    ? "Binary file, only the diff is shown."
-    : file.truncated
-      ? "The file is too large to show in full, only the diff is shown."
-      : content == null
-        ? "The file does not exist at the reviewed commit, only the diff is shown."
-        : null;
+  const notice = file.note ? NOTES[file.note] : null;
 
   return (
     <div className="space-y-2">
@@ -116,7 +130,7 @@ export function CodeView({ reviewId, file }: { reviewId: string; file: CriticalF
       </div>
       {effective === "file" && content != null ? (
         <FileLines path={file.path} content={content} diff={diff} focus={file.focusLines} />
-      ) : (
+      ) : file.note === "pruned" ? null : (
         <DiffLines path={file.path} diff={diff} focus={file.focusLines} />
       )}
     </div>
@@ -136,6 +150,20 @@ function useTokens(code: string, path: string) {
     };
   }, [code, path]);
   return tokens?.code === code ? tokens.lines : null;
+}
+
+function useDiffTokens(diff: FileDiffLine[], path: string) {
+  const [tokens, setTokens] = useState<{ diff: FileDiffLine[]; lines: (Token[] | undefined)[] } | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    tokenizeDiff(diff, path).then((lines) => {
+      if (!cancelled && lines) setTokens({ diff, lines });
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [diff, path]);
+  return tokens?.diff === diff ? tokens.lines : null;
 }
 
 function inRanges(line: number, ranges: LineRange[]) {
@@ -227,9 +255,7 @@ function FileLines({
 }
 
 function DiffLines({ path, diff, focus }: { path: string; diff: FileDiffLine[]; focus: LineRange[] }) {
-  // Highlight the diff as one block so multi-line constructs keep their colors.
-  const code = useMemo(() => diff.map((d) => d.text).join("\n"), [diff]);
-  const tokens = useTokens(code, path);
+  const tokens = useDiffTokens(diff, path);
   const firstFocus = diff.findIndex((d) => d.new != null && inRanges(d.new, focus));
   const first = firstFocus >= 0 ? firstFocus : diff.findIndex((d) => d.kind !== "context");
   const { box, target } = useScrollTo([path, first]);
@@ -242,10 +268,7 @@ function DiffLines({ path, diff, focus }: { path: string; diff: FileDiffLine[]; 
     >
       {diff.map((d, i) => {
         const prev = diff[i - 1];
-        const gap =
-          prev &&
-          ((d.new != null && prev.new != null && d.new > prev.new + 1) ||
-            (d.old != null && prev.old != null && d.old > prev.old + 1));
+        const gap = isHunkGap(prev, d);
         const mark = d.kind === "added" ? "+" : d.kind === "removed" ? "-" : " ";
         return (
           <div key={i}>

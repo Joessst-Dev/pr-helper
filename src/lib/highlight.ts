@@ -3,6 +3,7 @@
 // first use. Callers render the tokens as React elements: the code is PR author-controlled, so
 // it must never go through innerHTML.
 import type { HighlighterCore, LanguageInput } from "shiki/core";
+import type { FileDiffLine } from "./bindings/FileDiffLine";
 
 export type Token = { content: string; style?: Record<string, string> };
 
@@ -147,4 +148,42 @@ export async function tokenize(code: string, path: string): Promise<Token[][] | 
   } catch {
     return null;
   }
+}
+
+/** Whether `line` starts a new hunk, i.e. lines between `prev` and it were left out. */
+export function isHunkGap(prev: FileDiffLine | undefined, line: FileDiffLine): boolean {
+  if (!prev) return false;
+  return (
+    (line.new != null && prev.new != null && line.new > prev.new + 1) ||
+    (line.old != null && prev.old != null && line.old > prev.old + 1)
+  );
+}
+
+/**
+ * Tokens per diff line, or `null` for plain text. Each hunk is highlighted twice, once as the
+ * old code (context and removed lines) and once as the new code (context and added lines), so
+ * an open comment or string on a removed line can't color the added lines after it.
+ */
+export async function tokenizeDiff(diff: FileDiffLine[], path: string): Promise<(Token[] | undefined)[] | null> {
+  if (!languageFor(path) || diff.length > MAX_HIGHLIGHT_LINES) return null;
+  const out: (Token[] | undefined)[] = new Array(diff.length);
+  let start = 0;
+  for (let end = 1; end <= diff.length; end++) {
+    if (end < diff.length && !isHunkGap(diff[end - 1], diff[end])) continue;
+    for (const side of ["old", "new"] as const) {
+      const rows: number[] = [];
+      for (let i = start; i < end; i++) {
+        if (diff[i].kind !== (side === "old" ? "added" : "removed")) rows.push(i);
+      }
+      if (rows.length === 0) continue;
+      const lines = await tokenize(rows.map((i) => diff[i].text).join("\n"), path);
+      if (!lines) return null;
+      // Context lines take the new side's tokens.
+      rows.forEach((row, k) => {
+        if (side === "new" || diff[row].kind === "removed") out[row] = lines[k];
+      });
+    }
+    start = end;
+  }
+  return out;
 }

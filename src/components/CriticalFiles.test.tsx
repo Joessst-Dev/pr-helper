@@ -13,20 +13,26 @@ vi.mock("../lib/api", () => ({
 }));
 // Highlighting is covered by shiki itself; here every line gets one token, so we can check
 // that tokens are rendered as plain spans.
-vi.mock("../lib/highlight", () => ({
-  tokenize: async (code: string) =>
-    code.split("\n").map((line) => [{ content: line, style: { "--shiki-light": "#111" } }]),
-}));
+vi.mock("../lib/highlight", async (importOriginal) => {
+  const tokenize = async (code: string) =>
+    code.split("\n").map((line) => [{ content: line, style: { "--shiki-light": "#111" } }]);
+  const actual = await importOriginal<typeof import("../lib/highlight")>();
+  return {
+    isHunkGap: actual.isHunkGap,
+    tokenize,
+    tokenizeDiff: async (diff: { text: string }[]) => tokenize(diff.map((d) => d.text).join("\n")),
+  };
+});
 
 const files: CriticalFile[] = [
   {
     path: "src/auth.rs",
     reason: "The token check moved into the middleware.",
     focusLines: [{ start: 2, end: 3 }],
-    binary: false,
-    truncated: false,
+    note: null,
   },
-  { path: "assets/logo.png", reason: "Replaced logo.", focusLines: [], binary: true, truncated: false },
+  { path: "assets/logo.png", reason: "Replaced logo.", focusLines: [], note: "binary" },
+  { path: "src/old.rs", reason: "Older review.", focusLines: [], note: "pruned" },
 ];
 
 const authContent: CriticalFileContent = {
@@ -50,11 +56,14 @@ function renderFiles() {
 
 describe("CriticalFiles", () => {
   beforeEach(() => {
-    getReviewFile.mockReset().mockImplementation(async (_r: string, path: string) =>
-      path === "src/auth.rs"
-        ? authContent
-        : { content: null, diff: [{ kind: "added", old: null, new: 1, text: "Binary files differ" }], diffTruncated: false },
-    );
+    getReviewFile.mockReset().mockImplementation(async (_r: string, path: string) => {
+      if (path === "src/auth.rs") return authContent;
+      if (path === "src/old.rs") return { content: null, diff: [], diffTruncated: false };
+      if (path === "assets/logo.png") {
+        return { content: null, diff: [{ kind: "added", old: null, new: 1, text: "Binary files differ" }], diffTruncated: false };
+      }
+      throw new Error("not found: file x of review r1");
+    });
   });
 
   it("lists files with the reviewer's reason and focus ranges", () => {
@@ -95,6 +104,26 @@ describe("CriticalFiles", () => {
     expect(await screen.findByText("fn old_check() {}")).toBeInTheDocument();
     expect(container.querySelector('[data-kind="removed"]')).toHaveTextContent("fn old_check() {}");
     expect(container.querySelector('[data-kind="added"]')).toHaveTextContent("fn check() {}");
+  });
+
+  it("explains pruned files instead of showing an empty diff", async () => {
+    renderFiles();
+    await userEvent.click(screen.getByRole("button", { name: /src\/old\.rs/ }));
+    expect(await screen.findByText(/only kept for the latest review/)).toBeInTheDocument();
+    expect(screen.queryByText("No diff lines for this file.")).toBeNull();
+  });
+
+  it("explains a failed load and retries", async () => {
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <CriticalFiles reviewId="r1" files={[{ path: "gone.rs", reason: "r", focusLines: [], note: null }]} />
+      </QueryClientProvider>,
+    );
+    await userEvent.click(screen.getByRole("button", { name: /gone\.rs/ }));
+    expect(await screen.findByText("The code of this file could not be loaded.")).toBeInTheDocument();
+    getReviewFile.mockResolvedValueOnce(authContent);
+    await userEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(await screen.findByText("fn check() {}")).toBeInTheDocument();
   });
 
   it("shows only the diff for binary files", async () => {

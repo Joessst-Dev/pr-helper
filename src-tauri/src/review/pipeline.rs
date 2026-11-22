@@ -7,13 +7,13 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use crate::db::models::{
-    CriticalFile, CriticalFileContent, PrState, PullRequest, ReviewFile, ReviewStatus,
+    CriticalFile, CriticalFileContent, FileNote, PrState, PullRequest, ReviewFile, ReviewStatus,
     ReviewTrigger, TicketRef, Verdict,
 };
 use crate::env;
 use crate::error::{AppError, AppResult};
 use crate::git::diff::DiffIndex;
-use crate::git::repo_cache::FetchSpec;
+use crate::git::repo_cache::{FetchSpec, TreeEntry};
 use crate::review::guard::steering_attempt;
 use crate::review::postprocess::{finalize_body, process};
 use crate::review::prompt::{PreviousReview, PromptInput, system_prompt, user_prompt};
@@ -266,7 +266,7 @@ async fn execute(
     };
     let svc_events = svc.clone();
     let rid = review_id.to_string();
-    let outcome = runner::run(request, cancel, move |event| match event {
+    let outcome = runner::run(request, cancel.clone(), move |event| match event {
         RunEvent::Started { model, .. } => {
             svc_events.progress(&rid, ProgressKind::Status, format!("Model: {model}"))
         }
@@ -292,8 +292,10 @@ async fn execute(
         &pr.head_sha,
         &index,
         processed.critical_files,
+        &cancel,
     )
-    .await;
+    .await?;
+    check_cancel(&cancel)?;
     svc.db.complete_review(
         review_id,
         processed.verdict,
@@ -327,41 +329,43 @@ async fn snapshot_files(
     head: &str,
     index: &DiffIndex,
     files: Vec<CriticalFile>,
-) -> Vec<ReviewFile> {
+    cancel: &CancellationToken,
+) -> AppResult<Vec<ReviewFile>> {
     let mut out = Vec::with_capacity(files.len());
     for mut meta in files {
+        check_cancel(cancel)?;
         let (diff, diff_truncated) = index
             .file(&meta.path)
             .map(|f| f.view_lines(MAX_SNAPSHOT_DIFF_LINES))
             .unwrap_or_default();
-        let content = match svc.cache.blob_size(bare, head, &meta.path).await {
-            Ok(Some(size)) if size > MAX_SNAPSHOT_BYTES => {
-                meta.truncated = true;
+        let read = async {
+            Ok::<_, AppError>(match svc.cache.tree_entry(bare, head, &meta.path).await? {
+                TreeEntry::Missing => Err(FileNote::Deleted),
+                TreeEntry::NotAFile => Err(FileNote::NotAFile),
+                TreeEntry::Blob { size } if size > MAX_SNAPSHOT_BYTES => Err(FileNote::TooLarge),
+                TreeEntry::Blob { .. } => {
+                    let text = svc.cache.show_blob(bare, head, &meta.path).await?;
+                    if text.contains('\0') {
+                        Err(FileNote::Binary)
+                    } else {
+                        Ok(text)
+                    }
+                }
+            })
+        };
+        let content = match read.await {
+            Ok(Ok(text)) => Some(text),
+            Ok(Err(note)) => {
+                meta.note = Some(note);
                 None
             }
-            Ok(Some(_)) => match svc.cache.show_blob(bare, head, &meta.path).await {
-                Ok(text) if text.contains('\0') => {
-                    meta.binary = true;
-                    None
-                }
-                Ok(text) => Some(text),
-                Err(e) => {
-                    svc.progress(
-                        review_id,
-                        ProgressKind::Error,
-                        format!("Could not read {}: {e}", meta.path),
-                    );
-                    None
-                }
-            },
-            // Deleted in the PR, or not a regular file.
-            Ok(None) => None,
             Err(e) => {
                 svc.progress(
                     review_id,
                     ProgressKind::Error,
                     format!("Could not read {}: {e}", meta.path),
                 );
+                meta.note = Some(FileNote::Unreadable);
                 None
             }
         };
@@ -374,7 +378,7 @@ async fn snapshot_files(
             },
         });
     }
-    out
+    Ok(out)
 }
 
 /// Loads the tickets linked from the PR, if a ticket source is configured. Never fails the
