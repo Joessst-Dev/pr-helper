@@ -5,6 +5,7 @@ import clsx from "clsx";
 import { Copy, ExternalLink, Square, TerminalSquare } from "lucide-react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { api, errorMessage } from "../lib/api";
+import type { CriticalFile } from "../lib/bindings/CriticalFile";
 import type { Finding } from "../lib/bindings/Finding";
 import type { ProgressEvent } from "../lib/bindings/ProgressEvent";
 import type { Severity } from "../lib/bindings/Severity";
@@ -13,6 +14,7 @@ import type { Verdict } from "../lib/bindings/Verdict";
 import { useReviewProgress } from "../lib/events";
 import { formatCost, relativeTime, SEVERITIES, SEVERITY_LABEL, shortSha } from "../lib/format";
 import { ReviewStatusBadge, VerdictBadge } from "../components/badges";
+import { CriticalFiles } from "../components/CriticalFiles";
 import { FindingCard, RulesWarning, useCommentCheck } from "../components/FindingCard";
 import { TicketChips } from "../components/TicketChips";
 import { Badge, Button, Card, EmptyState, ErrorBanner, PageHeader, Select, Spinner, TextArea } from "../components/ui";
@@ -106,6 +108,7 @@ export function ReviewPage() {
               summary={review.summary ?? ""}
               verdict={review.verdict}
               findings={detail.data.findings}
+              criticalFiles={detail.data.criticalFiles}
               onChanged={() => qc.invalidateQueries({ queryKey: ["review", reviewId] })}
             />
           )}
@@ -201,6 +204,7 @@ export function ReviewResults({
   summary: initialSummary,
   verdict,
   findings: initialFindings,
+  criticalFiles = [],
   onChanged,
 }: {
   reviewId: string;
@@ -209,6 +213,7 @@ export function ReviewResults({
   summary: string;
   verdict: Verdict | null;
   findings: Finding[];
+  criticalFiles?: CriticalFile[];
   onChanged: () => void;
 }) {
   const [findings, setFindings] = useState(initialFindings);
@@ -302,6 +307,8 @@ export function ReviewResults({
           Post the summary as the review body
         </label>
       </Card>
+
+      <CriticalFiles reviewId={reviewId} files={criticalFiles} />
 
       {findings.length === 0 ? (
         <EmptyState title="No findings">The reviewer found nothing worth commenting on.</EmptyState>

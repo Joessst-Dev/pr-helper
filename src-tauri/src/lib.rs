@@ -212,6 +212,7 @@ pub fn run() {
             commands::start_review,
             commands::cancel_review,
             commands::get_review,
+            commands::get_review_file,
             commands::list_reviews_for_pr,
             commands::list_recent_reviews,
             commands::update_finding,

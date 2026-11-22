@@ -132,6 +132,12 @@ fn write_fake_claude(dir: &Path, verdict: &str) -> PathBuf {
                 "file": "lib.rs", "line_start": 1, "line_end": null, "side": "right",
                 "explanation": "x", "proposed_comment": "nit", "suggestion": null
             }
+        ],
+        "critical_files": [
+            { "path": "lib.rs", "reason": "b now calls unsafe_thing.", "focus_lines": [{"start": 2, "end": 2}] },
+            // Not part of the PR: must never be read.
+            { "path": "../../../../etc/passwd", "reason": "x", "focus_lines": [] },
+            { "path": ".claude/settings.json", "reason": "New reviewer settings.", "focus_lines": [] }
         ]
     });
     let stream = [
@@ -296,6 +302,27 @@ async fn full_review_and_post_flow() {
     assert!(cwd.trim().ends_with("worktree"));
     let prompt = std::fs::read_to_string(dir.join("prompt.txt")).unwrap();
     assert!(prompt.contains("acme/app#9") && prompt.contains("pr.diff"));
+    // Critical files are stored with a snapshot of the head; paths outside the diff are dropped.
+    let files = h.svc.db.list_review_files(&review.id).unwrap();
+    let paths: Vec<_> = files.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(paths, ["lib.rs", ".claude/settings.json"]);
+    assert_eq!(files[0].focus_lines, vec![LineRange { start: 2, end: 2 }]);
+    let lib = h.svc.db.get_review_file(&review.id, "lib.rs").unwrap();
+    assert_eq!(
+        lib.content.as_deref(),
+        Some("fn a() {}\nfn b() { unsafe_thing() }\nfn c() {}\n")
+    );
+    assert!(
+        lib.diff
+            .iter()
+            .any(|l| l.kind == DiffLineKind::Added && l.new == Some(2))
+    );
+    assert!(
+        h.svc
+            .db
+            .get_review_file(&review.id, "../../../../etc/passwd")
+            .is_err()
+    );
     // Worktree cleaned up afterwards.
     assert!(!h.svc.cache.review_dir(&review.id).exists());
 
@@ -617,6 +644,12 @@ async fn real_claude_review() {
             f.severity, f.title, f.file, f.line_start, f.in_diff, f.proposed_comment
         );
         assert!(crate::review::postprocess::dash_violations(&f.proposed_comment).is_empty());
+    }
+    for f in h.svc.db.list_review_files(&review.id).unwrap() {
+        println!(
+            "critical file {} {:?} :: {}",
+            f.path, f.focus_lines, f.reason
+        );
     }
     for line in h.svc.progress_log(&review.id) {
         println!("  {:?} {}", line.kind, line.message);

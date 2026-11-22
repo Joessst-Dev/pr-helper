@@ -272,6 +272,110 @@ pub struct TicketRef {
     pub url: Option<String>,
 }
 
+/// A changed file the reviewer recommends reading by hand, with its reason. The code itself is
+/// loaded separately (`CriticalFileContent`) because it can be large.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct CriticalFile {
+    pub path: String,
+    /// Written by the reviewer for the user. Never posted.
+    pub reason: String,
+    /// New-file line ranges the reviewer points at.
+    pub focus_lines: Vec<LineRange>,
+    /// Why the file's code is not available, if it isn't. The diff may still be.
+    pub note: Option<FileNote>,
+}
+
+/// Why a critical file has no stored code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum FileNote {
+    /// Binary at the reviewed commit.
+    Binary,
+    /// Too large to store.
+    TooLarge,
+    /// Deleted by the PR.
+    Deleted,
+    /// Not a regular file at the reviewed commit, e.g. a submodule.
+    NotAFile,
+    /// Reading it from git failed; the review log has the error.
+    Unreadable,
+    /// Only the latest review of a PR keeps the code; this is an older review.
+    Pruned,
+}
+
+impl FileNote {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Binary => "binary",
+            Self::TooLarge => "too_large",
+            Self::Deleted => "deleted",
+            Self::NotAFile => "not_a_file",
+            Self::Unreadable => "unreadable",
+            Self::Pruned => "pruned",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "binary" => Some(Self::Binary),
+            "too_large" => Some(Self::TooLarge),
+            "deleted" => Some(Self::Deleted),
+            "not_a_file" => Some(Self::NotAFile),
+            "unreadable" => Some(Self::Unreadable),
+            "pruned" => Some(Self::Pruned),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct LineRange {
+    pub start: u32,
+    pub end: u32,
+}
+
+/// The snapshot of a critical file taken when the review finished.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct CriticalFileContent {
+    /// The file at the reviewed head commit. `None` when `CriticalFile::note` says why.
+    pub content: Option<String>,
+    /// The file's diff lines (merge base to head).
+    pub diff: Vec<FileDiffLine>,
+    /// The diff was cut off because it was too long.
+    pub diff_truncated: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "lowercase")]
+#[ts(export)]
+pub enum DiffLineKind {
+    Context,
+    Added,
+    Removed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct FileDiffLine {
+    pub kind: DiffLineKind,
+    pub old: Option<u32>,
+    pub new: Option<u32>,
+    pub text: String,
+}
+
+/// What gets stored per critical file.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReviewFile {
+    pub meta: CriticalFile,
+    pub content: CriticalFileContent,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "lowercase")]
 #[ts(export)]

@@ -117,6 +117,20 @@ CREATE TABLE ticket_sources (
 
 ALTER TABLE reviews ADD COLUMN tickets TEXT;
 "#,
+    r#"
+CREATE TABLE review_files (
+    review_id      TEXT NOT NULL REFERENCES reviews(id) ON DELETE CASCADE,
+    position       INTEGER NOT NULL,
+    path           TEXT NOT NULL,
+    reason         TEXT NOT NULL,
+    focus_lines    TEXT NOT NULL,
+    note           TEXT,
+    content        TEXT,
+    diff           TEXT NOT NULL,
+    diff_truncated INTEGER NOT NULL,
+    PRIMARY KEY (review_id, path)
+);
+"#,
 ];
 
 pub fn run(conn: &mut Connection) -> rusqlite::Result<()> {

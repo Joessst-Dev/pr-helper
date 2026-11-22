@@ -14,11 +14,11 @@ use std::sync::LazyLock;
 
 use regex::{Captures, Regex};
 
-use crate::db::models::{Finding, Severity, Side, Verdict};
+use crate::db::models::{CriticalFile, Finding, LineRange, Severity, Side, Verdict};
 use crate::db::new_id;
 use crate::error::{AppError, AppResult};
 use crate::git::diff::DiffIndex;
-use crate::review::schema::{RawFinding, RawReview};
+use crate::review::schema::{RawCriticalFile, RawFinding, RawReview};
 use crate::settings::EffectiveSettings;
 
 // ---- markdown segmentation --------------------------------------------------
@@ -468,6 +468,7 @@ pub struct Processed {
     pub verdict: Verdict,
     pub summary: String,
     pub findings: Vec<Finding>,
+    pub critical_files: Vec<CriticalFile>,
 }
 
 pub const SCOPE_CATEGORY: &str = "scope";
@@ -524,7 +525,74 @@ pub fn process(
         verdict,
         summary: sanitize_comment(&raw.summary, forbid),
         findings,
+        critical_files: critical_files(raw.critical_files, diff),
     }
+}
+
+pub const MAX_CRITICAL_FILES: usize = 5;
+const MAX_FOCUS_RANGES: usize = 10;
+const MAX_REASON_CHARS: usize = 1000;
+/// Larger line numbers are model noise; no reviewable file is this long.
+const MAX_LINE: i64 = 1_000_000;
+
+/// The files the reviewer recommends reading by hand. Only paths changed in the PR survive
+/// (model output is untrusted, and the path is later used to read the file from git),
+/// duplicates are dropped, and the list is capped. The reason is shown to the user only and
+/// never posted, so the comment rules don't apply to it.
+fn critical_files(raw: Vec<RawCriticalFile>, diff: &DiffIndex) -> Vec<CriticalFile> {
+    let mut out: Vec<CriticalFile> = Vec::new();
+    for f in raw {
+        let wanted = normalize_path(&f.path, diff);
+        let Some(file) = diff.file(&wanted) else {
+            continue;
+        };
+        let path = if file.new_path.is_empty() {
+            file.old_path.clone()
+        } else {
+            file.new_path.clone()
+        };
+        if out.iter().any(|c| c.path == path) {
+            continue;
+        }
+        let mut focus_lines: Vec<LineRange> = f
+            .focus_lines
+            .iter()
+            .filter_map(|r| {
+                let start = r.start.clamp(0, MAX_LINE);
+                let end = if r.end < r.start { r.start } else { r.end }.clamp(0, MAX_LINE);
+                (start > 0).then_some(LineRange {
+                    start: start as u32,
+                    end: end as u32,
+                })
+            })
+            .collect();
+        focus_lines.sort_by_key(|r| (r.start, r.end));
+        focus_lines.dedup();
+        focus_lines.truncate(MAX_FOCUS_RANGES);
+        out.push(CriticalFile {
+            path,
+            reason: f.reason.trim().chars().take(MAX_REASON_CHARS).collect(),
+            focus_lines,
+            note: None,
+        });
+        if out.len() == MAX_CRITICAL_FILES {
+            break;
+        }
+    }
+    out
+}
+
+/// The model sometimes copies git's `b/` prefix or adds `./`. Strip at most one of each, and
+/// only when the path as given isn't in the diff, so a real top-level `b/` folder still works.
+fn normalize_path(p: &str, diff: &DiffIndex) -> String {
+    let p = p.trim();
+    let dot = p.strip_prefix("./").unwrap_or(p);
+    let candidates = [p, dot, dot.strip_prefix("b/").unwrap_or(dot)];
+    candidates
+        .iter()
+        .find(|c| diff.file(c).is_some())
+        .unwrap_or(&candidates[2])
+        .to_string()
 }
 
 fn to_finding(f: RawFinding, review_id: &str, forbid: bool, diff: &DiffIndex) -> Option<Finding> {
@@ -535,12 +603,7 @@ fn to_finding(f: RawFinding, review_id: &str, forbid: bool, diff: &DiffIndex) ->
     };
     let file = f
         .file
-        .map(|p| {
-            p.trim()
-                .trim_start_matches("./")
-                .trim_start_matches("b/")
-                .to_string()
-        })
+        .map(|p| normalize_path(&p, diff))
         .filter(|p| !p.is_empty());
     let line_start = f.line_start.filter(|l| *l > 0);
     let line_end = f.line_end.filter(|l| *l > 0 && Some(*l) > line_start);
@@ -719,11 +782,87 @@ mod tests {
         "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1,2 +1,3 @@\n x\n+y\n z\n";
 
     #[test]
+    fn critical_files_must_be_in_the_diff_and_are_capped() {
+        let diff = DiffIndex::parse(
+            "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1 +1,2 @@\n x\n+y\n\
+             diff --git a/old.rs b/new.rs\nrename from old.rs\nrename to new.rs\n",
+        );
+        let file = |path: &str, ranges: &[(i64, i64)]| RawCriticalFile {
+            path: path.into(),
+            reason: format!("  look at {path}  "),
+            focus_lines: ranges
+                .iter()
+                .map(|&(start, end)| crate::review::schema::RawLineRange { start, end })
+                .collect(),
+        };
+        let out = critical_files(
+            vec![
+                file("./a.rs", &[(9, 3), (0, 4), (2, 5), (2, 5), (-1, 2)]),
+                file("../../etc/passwd", &[]),
+                file("not-changed.rs", &[]),
+                file("b/a.rs", &[]),
+                file("old.rs", &[(1, 99_999_999)]),
+            ],
+            &diff,
+        );
+        let paths: Vec<_> = out.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, ["a.rs", "new.rs"]);
+        assert_eq!(out[0].reason, "look at ./a.rs");
+        assert_eq!(
+            out[0].focus_lines,
+            vec![
+                LineRange { start: 2, end: 5 },
+                LineRange { start: 9, end: 9 }
+            ]
+        );
+        assert_eq!(
+            out[1].focus_lines,
+            vec![LineRange {
+                start: 1,
+                end: MAX_LINE as u32
+            }]
+        );
+
+        // A real top-level `b/` folder is not mistaken for git's prefix.
+        let real_b = DiffIndex::parse(
+            "diff --git a/b/auth.rs b/b/auth.rs\n--- a/b/auth.rs\n+++ b/b/auth.rs\n@@ -1 +1 @@\n-a\n+b\n",
+        );
+        let found: Vec<_> = critical_files(
+            vec![file("b/auth.rs", &[]), file("b/b/auth.rs", &[])],
+            &real_b,
+        )
+        .into_iter()
+        .map(|f| f.path)
+        .collect();
+        assert_eq!(found, ["b/auth.rs"]);
+        assert_eq!(normalize_path("./b/b/auth.rs", &real_b), "b/auth.rs");
+        assert_eq!(normalize_path("b/x.rs", &real_b), "x.rs");
+
+        let wide: String = (0..8)
+            .map(|i| format!("diff --git a/f{i}.rs b/f{i}.rs\n--- a/f{i}.rs\n+++ b/f{i}.rs\n@@ -1 +1 @@\n-a\n+b\n"))
+            .collect();
+        let many: Vec<_> = (0..8).map(|i| file(&format!("f{i}.rs"), &[])).collect();
+        assert_eq!(
+            critical_files(many, &DiffIndex::parse(&wide)).len(),
+            MAX_CRITICAL_FILES
+        );
+        let long = RawCriticalFile {
+            reason: "x".repeat(5000),
+            ..file("a.rs", &[])
+        };
+        assert_eq!(
+            critical_files(vec![long], &diff)[0].reason.len(),
+            MAX_REASON_CHARS
+        );
+    }
+
+    #[test]
     fn process_sorts_filters_and_anchors() {
         let diff = DiffIndex::parse(DIFF);
         let raw_review = RawReview {
             verdict: "approve".into(),
             summary: "Summary — fine".into(),
+            critical_files: Vec::new(),
             findings: vec![
                 raw("nit", "a.rs", 2, "nit"),
                 raw("low", "b.rs", 9, "low"),
@@ -761,6 +900,7 @@ mod tests {
         let raw_review = RawReview {
             verdict: "approve".into(),
             summary: "LGTM".into(),
+            critical_files: Vec::new(),
             findings: vec![raw("nit", "a.rs", 2, "tiny")],
         };
         let p = process(
@@ -780,6 +920,7 @@ mod tests {
         let review = || RawReview {
             verdict: "request_changes".into(),
             summary: "s".into(),
+            critical_files: Vec::new(),
             findings: vec![
                 RawFinding {
                     category: Some(" Scope".into()),

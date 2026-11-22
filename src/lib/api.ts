@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { AppConfig } from "./bindings/AppConfig";
 import type { CommentCheck } from "./bindings/CommentCheck";
+import type { CriticalFileContent } from "./bindings/CriticalFileContent";
 import type { EffectiveSettings } from "./bindings/EffectiveSettings";
 import type { EnvironmentStatus } from "./bindings/EnvironmentStatus";
 import type { Finding } from "./bindings/Finding";
@@ -48,6 +49,8 @@ export const api = {
     invoke<Review>("start_review", { serverId, projectId, number }),
   cancelReview: (reviewId: string) => invoke<boolean>("cancel_review", { reviewId }),
   getReview: (reviewId: string) => invoke<ReviewDetail>("get_review", { reviewId }),
+  getReviewFile: (reviewId: string, path: string) =>
+    invoke<CriticalFileContent>("get_review_file", { reviewId, path }),
   listReviewsForPr: (serverId: string, repo: string, number: number) =>
     invoke<Review[]>("list_reviews_for_pr", { serverId, repo, number }),
   listRecentReviews: (limit: number) => invoke<Review[]>("list_recent_reviews", { limit }),
