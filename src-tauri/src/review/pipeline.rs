@@ -6,7 +6,10 @@ use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
-use crate::db::models::{PrState, PullRequest, ReviewStatus, ReviewTrigger, TicketRef, Verdict};
+use crate::db::models::{
+    CriticalFile, CriticalFileContent, PrState, PullRequest, ReviewFile, ReviewStatus,
+    ReviewTrigger, TicketRef, Verdict,
+};
 use crate::env;
 use crate::error::{AppError, AppResult};
 use crate::git::diff::DiffIndex;
@@ -282,12 +285,22 @@ async fn execute(
     let raw: RawReview = serde_json::from_value(outcome.output)
         .map_err(|e| AppError::Reviewer(format!("unexpected review format: {e}")))?;
     let processed = process(raw, review_id, &settings, &index, has_tickets);
+    let files = snapshot_files(
+        svc,
+        review_id,
+        &bare,
+        &pr.head_sha,
+        &index,
+        processed.critical_files,
+    )
+    .await;
     svc.db.complete_review(
         review_id,
         processed.verdict,
         &processed.summary,
         outcome.cost_usd,
         &processed.findings,
+        &files,
     )?;
     svc.db.set_tracked_reviewed(
         &pr.server_id,
@@ -297,6 +310,71 @@ async fn execute(
         Some(processed.verdict),
     )?;
     Ok((processed.verdict, steering))
+}
+
+/// Files above this size are not stored; the UI shows only their diff.
+const MAX_SNAPSHOT_BYTES: u64 = 512 * 1024;
+const MAX_SNAPSHOT_DIFF_LINES: usize = 5000;
+
+/// Copies the critical files at the reviewed head into the review, so the UI can show them
+/// after the worktree is gone or the PR has moved on. The paths were already checked against
+/// the diff in `postprocess`, and the content comes from the object database, not the checkout.
+/// Never fails the review: a file that can't be read is kept with its diff only.
+async fn snapshot_files(
+    svc: &Service,
+    review_id: &str,
+    bare: &Path,
+    head: &str,
+    index: &DiffIndex,
+    files: Vec<CriticalFile>,
+) -> Vec<ReviewFile> {
+    let mut out = Vec::with_capacity(files.len());
+    for mut meta in files {
+        let (diff, diff_truncated) = index
+            .file(&meta.path)
+            .map(|f| f.view_lines(MAX_SNAPSHOT_DIFF_LINES))
+            .unwrap_or_default();
+        let content = match svc.cache.blob_size(bare, head, &meta.path).await {
+            Ok(Some(size)) if size > MAX_SNAPSHOT_BYTES => {
+                meta.truncated = true;
+                None
+            }
+            Ok(Some(_)) => match svc.cache.show_blob(bare, head, &meta.path).await {
+                Ok(text) if text.contains('\0') => {
+                    meta.binary = true;
+                    None
+                }
+                Ok(text) => Some(text),
+                Err(e) => {
+                    svc.progress(
+                        review_id,
+                        ProgressKind::Error,
+                        format!("Could not read {}: {e}", meta.path),
+                    );
+                    None
+                }
+            },
+            // Deleted in the PR, or not a regular file.
+            Ok(None) => None,
+            Err(e) => {
+                svc.progress(
+                    review_id,
+                    ProgressKind::Error,
+                    format!("Could not read {}: {e}", meta.path),
+                );
+                None
+            }
+        };
+        out.push(ReviewFile {
+            meta,
+            content: CriticalFileContent {
+                content,
+                diff,
+                diff_truncated,
+            },
+        });
+    }
+    out
 }
 
 /// Loads the tickets linked from the PR, if a ticket source is configured. Never fails the

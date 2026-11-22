@@ -99,3 +99,18 @@ input,
 select {
   font: inherit;
 }
+
+/* Syntax highlighting (src/lib/highlight.ts): shiki emits both theme colors as custom properties. */
+.shiki-token {
+  color: var(--shiki-light);
+  font-style: var(--shiki-light-font-style);
+  font-weight: var(--shiki-light-font-weight);
+}
+
+@media (prefers-color-scheme: dark) {
+  .shiki-token {
+    color: var(--shiki-dark);
+    font-style: var(--shiki-dark-font-style);
+    font-weight: var(--shiki-dark-font-weight);
+  }
+}

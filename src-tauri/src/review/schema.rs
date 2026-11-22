@@ -9,6 +9,27 @@ pub struct RawReview {
     pub summary: String,
     #[serde(default)]
     pub findings: Vec<RawFinding>,
+    #[serde(default)]
+    pub critical_files: Vec<RawCriticalFile>,
+}
+
+/// A changed file the reviewer recommends the user reads personally.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RawCriticalFile {
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    pub focus_lines: Vec<RawLineRange>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RawLineRange {
+    #[serde(default)]
+    pub start: i64,
+    #[serde(default)]
+    pub end: i64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -38,7 +59,7 @@ pub fn review_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["verdict", "summary", "findings"],
+        "required": ["verdict", "summary", "findings", "critical_files"],
         "properties": {
             "verdict": {
                 "type": "string",
@@ -71,6 +92,32 @@ pub fn review_schema() -> serde_json::Value {
                         "suggestion": { "type": ["string", "null"], "description": "Optional exact replacement code for line_start..line_end (no fences)." }
                     }
                 }
+            },
+            "critical_files": {
+                "type": "array",
+                "description": "Zero to five files changed in this PR that the person running the review should read personally, most important first.",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["path", "reason", "focus_lines"],
+                    "properties": {
+                        "path": { "type": "string", "description": "Repo-relative path of a file changed in this PR (new path for renames)." },
+                        "reason": { "type": "string", "description": "English, one to three sentences: why a human should read this file and what to look at." },
+                        "focus_lines": {
+                            "type": "array",
+                            "description": "Line ranges in the new file that deserve the closest look. May be empty.",
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "required": ["start", "end"],
+                                "properties": {
+                                    "start": { "type": "integer" },
+                                    "end": { "type": "integer" }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     })
@@ -95,5 +142,16 @@ mod tests {
         let parsed: RawReview = serde_json::from_value(sample).unwrap();
         assert_eq!(parsed.findings.len(), 1);
         assert_eq!(parsed.findings[0].file, None);
+        assert!(parsed.critical_files.is_empty());
+
+        let with_files: RawReview = serde_json::from_value(serde_json::json!({
+            "verdict": "comment", "summary": "s", "findings": [],
+            "critical_files": [{"path": "a.rs", "reason": "r", "focus_lines": [{"start": 1, "end": 4}]}]
+        }))
+        .unwrap();
+        assert_eq!(with_files.critical_files[0].path, "a.rs");
+        assert_eq!(with_files.critical_files[0].focus_lines[0].end, 4);
+        let required = schema["required"].as_array().unwrap();
+        assert!(required.iter().any(|v| v == "critical_files"));
     }
 }

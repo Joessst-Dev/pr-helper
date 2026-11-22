@@ -272,6 +272,68 @@ pub struct TicketRef {
     pub url: Option<String>,
 }
 
+/// A changed file the reviewer recommends reading by hand, with its reason. The code itself is
+/// loaded separately (`CriticalFileContent`) because it can be large.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct CriticalFile {
+    pub path: String,
+    /// Written by the reviewer for the user. Never posted.
+    pub reason: String,
+    /// New-file line ranges the reviewer points at.
+    pub focus_lines: Vec<LineRange>,
+    /// The file at the PR head is binary, so only the diff (if any) is shown.
+    pub binary: bool,
+    /// The file at the PR head is too large to store, so only the diff is shown.
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct LineRange {
+    pub start: u32,
+    pub end: u32,
+}
+
+/// The snapshot of a critical file taken when the review finished.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct CriticalFileContent {
+    /// The file at the reviewed head commit. `None` for deleted, binary or oversized files.
+    pub content: Option<String>,
+    /// The file's diff lines (merge base to head).
+    pub diff: Vec<FileDiffLine>,
+    /// The diff was cut off because it was too long.
+    pub diff_truncated: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "lowercase")]
+#[ts(export)]
+pub enum DiffLineKind {
+    Context,
+    Added,
+    Removed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct FileDiffLine {
+    pub kind: DiffLineKind,
+    pub old: Option<u32>,
+    pub new: Option<u32>,
+    pub text: String,
+}
+
+/// What gets stored per critical file.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReviewFile {
+    pub meta: CriticalFile,
+    pub content: CriticalFileContent,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "lowercase")]
 #[ts(export)]

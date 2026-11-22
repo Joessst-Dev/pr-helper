@@ -227,6 +227,16 @@ pub async fn start_review(
     queue::enqueue(&svc, pr, ReviewTrigger::Manual)
 }
 
+/// The stored snapshot of one critical file of a review.
+#[tauri::command]
+pub fn get_review_file(
+    svc: Svc<'_>,
+    review_id: String,
+    path: String,
+) -> AppResult<CriticalFileContent> {
+    svc.db.get_review_file(&review_id, &path)
+}
+
 #[tauri::command]
 pub fn cancel_review(svc: Svc<'_>, review_id: String) -> bool {
     svc.queue.cancel(&review_id)
@@ -238,6 +248,8 @@ pub fn cancel_review(svc: Svc<'_>, review_id: String) -> bool {
 pub struct ReviewDetail {
     pub review: Review,
     pub findings: Vec<Finding>,
+    /// Files the reviewer recommends reading by hand; their code comes from `get_review_file`.
+    pub critical_files: Vec<CriticalFile>,
     pub settings: EffectiveSettings,
     pub server: Server,
     pub log: Vec<ProgressEvent>,
@@ -254,6 +266,7 @@ pub fn get_review(svc: Svc<'_>, review_id: String) -> AppResult<ReviewDetail> {
         .map(|t| t.web_url);
     Ok(ReviewDetail {
         findings: svc.db.list_findings(&review.id)?,
+        critical_files: svc.db.list_review_files(&review.id)?,
         settings: svc.effective_settings(&review.server_id, Some(&review.repo))?,
         log: svc.progress_log(&review.id),
         server,

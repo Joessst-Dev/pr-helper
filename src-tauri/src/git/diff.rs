@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use crate::db::models::Side;
+use crate::db::models::{DiffLineKind, FileDiffLine, Side};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LineKind {
@@ -31,6 +31,28 @@ pub struct FileDiff {
     /// Removed old line numbers.
     pub left: BTreeSet<u32>,
     pub lines: Vec<DiffLine>,
+}
+
+impl FileDiff {
+    /// The diff lines for display, at most `max`. The flag says whether lines were cut off.
+    pub fn view_lines(&self, max: usize) -> (Vec<FileDiffLine>, bool) {
+        let lines = self
+            .lines
+            .iter()
+            .take(max)
+            .map(|l| FileDiffLine {
+                kind: match l.kind {
+                    LineKind::Context => DiffLineKind::Context,
+                    LineKind::Added => DiffLineKind::Added,
+                    LineKind::Removed => DiffLineKind::Removed,
+                },
+                old: l.old,
+                new: l.new,
+                text: l.text.clone(),
+            })
+            .collect();
+        (lines, self.lines.len() > max)
+    }
 }
 
 /// Where an inline comment can be attached, with both line numbers GitLab needs.
@@ -372,6 +394,22 @@ deleted file mode 100644
             ex,
             "+    2 fn b() -> u8 { 1 }\n+    3 fn c() {}\n     4 fn d() {}"
         );
+    }
+
+    #[test]
+    fn view_lines_maps_kinds_and_caps_length() {
+        let idx = DiffIndex::parse(DIFF);
+        let f = idx.file("src/lib.rs").unwrap();
+        let (lines, cut) = f.view_lines(100);
+        assert!(!cut);
+        assert_eq!(lines.len(), f.lines.len());
+        assert_eq!(lines[1].kind, DiffLineKind::Removed);
+        assert_eq!((lines[1].old, lines[1].new), (Some(2), None));
+        assert_eq!(lines[2].kind, DiffLineKind::Added);
+        assert_eq!(lines[2].text, "fn b() -> u8 { 1 }");
+        let (short, cut) = f.view_lines(2);
+        assert!(cut);
+        assert_eq!(short.len(), 2);
     }
 
     #[test]

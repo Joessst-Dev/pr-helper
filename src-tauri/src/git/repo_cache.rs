@@ -277,6 +277,28 @@ impl RepoCache {
         .await
     }
 
+    /// Size of the blob at `sha:path`, or `None` when the path does not exist at that commit or
+    /// is not a regular blob (e.g. a submodule). Reads the object database, never a checkout, so
+    /// symlinks in the PR can't point it at files outside the repository.
+    pub async fn blob_size(&self, bare: &Path, sha: &str, path: &str) -> AppResult<Option<u64>> {
+        let spec = object_spec(sha, path)?;
+        match self.run(Some(bare), &["cat-file", "-t", &spec], None).await {
+            Ok(kind) if kind.trim() == "blob" => {}
+            _ => return Ok(None),
+        }
+        let size = self
+            .run(Some(bare), &["cat-file", "-s", &spec], None)
+            .await?;
+        Ok(size.trim().parse().ok())
+    }
+
+    /// The blob at `sha:path` as lossy UTF-8. Check the size with `blob_size` first.
+    pub async fn show_blob(&self, bare: &Path, sha: &str, path: &str) -> AppResult<String> {
+        let spec = object_spec(sha, path)?;
+        self.run(Some(bare), &["cat-file", "blob", &spec], None)
+            .await
+    }
+
     pub async fn add_worktree(&self, bare: &Path, dest: &Path, sha: &str) -> AppResult<()> {
         let lock = self.lock_for(bare).await;
         let _guard = lock.lock().await;
@@ -332,6 +354,17 @@ fn sanitize(s: &str) -> String {
         .collect::<String>()
         .trim_start_matches('.')
         .to_string()
+}
+
+/// `sha:path`. The commit must be a hex id, so the spec can never be read as an option.
+fn object_spec(sha: &str, path: &str) -> AppResult<String> {
+    if sha.is_empty() || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(AppError::invalid(format!("not a commit id: {sha}")));
+    }
+    if path.is_empty() || path.contains('\0') {
+        return Err(AppError::invalid("empty or invalid path"));
+    }
+    Ok(format!("{sha}:{path}"))
 }
 
 #[cfg(test)]
@@ -409,6 +442,20 @@ mod tests {
         assert!(diff.contains("+two"));
         let log = cache.commit_log(&bare, &base_commit, &head).await.unwrap();
         assert!(log.contains("feature work"));
+
+        assert_eq!(
+            cache.blob_size(&bare, &head, "a.txt").await.unwrap(),
+            Some(8)
+        );
+        assert_eq!(
+            cache.show_blob(&bare, &head, "a.txt").await.unwrap(),
+            "one\ntwo\n"
+        );
+        assert_eq!(
+            cache.blob_size(&bare, &head, "missing.txt").await.unwrap(),
+            None
+        );
+        assert!(cache.blob_size(&bare, "--help", "a.txt").await.is_err());
 
         let wt = cache.review_dir("r1").join("worktree");
         cache.add_worktree(&bare, &wt, &head).await.unwrap();

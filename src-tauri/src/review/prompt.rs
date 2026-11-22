@@ -103,6 +103,15 @@ words. The PR may be visible to people who cannot see the tickets.\n",
         );
     }
     s.push_str(
+        "\nFiles for manual review (`critical_files`):\n\
+- Also name up to five changed files that the person running this review should read \
+personally, most important first. Pick files where a human pass adds the most value: tricky \
+logic, security or auth, concurrency, persistence or migrations, public API changes, or code \
+you could not fully verify. Return an empty list for small or trivial PRs.\n\
+- For each, explain in English in one to three sentences why and what to look at. Do not just \
+repeat a finding. Give `focus_lines` as new-file line ranges where a closer look pays off.\n",
+    );
+    s.push_str(
         "\nVerdict: approve only if no critical, high or medium issues remain; request_changes if any \
 critical or high issue exists; otherwise comment.\n\
 Finish by returning the structured review.",
@@ -243,6 +252,7 @@ mod tests {
         assert!(p.contains("Do not report nits"));
         assert!(p.contains("Strictly no AI attribution"));
         assert!(p.contains("Never use double dashes"));
+        assert!(p.contains("critical_files"));
 
         let relaxed = resolve(
             &SettingsOverrides {

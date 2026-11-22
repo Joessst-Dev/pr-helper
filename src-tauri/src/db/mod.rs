@@ -742,6 +742,7 @@ impl Db {
         summary: &str,
         cost_usd: Option<f64>,
         findings: &[Finding],
+        files: &[ReviewFile],
     ) -> AppResult<()> {
         let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let tx = conn.transaction()?;
@@ -781,6 +782,26 @@ impl Db {
                 ],
             )?;
         }
+        tx.execute("DELETE FROM review_files WHERE review_id = ?1", [id])?;
+        for (position, f) in files.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO review_files (review_id, position, path, reason, focus_lines, is_binary,
+                   truncated, content, diff, diff_truncated)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    id,
+                    position as i64,
+                    f.meta.path,
+                    f.meta.reason,
+                    json_col(&f.meta.focus_lines)?,
+                    f.meta.binary,
+                    f.meta.truncated,
+                    f.content.content,
+                    json_col(&f.content.diff)?,
+                    f.content.diff_truncated,
+                ],
+            )?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -812,6 +833,49 @@ impl Db {
                 [now()],
             )
         })
+    }
+
+    // ---- critical files --------------------------------------------------
+
+    /// The files the reviewer recommends reading by hand, without their code.
+    pub fn list_review_files(&self, review_id: &str) -> AppResult<Vec<CriticalFile>> {
+        self.with(|c| {
+            let mut stmt = c.prepare(
+                "SELECT path, reason, focus_lines, is_binary, truncated FROM review_files
+                 WHERE review_id = ?1 ORDER BY position",
+            )?;
+            let rows = stmt.query_map([review_id], |r| {
+                let focus: String = r.get("focus_lines")?;
+                Ok(CriticalFile {
+                    path: r.get("path")?,
+                    reason: r.get("reason")?,
+                    focus_lines: serde_json::from_str(&focus).unwrap_or_default(),
+                    binary: r.get("is_binary")?,
+                    truncated: r.get("truncated")?,
+                })
+            })?;
+            rows.collect()
+        })
+    }
+
+    pub fn get_review_file(&self, review_id: &str, path: &str) -> AppResult<CriticalFileContent> {
+        self.with(|c| {
+            c.query_row(
+                "SELECT content, diff, diff_truncated FROM review_files
+                 WHERE review_id = ?1 AND path = ?2",
+                params![review_id, path],
+                |r| {
+                    let diff: String = r.get("diff")?;
+                    Ok(CriticalFileContent {
+                        content: r.get("content")?,
+                        diff: serde_json::from_str(&diff).unwrap_or_default(),
+                        diff_truncated: r.get("diff_truncated")?,
+                    })
+                },
+            )
+            .optional()
+        })?
+        .ok_or_else(|| AppError::NotFound(format!("file {path} of review {review_id}")))
     }
 
     // ---- findings --------------------------------------------------------
@@ -890,6 +954,10 @@ impl Db {
         })?;
         Ok(())
     }
+}
+
+fn json_col<T: serde::Serialize>(value: &T) -> rusqlite::Result<String> {
+    serde_json::to_string(value).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
 }
 
 pub fn normalize_base_url(url: &str) -> String {
@@ -1017,8 +1085,37 @@ mod tests {
             "sum",
             Some(0.5),
             &[finding],
+            &[ReviewFile {
+                meta: CriticalFile {
+                    path: "src/a.rs".into(),
+                    reason: "Locking order changed".into(),
+                    focus_lines: vec![LineRange { start: 2, end: 5 }],
+                    binary: false,
+                    truncated: false,
+                },
+                content: CriticalFileContent {
+                    content: Some("fn a() {}\n".into()),
+                    diff: vec![FileDiffLine {
+                        kind: DiffLineKind::Added,
+                        old: None,
+                        new: Some(1),
+                        text: "fn a() {}".into(),
+                    }],
+                    diff_truncated: false,
+                },
+            }],
         )
         .unwrap();
+        let files = db.list_review_files(&review.id).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].focus_lines, vec![LineRange { start: 2, end: 5 }]);
+        let file = db.get_review_file(&review.id, "src/a.rs").unwrap();
+        assert_eq!(file.content.as_deref(), Some("fn a() {}\n"));
+        assert_eq!(file.diff[0].kind, DiffLineKind::Added);
+        assert!(matches!(
+            db.get_review_file(&review.id, "other.rs"),
+            Err(AppError::NotFound(_))
+        ));
         db.set_tracked_reviewed(&s.id, "team/app", 7, "aaa", Some(Verdict::RequestChanges))
             .unwrap();
         let t = db.get_tracked(&s.id, "team/app", 7).unwrap().unwrap();
