@@ -7,14 +7,29 @@
  * file name to a ticket attachment.
  */
 export function jiraToMarkdown(input: string): string {
-  const lines = input.replace(/\r\n?/g, "\n").split("\n");
+  // NUL marks placeholders below, so it must not come from the input.
+  const lines = input.replace(/\u0000/g, "").replace(/\r\n?/g, "\n").split("\n");
   const out: Line[] = [];
-  let code: { kind: string } | null = null;
+  let code: CodeBlock | null = null;
   let quote = false;
 
-  const emit: Emit = (text, kind, row) => out.push({ text, kind, cells: row?.cells, header: row?.header });
-  const blankBefore = () => {
-    if (out.length > 0 && out[out.length - 1].kind !== "blank") emit("", "blank");
+  const emit: Emit = (text, kind, row) => out.push({ text, kind, row });
+  const ctx: Ctx = {
+    emit,
+    blankBefore: () => {
+      if (out.length > 0 && out[out.length - 1].kind !== "blank") emit("", "blank");
+    },
+    last: () => out[out.length - 1]?.kind,
+  };
+  const closeCode = (block: CodeBlock) => {
+    // The fence must be longer than any tilde run that starts a line of the code.
+    const fence = "~".repeat(Math.max(FENCE_MIN, block.longest + 1));
+    out[block.openAt].text = fence + block.lang;
+    emit(fence, "code");
+  };
+  const codeLine = (block: CodeBlock, text: string) => {
+    block.longest = Math.max(block.longest, /^\s*(~*)/.exec(text)![1].length);
+    emit(text, "code");
   };
 
   for (let i = 0; i < lines.length; i++) {
@@ -23,11 +38,11 @@ export function jiraToMarkdown(input: string): string {
     if (code) {
       const close = line.search(new RegExp(`\\{${code.kind}\\}`, "i"));
       if (close === -1) {
-        emit(line, "code");
+        codeLine(code, line);
         continue;
       }
-      if (line.slice(0, close).trim()) emit(line.slice(0, close), "code");
-      emit(FENCE, "code");
+      if (line.slice(0, close).trim()) codeLine(code, line.slice(0, close));
+      closeCode(code);
       const rest = line.slice(close + code.kind.length + 2);
       code = null;
       if (rest.trim()) lines.splice(i + 1, 0, rest);
@@ -38,9 +53,9 @@ export function jiraToMarkdown(input: string): string {
     if (open) {
       const kind = open[1].toLowerCase();
       const lang = kind === "code" ? codeLanguage(open[2]) : "";
-      blankBefore();
-      emit(FENCE + lang, "code");
-      code = { kind };
+      ctx.blankBefore();
+      code = { kind, lang, openAt: out.length, longest: 0 };
+      emit("", "code");
       if (open[3]) lines.splice(i + 1, 0, open[3]);
       continue;
     }
@@ -50,31 +65,38 @@ export function jiraToMarkdown(input: string): string {
       parts.forEach((part, idx) => {
         if (idx > 0) {
           quote = !quote;
-          if (!quote) blankBefore();
+          if (!quote) ctx.blankBefore();
         }
-        if (part.trim()) emitText(part, quote, emit, blankBefore);
+        if (part.trim()) emitText(part, quote, ctx);
       });
       continue;
     }
 
-    emitText(line, quote, emit, blankBefore);
+    emitText(line, quote, ctx);
   }
-  if (code) emit(FENCE, "code");
+  if (code) closeCode(code);
 
   // Jira keeps single line breaks; markdown needs a hard break for that.
   return fixTables(out)
     .map((l, idx, all) => {
       const next = all[idx + 1];
-      return l.kind === "text" && next?.kind === "text" ? `${l.text}  ` : l.text;
+      const breaks = (l.kind === "text" || l.kind === "quote-text") && next?.kind === l.kind;
+      return breaks ? `${l.text}  ` : l.text;
     })
     .join("\n");
 }
 
-type LineKind = "text" | "blank" | "block" | "code" | "table";
+/**
+ * `list` and `bq` lines swallow a following text line in markdown (lazy continuation), so
+ * text after them starts a new paragraph. `quote-text` is text inside `{quote}`.
+ */
+type LineKind = "text" | "quote-text" | "blank" | "block" | "list" | "bq" | "code" | "table";
 type Emit = (text: string, kind: LineKind, row?: TableRow) => void;
-type Line = { text: string; kind: LineKind; cells?: number; header?: boolean };
+type Line = { text: string; kind: LineKind; row?: TableRow };
+type Ctx = { emit: Emit; blankBefore: () => void; last: () => LineKind | undefined };
+type CodeBlock = { kind: string; lang: string; openAt: number; longest: number };
 
-const FENCE = "~~~~";
+const FENCE_MIN = 4;
 
 /** `{code:java}` or `{code:title=x|language=java}` → `java`. */
 function codeLanguage(params: string | undefined): string {
@@ -87,12 +109,7 @@ function codeLanguage(params: string | undefined): string {
   return "";
 }
 
-function emitText(
-  raw: string,
-  quote: boolean,
-  emit: Emit,
-  blankBefore: () => void,
-) {
+function emitText(raw: string, quote: boolean, { emit, blankBefore, last }: Ctx) {
   const prefix = quote ? "> " : "";
   const line = raw.replace(/\{(panel|color|section|column|expand)(?::[^}]*)?\}/gi, "");
   const trimmed = line.trim();
@@ -117,7 +134,8 @@ function emitText(
 
   const bq = /^bq\.\s*(.*)$/.exec(trimmed);
   if (bq) {
-    emit(`> ${inline(bq[1])}`, "block");
+    if (!quote && last() !== "bq") blankBefore();
+    emit(`> ${inline(bq[1])}`, "bq");
     return;
   }
 
@@ -127,24 +145,34 @@ function emitText(
     let indent = "";
     for (const m of markers.slice(0, -1)) indent += m === "#" ? "   " : "  ";
     const bullet = markers.endsWith("#") ? "1." : "-";
-    emit(`${prefix}${indent}${bullet} ${inline(list[2])}`, "block");
+    emit(`${prefix}${indent}${bullet} ${inline(list[2])}`, quote ? "block" : "list");
     return;
   }
 
   if (trimmed.startsWith("|")) {
     const row = tableRow(trimmed);
     // Tables inside quotes are rare; they are kept as plain rows there.
-    if (quote) emit(`${prefix}${row.text}`, "block");
-    else emit(row.text, "table", row);
+    if (quote) emit(`${prefix}${rowText(row.cells)}`, "block");
+    else emit("", "table", row);
     return;
   }
 
   // A literal ">" at the start would turn into a quote in markdown.
   const text = inline(trimmed).replace(/^>/, "\\>");
-  emit(`${prefix}${text}`, quote ? "block" : "text");
+  if (quote) {
+    emit(`${prefix}${text}`, "quote-text");
+    return;
+  }
+  const previous = last();
+  if (previous === "list" || previous === "bq") blankBefore();
+  emit(text, "text");
 }
 
-type TableRow = { text: string; cells: number; header: boolean };
+type TableRow = { cells: string[]; header: boolean };
+
+function rowText(cells: string[]): string {
+  return `| ${cells.join(" | ")} |`;
+}
 
 /**
  * GFM tables need a header row followed by a separator, and blank lines around them.
@@ -158,25 +186,24 @@ function fixTables(lines: Line[]): Line[] {
       result.push(l);
       continue;
     }
-    const run: Line[] = [];
-    while (i < lines.length && lines[i].kind === "table") run.push(lines[i++]);
+    const run: TableRow[] = [];
+    while (i < lines.length && lines[i].kind === "table") run.push(lines[i++].row!);
     i--;
-    const width = Math.max(...run.map((r) => r.cells ?? 1));
+    // GFM drops body cells beyond the header width, and needs the separator to match the
+    // header, so the header gets padded to the widest row.
+    const width = Math.max(...run.map((r) => r.cells.length));
+    const pad = (cells: string[]) => [...cells, ...Array<string>(width - cells.length).fill("")];
+    const header = run[0].header ? run.shift()!.cells : [];
     if (result.length > 0 && result[result.length - 1].kind !== "blank") result.push({ text: "", kind: "blank" });
-    const sep = `|${" --- |".repeat(width)}`;
-    if (run[0].header) {
-      result.push({ text: run[0].text, kind: "block" }, { text: sep, kind: "block" });
-      run.shift();
-    } else {
-      result.push({ text: `|${"  |".repeat(width)}`, kind: "block" }, { text: sep, kind: "block" });
-    }
-    for (const r of run) result.push({ text: r.text, kind: "block" });
+    result.push({ text: rowText(pad(header)), kind: "block" });
+    result.push({ text: `|${" --- |".repeat(width)}`, kind: "block" });
+    for (const r of run) result.push({ text: rowText(r.cells), kind: "block" });
     result.push({ text: "", kind: "blank" });
   }
   return result;
 }
 
-/** `||a||b||` (header) or `|a|b|` → `| a | b |`. */
+/** `||a||b||` (header) or `|a|b|` → cells. Pipes inside a cell are escaped for GFM. */
 function tableRow(line: string): TableRow {
   const header = line.startsWith("||");
   const tokens: string[] = [];
@@ -186,7 +213,7 @@ function tableRow(line: string): TableRow {
     .replace(header ? /\|\|\s*$/ : /\|\s*$/, "")
     .split(header ? "||" : "|")
     .map((c) => restore(transform(c.trim()), tokens).replace(/\|/g, "\\|"));
-  return { text: `| ${cells.join(" | ")} |`, cells: cells.length, header };
+  return { cells, header };
 }
 
 /** Inline formatting of one line of text. */
@@ -206,7 +233,8 @@ function protect(text: string, tokens: string[]): string {
       .replace(/\{\{(.+?)\}\}/g, (_, c: string) => keep(inlineCode(c)))
       // !image.png! or !image.png|thumbnail! or !https://…!
       .replace(
-        /!([^!\n|]+?\.(?:png|jpe?g|gif|webp|bmp|svg)|https?:\/\/[^!\s|]+)(?:\|[^!\n]*)?!/gi,
+        // The name can't start with a space, so "Done! see shot.png!" stays prose.
+        /!(?=\S)([^!\n|]+?\.(?:png|jpe?g|gif|webp|bmp|svg)|https?:\/\/[^!\s|]+)(?:\|[^!\n]*)?!/gi,
         (_, src: string) => keep(`![${escapeText(basename(src))}](<${src.replace(/[<>]/g, "")}>)`),
       )
       // [text|url], [url], [~user], [^attachment]
@@ -220,7 +248,7 @@ function protect(text: string, tokens: string[]): string {
 }
 
 function restore(text: string, tokens: string[]): string {
-  return text.replace(new RegExp(`${TOKEN}(\\d+)${TOKEN}`, "g"), (_, i: string) => tokens[Number(i)]);
+  return text.replace(new RegExp(`${TOKEN}(\\d+)${TOKEN}`, "g"), (whole, i: string) => tokens[Number(i)] ?? whole);
 }
 
 function transform(text: string): string {
@@ -266,8 +294,9 @@ function inlineCode(content: string): string {
   return `${ticks}${pad}${content}${pad}${ticks}`;
 }
 
+/** Escapes markdown syntax. "|" is left to tableRow, which escapes it inside tables only. */
 function escapeText(text: string): string {
-  return text.replace(/([\\`*_[\]<>~|])/g, "\\$1");
+  return text.replace(/([\\`*_[\]<>~])/g, "\\$1");
 }
 
 function basename(src: string): string {

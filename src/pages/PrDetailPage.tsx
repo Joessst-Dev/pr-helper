@@ -240,9 +240,11 @@ function TicketCard({ ticket, serverId, repo }: { ticket: Ticket; serverId: stri
   const renderImage = useCallback(
     (src: string, alt: string) => {
       const attachment = ticket.attachments.filter((a) => a.filename === src).pop();
-      return attachment ? <TicketImage serverId={serverId} repo={repo} attachment={attachment} alt={alt} /> : null;
+      return attachment ? (
+        <TicketImage serverId={serverId} repo={repo} ticketKey={ticket.key} attachment={attachment} alt={alt} />
+      ) : null;
     },
-    [ticket.attachments, serverId, repo],
+    [ticket.attachments, ticket.key, serverId, repo],
   );
   const text = (value: string) => (
     <Markdown renderImage={renderImage}>{ticket.textFormat === "jira_wiki" ? jiraToMarkdown(value) : value}</Markdown>
@@ -301,17 +303,19 @@ function formatCreated(created: string) {
 function TicketImage({
   serverId,
   repo,
+  ticketKey,
   attachment,
   alt,
 }: {
   serverId: string;
   repo: string;
+  ticketKey: string;
   attachment: TicketAttachment;
   alt: string;
 }) {
   const image = useQuery({
-    queryKey: ["ticket-image", serverId, repo, attachment.id],
-    queryFn: () => api.loadTicketImage(serverId, repo, attachment.id),
+    queryKey: ["ticket-image", serverId, repo, ticketKey, attachment.id],
+    queryFn: () => api.loadTicketImage(serverId, repo, ticketKey, attachment.id),
     staleTime: Infinity,
     retry: false,
   });

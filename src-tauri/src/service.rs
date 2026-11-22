@@ -520,11 +520,14 @@ impl Service {
     }
 
     /// An image attachment of a ticket as a `data:` URL, fetched with the Jira source that is
-    /// configured for the server or repo. The webview never sees the credentials.
+    /// configured for the server or repo. Like [`Self::load_pr_tickets`], the ticket must be in
+    /// an allowed project, and the attachment must belong to it. The webview never sees the
+    /// credentials.
     pub async fn load_ticket_image(
         &self,
         server_id: &str,
         repo: &str,
+        key: &str,
         attachment_id: &str,
     ) -> AppResult<String> {
         use base64::Engine;
@@ -533,6 +536,12 @@ impl Service {
             return Err(AppError::invalid(
                 "no ticket source is configured for this repository",
             ));
+        };
+        let projects = tickets::parse_project_keys(&settings.ticket_project_keys.value);
+        let Some(key) = tickets::filter_keys(&[key.to_string()], &projects).pop() else {
+            return Err(AppError::invalid(format!(
+                "ticket {key:?} is not in an allowed project"
+            )));
         };
         let source = self.db.get_ticket_source(source_id)?;
         let token = match source.kind {
@@ -545,7 +554,7 @@ impl Service {
         };
         let (mime, bytes) = self
             .jira_client(&source, token)?
-            .attachment_image(attachment_id)
+            .attachment_image(&key, attachment_id)
             .await?;
         Ok(format!(
             "data:{mime};base64,{}",

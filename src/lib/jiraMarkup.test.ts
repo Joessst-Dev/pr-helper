@@ -62,4 +62,38 @@ describe("jiraToMarkdown", () => {
     expect(jiraToMarkdown("<script>x</script> ~sub~")).toBe("\\<script>x\\</script> \\~sub\\~");
     expect(jiraToMarkdown("> not a quote")).toBe("\\> not a quote");
   });
+
+  describe("review findings", () => {
+    it("starts a new paragraph after a list or a bq. quote", () => {
+      expect(jiraToMarkdown("* one\n* two\nAfter text")).toBe("- one\n- two\n\nAfter text");
+      expect(jiraToMarkdown("bq. quoted\nnext line")).toBe("> quoted\n\nnext line");
+      expect(jiraToMarkdown("Intro\nbq. quoted")).toBe("Intro\n\n> quoted");
+    });
+
+    it("pads the header when body rows are wider", () => {
+      expect(jiraToMarkdown("||a||b||\n|1|2|3|")).toBe("| a | b |  |\n| --- | --- | --- |\n| 1 | 2 | 3 |\n");
+    });
+
+    it("does not turn prose between exclamation marks into an image", () => {
+      expect(jiraToMarkdown("Done! see shot.png! ok")).toBe("Done! see shot.png! ok");
+    });
+
+    it("keeps line breaks inside {quote}", () => {
+      expect(jiraToMarkdown("{quote}\nl1\nl2\n{quote}")).toBe("> l1  \n> l2\n");
+    });
+
+    it("escapes a pipe in a table cell link label once", () => {
+      expect(jiraToMarkdown("|a|[x|y|https://u.example]|")).toBe(
+        "|  |  |\n| --- | --- |\n| a | [x\\|y](<https://u.example>) |\n",
+      );
+    });
+
+    it("uses a fence longer than tilde runs in the code", () => {
+      expect(jiraToMarkdown("{code}\n~~~~\nx\n{code}")).toBe("~~~~~\n~~~~\nx\n~~~~~");
+    });
+
+    it("ignores NUL characters that look like placeholders", () => {
+      expect(jiraToMarkdown("a \u00005\u0000 b")).toBe("a 5 b");
+    });
+  });
 });

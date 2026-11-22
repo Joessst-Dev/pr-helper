@@ -1013,7 +1013,18 @@ async fn pr_view_tickets_follow_settings_and_the_project_allow_list() {
     assert!(loaded[1].ticket.is_none());
     assert!(loaded[1].error.is_some());
 
-    // Images come through the configured source, as a data URL.
+    // Images come through the configured source, as a data URL, only for attachments of an
+    // allowed ticket.
+    wiremock::Mock::given(method("GET"))
+        .and(path("/rest/api/2/issue/ABC-7"))
+        .and(wiremock::matchers::query_param("fields", "attachment"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"fields": {"attachment": [{"id": "5"}]}})),
+        )
+        .with_priority(1)
+        .mount(&jira)
+        .await;
     wiremock::Mock::given(method("GET"))
         .and(path("/rest/api/2/attachment/5"))
         .respond_with(
@@ -1031,10 +1042,18 @@ async fn pr_view_tickets_follow_settings_and_the_project_allow_list() {
         .mount(&jira)
         .await;
     assert_eq!(
-        svc.load_ticket_image(&server.id, &pr.repo, "5")
+        svc.load_ticket_image(&server.id, &pr.repo, "ABC-7", "5")
             .await
             .unwrap(),
         "data:image/png;base64,YWJj"
+    );
+    let err = svc
+        .load_ticket_image(&server.id, &pr.repo, "SECRET-1", "5")
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("not in an allowed project"),
+        "{err}"
     );
 }
 

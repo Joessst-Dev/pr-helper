@@ -41,8 +41,8 @@ export const api = {
     invoke<PrDetail>("get_pr_detail", { serverId, projectId, number }),
   loadPrTickets: (serverId: string, repo: string, keys: string[], requestId: string) =>
     invoke<TicketLoad[]>("load_pr_tickets", { serverId, repo, keys, requestId }),
-  loadTicketImage: (serverId: string, repo: string, attachmentId: string) =>
-    invoke<string>("load_ticket_image", { serverId, repo, attachmentId }),
+  loadTicketImage: (serverId: string, repo: string, key: string, attachmentId: string) =>
+    invoke<string>("load_ticket_image", { serverId, repo, key, attachmentId }),
   cancelTicketLoad: (requestId: string) => invoke<boolean>("cancel_ticket_load", { requestId }),
   startReview: (serverId: string, projectId: string, number: number) =>
     invoke<Review>("start_review", { serverId, projectId, number }),

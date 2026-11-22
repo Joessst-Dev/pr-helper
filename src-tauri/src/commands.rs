@@ -200,9 +200,10 @@ pub async fn load_ticket_image(
     svc: Svc<'_>,
     server_id: String,
     repo: String,
+    key: String,
     attachment_id: String,
 ) -> AppResult<String> {
-    svc.load_ticket_image(&server_id, &repo, &attachment_id)
+    svc.load_ticket_image(&server_id, &repo, &key, &attachment_id)
         .await
 }
 

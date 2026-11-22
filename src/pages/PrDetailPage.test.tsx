@@ -74,7 +74,7 @@ describe("TicketsSection", () => {
     expect((await screen.findByText("FFT:")).tagName).toBe("STRONG");
     const img = await screen.findByRole("img", { name: "flow.png" });
     expect(img).toHaveAttribute("src", "data:image/png;base64,AAAA");
-    expect(loadTicketImage).toHaveBeenCalledWith("s1", "acme/app", "10001");
+    expect(loadTicketImage).toHaveBeenCalledWith("s1", "acme/app", "ABC-7", "10001");
     // Images that are not attachments stay links and are never loaded.
     expect(container.querySelectorAll("img")).toHaveLength(1);
     expect(screen.getByRole("link", { name: "[image: pixel.png]" })).toBeInTheDocument();

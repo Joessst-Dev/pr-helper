@@ -123,11 +123,36 @@ impl JiraClient {
         Ok(parse_issue(&v, key, extra_fields, &self.base))
     }
 
-    /// Downloads an image attachment: `(mime type, bytes)`. Only displayable image types up to
-    /// [`MAX_IMAGE_BYTES`], and the credentials only ever go to the configured Jira host.
-    pub async fn attachment_image(&self, id: &str) -> AppResult<(String, Vec<u8>)> {
+    /// Downloads an image attachment of ticket `key`: `(mime type, bytes)`. The attachment must
+    /// belong to that ticket. Only displayable image types up to [`MAX_IMAGE_BYTES`], and the
+    /// credentials only ever go to the configured Jira host.
+    pub async fn attachment_image(&self, key: &str, id: &str) -> AppResult<(String, Vec<u8>)> {
+        if !is_valid_key(key) {
+            return Err(AppError::invalid(format!("invalid ticket key {key:?}")));
+        }
         if id.is_empty() || id.len() > 20 || !id.bytes().all(|b| b.is_ascii_digit()) {
             return Err(AppError::invalid(format!("invalid attachment id {id:?}")));
+        }
+        let issue = self
+            .send(
+                self.get(&format!("/issue/{key}"))
+                    .query(&[("fields", "attachment")]),
+                &format!("Ticket {key}"),
+            )
+            .await?;
+        let belongs = issue["fields"]["attachment"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|a| match &a["id"] {
+                Value::String(s) => s == id,
+                Value::Number(n) => n.to_string() == id,
+                _ => false,
+            });
+        if !belongs {
+            return Err(AppError::invalid(format!(
+                "attachment {id} does not belong to {key}"
+            )));
         }
         let meta = self
             .send(self.get(&format!("/attachment/{id}")), "The attachment")
@@ -257,9 +282,11 @@ fn parse_issue(v: &Value, key: &str, extra_fields: &[String], base: &str) -> Tic
     }
 }
 
-/// Image attachments, newest last, as the text references them by file name.
+/// Image attachments in Jira's order (oldest first), as the text references them by file name.
+/// On tickets with very many images only the newest [`MAX_ATTACHMENTS`] are kept.
 fn parse_attachments(v: &Value) -> Vec<TicketAttachment> {
-    v.as_array()
+    let images: Vec<TicketAttachment> = v
+        .as_array()
         .into_iter()
         .flatten()
         .filter_map(|a| {
@@ -280,8 +307,9 @@ fn parse_attachments(v: &Value) -> Vec<TicketAttachment> {
                 size: a["size"].as_u64().unwrap_or(0),
             })
         })
-        .take(MAX_ATTACHMENTS)
-        .collect()
+        .collect();
+    let skip = images.len().saturating_sub(MAX_ATTACHMENTS);
+    images.into_iter().skip(skip).collect()
 }
 
 /// Best-effort plain text for any Jira field value.
@@ -481,8 +509,16 @@ mod tests {
         )
         .await;
 
+        Mock::given(method("GET"))
+            .and(path("/rest/api/2/issue/ABC-1"))
+            .and(query_param("fields", "attachment"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "fields": {"attachment": [{"id": "1"}, {"id": 2}, {"id": "3"}, {"id": "4"}]}
+            })))
+            .mount(&server)
+            .await;
         let jira = client(&server, JiraAuth::Bearer("pat".into()));
-        let (mime, bytes) = jira.attachment_image("1").await.unwrap();
+        let (mime, bytes) = jira.attachment_image("ABC-1", "1").await.unwrap();
         assert_eq!(mime, "image/png");
         assert_eq!(bytes, b"\x89PNG");
         for (id, expected) in [
@@ -490,10 +526,29 @@ mod tests {
             ("3", "not a supported image"),
             ("4", "too large"),
             ("../1", "invalid attachment id"),
+            ("5", "does not belong to ABC-1"),
         ] {
-            let err = jira.attachment_image(id).await.unwrap_err().to_string();
+            let err = jira
+                .attachment_image("ABC-1", id)
+                .await
+                .unwrap_err()
+                .to_string();
             assert!(err.contains(expected), "{id}: {err}");
         }
+    }
+
+    #[test]
+    fn keeps_the_newest_attachments() {
+        let many: Vec<Value> = (1..=MAX_ATTACHMENTS + 10)
+            .map(|i| {
+                serde_json::json!({"id": i.to_string(), "filename": format!("{i}.png"),
+                    "mimeType": "image/png", "size": 1})
+            })
+            .collect();
+        let kept = parse_attachments(&Value::Array(many));
+        assert_eq!(kept.len(), MAX_ATTACHMENTS);
+        assert_eq!(kept[0].id, "11");
+        assert_eq!(kept.last().unwrap().id, (MAX_ATTACHMENTS + 10).to_string());
     }
 
     #[tokio::test]
