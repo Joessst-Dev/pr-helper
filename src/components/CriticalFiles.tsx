@@ -11,7 +11,14 @@ import type { Finding } from "../lib/bindings/Finding";
 import type { Side } from "../lib/bindings/Side";
 import { isHunkGap, tokenize, tokenizeDiff, type Token } from "../lib/highlight";
 import { Badge, Button, Card, Spinner } from "./ui";
-import { CommentComposer, UserComment, type CommentActions } from "./CommentComposer";
+import {
+  CommentComposer,
+  EMPTY_DRAFT,
+  UserComment,
+  useAdvice,
+  type CommentActions,
+  type Draft,
+} from "./CommentComposer";
 
 /** Files the reviewer recommends reading by hand, each expandable to its highlighted code. */
 export function CriticalFiles({
@@ -135,6 +142,9 @@ export function CodeView({
 
   const { diff, diffTruncated } = query.data;
   const notice = file.note ? NOTES[file.note] : null;
+  // The file view only has new lines; comments on removed lines live in the diff view.
+  const removedComments =
+    comments?.comments.filter((c) => c.file === file.path && c.side === "left").length ?? 0;
 
   return (
     <div className="space-y-2">
@@ -156,6 +166,13 @@ export function CodeView({
         )}
         {notice && <span className="text-xs text-muted">{notice}</span>}
         {effective === "diff" && diffTruncated && <span className="text-xs text-muted">The diff is cut off.</span>}
+        {effective === "file" && removedComments > 0 && (
+          <span className="text-xs text-muted">
+            {removedComments === 1
+              ? "1 comment on removed lines is shown in the Diff view."
+              : `${removedComments} comments on removed lines are shown in the Diff view.`}
+          </span>
+        )}
       </div>
       {effective === "file" && content != null ? (
         <FileLines path={file.path} content={content} diff={diff} focus={file.focusLines} comments={comments} />
@@ -240,6 +257,21 @@ function useLineSelection() {
   return { range, pick, clear: () => setSel(null) };
 }
 
+/** A new comment in the making: its lines, its text and its AI check, all kept while the lines change. */
+function useNewComment(reviewId: string) {
+  const { range, pick, clear } = useLineSelection();
+  const [draft, setDraft] = useState<Draft>(EMPTY_DRAFT);
+  const ai = useAdvice(reviewId);
+  const done = () => {
+    clear();
+    setDraft(EMPTY_DRAFT);
+    ai.stop();
+  };
+  return { range, pick, draft, setDraft, ai, done };
+}
+
+type NewComment = ReturnType<typeof useNewComment>;
+
 const inSelection = (sel: Selection | null, side: Side, line: number | null) =>
   !!sel && line != null && sel.side === side && line >= sel.start && line <= sel.end;
 
@@ -284,20 +316,19 @@ function RowExtras({
   side,
   line,
   saved,
-  selection,
+  composing,
   outsideDiff,
   actions,
-  onDone,
 }: {
   path: string;
   side: Side;
   line: number | null;
   saved: Map<string, Finding[]>;
-  selection: Selection | null;
+  composing: NewComment;
   outsideDiff: boolean;
   actions?: CommentActions;
-  onDone: () => void;
 }) {
+  const selection = composing.range;
   if (!actions || line == null) return null;
   const mine = saved.get(`${side}:${line}`) ?? [];
   const compose = selection?.side === side && selection.end === line;
@@ -309,16 +340,18 @@ function RowExtras({
       ))}
       {compose && (
         <CommentComposer
-          key={`${selection.side}:${selection.start}-${selection.end}`}
           reviewId={actions.reviewId}
           anchor={{ file: path, lineStart: selection.start, lineEnd: selection.end, side }}
           outsideDiff={outsideDiff}
           check={actions.check}
+          draft={composing.draft}
+          onDraftChange={composing.setDraft}
+          ai={composing.ai}
           onSave={async (text, severity) => {
             await actions.onAdd({ file: path, lineStart: selection.start, lineEnd: selection.end, side }, severity, text);
-            onDone();
+            composing.done();
           }}
-          onCancel={onDone}
+          onCancel={composing.done}
         />
       )}
     </div>
@@ -352,7 +385,8 @@ function FileLines({
     [diff],
   );
   const tokens = useTokens(content, path);
-  const { range, pick, clear } = useLineSelection();
+  const composing = useNewComment(comments?.reviewId ?? "");
+  const { range, pick } = composing;
   const saved = useMemo(() => commentsByLine(path, comments), [path, comments]);
   // Jump to what the reviewer pointed at, else to the first change.
   const first = focus[0]?.start ?? [...changed].sort((a, b) => a - b)[0] ?? 1;
@@ -400,10 +434,9 @@ function FileLines({
               side="right"
               line={no}
               saved={saved}
-              selection={range}
+              composing={composing}
               outsideDiff={!inDiff.has(range?.end ?? no)}
               actions={comments}
-              onDone={clear}
             />
           </div>
         );
@@ -424,7 +457,8 @@ function DiffLines({
   comments?: CommentActions;
 }) {
   const tokens = useDiffTokens(diff, path);
-  const { range, pick, clear } = useLineSelection();
+  const composing = useNewComment(comments?.reviewId ?? "");
+  const { range, pick } = composing;
   const saved = useMemo(() => commentsByLine(path, comments), [path, comments]);
   const firstFocus = diff.findIndex((d) => d.new != null && inRanges(d.new, focus));
   const first = firstFocus >= 0 ? firstFocus : diff.findIndex((d) => d.kind !== "context");
@@ -483,10 +517,9 @@ function DiffLines({
               side={side}
               line={line}
               saved={saved}
-              selection={range}
+              composing={composing}
               outsideDiff={false}
               actions={comments}
-              onDone={clear}
             />
             {leftAlso != null && (
               <RowExtras
@@ -494,10 +527,9 @@ function DiffLines({
                 side="left"
                 line={leftAlso}
                 saved={saved}
-                selection={range}
+                composing={composing}
                 outsideDiff={false}
                 actions={comments}
-                onDone={clear}
               />
             )}
           </div>

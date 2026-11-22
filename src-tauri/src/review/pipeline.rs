@@ -7,8 +7,8 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use crate::db::models::{
-    CriticalFile, CriticalFileContent, FileNote, PrState, PullRequest, ReviewFile, ReviewStatus,
-    ReviewTrigger, TicketRef, Verdict,
+    CriticalFile, CriticalFileContent, FileNote, FindingSource, PrState, PullRequest, ReviewFile,
+    ReviewStatus, ReviewTrigger, TicketRef, Verdict,
 };
 use crate::env;
 use crate::error::{AppError, AppResult};
@@ -191,8 +191,14 @@ async fn execute(
     let previous = svc
         .db
         .last_done_review(&pr.server_id, &pr.repo, pr.number)?;
+    // The user's own comments are not the reviewer's to re-report.
     let previous_findings = match &previous {
-        Some(p) => svc.db.list_findings(&p.id)?,
+        Some(p) => svc
+            .db
+            .list_findings(&p.id)?
+            .into_iter()
+            .filter(|f| f.source == FindingSource::Reviewer)
+            .collect(),
         None => Vec::new(),
     };
     let mut has_incremental = false;

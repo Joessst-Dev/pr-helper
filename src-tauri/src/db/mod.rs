@@ -955,19 +955,45 @@ impl Db {
         self.get_finding(id)
     }
 
-    /// Stores a comment the user wrote on a critical file. It goes after the reviewer's findings.
+    /// Stores a comment the user wrote on a critical file. It keeps the severity order: it goes
+    /// after every finding of the same or a higher severity, and the rest move down one place.
     pub fn insert_user_finding(&self, f: &Finding) -> AppResult<Finding> {
-        self.with(|c| {
-            c.execute(
+        {
+            let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+            let tx = conn.transaction()?;
+            let ranked: Vec<(u32, u8)> = {
+                let mut stmt = tx.prepare(
+                    "SELECT position, severity FROM findings WHERE review_id = ?1 ORDER BY position",
+                )?;
+                stmt.query_map([&f.review_id], |r| {
+                    let severity: String = r.get(1)?;
+                    Ok((
+                        r.get(0)?,
+                        Severity::parse(&severity).unwrap_or(Severity::Low).rank(),
+                    ))
+                })?
+                .collect::<rusqlite::Result<_>>()?
+            };
+            let position = ranked
+                .iter()
+                .filter(|(_, rank)| *rank <= f.severity.rank())
+                .map(|(p, _)| p + 1)
+                .max()
+                .unwrap_or(0);
+            tx.execute(
+                "UPDATE findings SET position = position + 1 WHERE review_id = ?1 AND position >= ?2",
+                params![f.review_id, position],
+            )?;
+            tx.execute(
                 "INSERT INTO findings (id, review_id, position, severity, category, title, file,
                    line_start, line_end, side, explanation, proposed_comment, suggestion, in_diff,
                    diff_excerpt, selected, source)
-                 VALUES (?1, ?2,
-                   (SELECT COALESCE(MAX(position), -1) + 1 FROM findings WHERE review_id = ?2),
-                   ?3, ?4, ?5, ?6, ?7, ?8, ?9, '', ?10, NULL, ?11, NULL, ?12, 'user')",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, '', ?11, NULL, ?12, NULL, ?13,
+                   'user')",
                 params![
                     f.id,
                     f.review_id,
+                    position,
                     f.severity.as_str(),
                     f.category,
                     f.title,
@@ -983,8 +1009,9 @@ impl Db {
                     f.in_diff,
                     f.selected,
                 ],
-            )
-        })?;
+            )?;
+            tx.commit()?;
+        }
         self.get_finding(&f.id)
     }
 
@@ -1221,6 +1248,19 @@ mod tests {
         assert_eq!(other.position, 2);
         db.delete_user_finding(&other.id).unwrap();
         assert_eq!(db.list_findings(&review.id).unwrap().len(), 2);
+
+        // A critical comment goes before the low findings, keeping the severity order.
+        finding.id = new_id();
+        finding.severity = Severity::Critical;
+        let critical = db.insert_user_finding(&finding).unwrap();
+        assert_eq!(critical.position, 0);
+        let order: Vec<_> = db
+            .list_findings(&review.id)
+            .unwrap()
+            .into_iter()
+            .map(|f| (f.id, f.position))
+            .collect();
+        assert_eq!(order, [(critical.id, 0), (reviewer.id, 1), (mine.id, 2)]);
     }
 
     #[test]

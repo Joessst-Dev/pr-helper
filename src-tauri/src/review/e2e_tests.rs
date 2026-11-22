@@ -608,7 +608,6 @@ async fn steering_text_in_a_ticket_blocks_auto_approve() {
     );
 }
 
-/// Runs the real `claude` CLI (costs a few cents). `cargo test real_claude -- --ignored`
 fn user_comment(review_id: &str, line: u32, side: Side, body: &str) -> UserCommentInput {
     UserCommentInput {
         review_id: review_id.into(),
@@ -699,15 +698,28 @@ async fn user_comments_are_checked_and_posted() {
     .await
     .unwrap();
     assert_eq!(outcome.posted, 2);
-    let rec = h.recorded.lock().unwrap();
-    let inline = &rec.submissions[0].inline;
-    assert_eq!((inline[0].side, inline[0].line), (Side::Left, 2));
-    assert_eq!((inline[1].side, inline[1].line), (Side::Right, 2));
-    drop(rec);
+    {
+        let rec = h.recorded.lock().unwrap();
+        let inline = &rec.submissions[0].inline;
+        assert_eq!((inline[0].side, inline[0].line), (Side::Left, 2));
+        assert_eq!((inline[1].side, inline[1].line), (Side::Right, 2));
+    }
     // Posted comments stay.
     assert!(user_comment::delete(&h.svc, &mine.id).is_err());
+
+    // A re-review lists the reviewer's previous findings, never the user's comments.
+    write_fake_claude(dir, "comment");
+    let again = queue::enqueue(&h.svc, h.pr.clone(), ReviewTrigger::Manual).unwrap();
+    assert_eq!(
+        wait_finished(&h.svc, &again.id).await.status,
+        ReviewStatus::Done
+    );
+    let prompt = std::fs::read_to_string(dir.join("prompt.txt")).unwrap();
+    assert!(prompt.contains("Explain unsafe_thing"));
+    assert!(!prompt.contains("Why drop the plain version?"));
 }
 
+/// Checks a user comment with the real `claude` CLI (haiku, costs under a cent).
 #[cfg(unix)]
 #[tokio::test]
 #[ignore]
@@ -743,6 +755,7 @@ async fn real_claude_comment_check() {
     assert!(crate::review::postprocess::dash_violations(&a.suggested_comment).is_empty());
 }
 
+/// Runs the real `claude` CLI (costs a few cents). `cargo test real_claude -- --ignored`
 #[cfg(unix)]
 #[tokio::test]
 #[ignore]

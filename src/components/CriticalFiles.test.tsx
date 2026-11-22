@@ -194,6 +194,43 @@ describe("CriticalFiles", () => {
       expect(screen.queryByRole("textbox", { name: "Your comment" })).toBeNull();
     });
 
+    it("keeps the draft and a running AI check when the selection changes", async () => {
+      checkUserComment.mockReturnValue(new Promise(() => {}));
+      const a = actions();
+      renderWith(a);
+      await openAuth();
+      await userEvent.click(screen.getByRole("button", { name: "Comment on line 2" }));
+      await userEvent.type(screen.getByRole("textbox", { name: "Your comment" }), "Long thought");
+      await userEvent.selectOptions(screen.getByRole("combobox", { name: "Severity" }), "low");
+      await userEvent.click(screen.getByRole("button", { name: /Ask AI/ }));
+      fireEvent.click(screen.getByRole("button", { name: "Comment on line 4" }), { shiftKey: true });
+      expect(screen.getByText("Your comment on lines 2-4")).toBeInTheDocument();
+      expect(screen.getByRole("textbox", { name: "Your comment" })).toHaveValue("Long thought");
+      expect(screen.getByRole("combobox", { name: "Severity" })).toHaveValue("low");
+      expect(screen.getByText("Checking your comment…")).toBeInTheDocument();
+      expect(cancelCommentCheck).not.toHaveBeenCalled();
+      await userEvent.click(screen.getByRole("button", { name: "Add comment" }));
+      expect(a.onAdd).toHaveBeenCalledWith(
+        { file: "src/auth.rs", lineStart: 2, lineEnd: 4, side: "right" },
+        "low",
+        "Long thought",
+      );
+      // Saving ends the check and starts the next comment empty.
+      expect(cancelCommentCheck).toHaveBeenCalled();
+      await userEvent.click(screen.getByRole("button", { name: "Comment on line 1" }));
+      expect(screen.getByRole("textbox", { name: "Your comment" })).toHaveValue("");
+    });
+
+    it("points to the diff view for comments on removed lines", async () => {
+      const removed = finding({ id: "u2", source: "user", file: "src/auth.rs", lineStart: 2, side: "left" });
+      renderWith(actions({ comments: [removed] }));
+      await openAuth();
+      expect(screen.getByText("1 comment on removed lines is shown in the Diff view.")).toBeInTheDocument();
+      await userEvent.click(screen.getByRole("button", { name: "Diff" }));
+      expect(await screen.findByText("Your comment")).toBeInTheDocument();
+      expect(screen.queryByText(/shown in the Diff view/)).toBeNull();
+    });
+
     it("warns that lines outside the diff become a general comment", async () => {
       renderWith(actions());
       await openAuth();

@@ -12,7 +12,7 @@ import type { Severity } from "../lib/bindings/Severity";
 import type { SubmitMode } from "../lib/bindings/SubmitMode";
 import type { Verdict } from "../lib/bindings/Verdict";
 import { useReviewProgress } from "../lib/events";
-import { formatCost, relativeTime, SEVERITIES, SEVERITY_LABEL, shortSha } from "../lib/format";
+import { formatCost, relativeTime, SEVERITIES, SEVERITY_LABEL, severityRank, shortSha } from "../lib/format";
 import { ReviewStatusBadge, VerdictBadge } from "../components/badges";
 import type { CommentActions } from "../components/CommentComposer";
 import { CriticalFiles } from "../components/CriticalFiles";
@@ -263,7 +263,11 @@ export function ReviewResults({
         severity,
         body,
       });
-      setFindings((fs) => [...fs, added]);
+      // Same place the backend gives it: after every finding of the same or a higher severity.
+      setFindings((fs) => {
+        const at = fs.reduce((i, f, k) => (severityRank(f.severity) <= severityRank(added.severity) ? k + 1 : i), 0);
+        return [...fs.slice(0, at), added, ...fs.slice(at)];
+      });
     },
     onEdit: (id, proposedComment) => update(id, { proposedComment }),
     onDelete: async (id) => {

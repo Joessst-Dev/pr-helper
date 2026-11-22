@@ -98,13 +98,17 @@ fn validate_anchor(input: &UserCommentInput, content: &CriticalFileContent) -> A
             "the selected lines are not part of this file",
         ));
     }
-    if side == Side::Left
-        && !content.diff.iter().any(|d| {
-            d.kind == DiffLineKind::Removed && d.old.is_some_and(|o| o >= start && o <= end)
-        })
-    {
+    // On the old side only removed lines can be anchored; posting would otherwise move the
+    // comment to the new line with the same number.
+    let removed = |n: u32| {
+        content
+            .diff
+            .iter()
+            .any(|d| d.kind == DiffLineKind::Removed && d.old == Some(n))
+    };
+    if side == Side::Left && !(removed(start) && removed(end)) {
         return Err(AppError::invalid(
-            "comments on the old side need at least one removed line",
+            "comments on the old side must start and end on removed lines",
         ));
     }
     Ok(Anchor {
@@ -393,6 +397,8 @@ mod tests {
         let a = validate_anchor(&input(2, None, Side::Left), &c).unwrap();
         assert!(a.in_diff);
         assert!(validate_anchor(&input(1, None, Side::Left), &c).is_err());
+        // A range ending on a context line would be posted on the new side.
+        assert!(validate_anchor(&input(2, Some(3), Side::Left), &c).is_err());
         // Without the file, only diff lines.
         let c = content(false);
         assert!(validate_anchor(&input(5, None, Side::Right), &c).is_err());

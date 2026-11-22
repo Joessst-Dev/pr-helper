@@ -36,8 +36,14 @@ export function anchorLabel(a: Pick<CommentAnchor, "lineStart" | "lineEnd" | "si
   return a.side === "left" ? `${lines} (removed)` : lines;
 }
 
-/** Runs the AI check of a draft; cancels it when the composer goes away or a new check starts. */
-function useAdvice(reviewId: string, anchor: CommentAnchor) {
+/** A comment being written, kept by the code view so it survives changing the selected lines. */
+export type Draft = { text: string; severity: Severity };
+export const EMPTY_DRAFT: Draft = { text: "", severity: "medium" };
+
+export type Advice = ReturnType<typeof useAdvice>;
+
+/** Runs the AI check of a draft; cancels it when the owner goes away or a new check starts. */
+export function useAdvice(reviewId: string) {
   const running = useRef<string | null>(null);
   const [state, setState] = useState<{ busy: boolean; advice: CommentAdvice | null; error: string | null }>({
     busy: false,
@@ -50,7 +56,7 @@ function useAdvice(reviewId: string, anchor: CommentAnchor) {
   };
   useEffect(() => cancel, []);
 
-  const ask = async (text: string, severity: Severity) => {
+  const ask = async (anchor: CommentAnchor, text: string, severity: Severity) => {
     cancel();
     const id = crypto.randomUUID();
     running.current = id;
@@ -124,6 +130,9 @@ export function CommentComposer({
   editing = false,
   outsideDiff = false,
   check,
+  draft,
+  onDraftChange,
+  ai: sharedAi,
   onSave,
   onCancel,
 }: {
@@ -135,15 +144,29 @@ export function CommentComposer({
   editing?: boolean;
   outsideDiff?: boolean;
   check: CheckFn;
+  /** Where the text lives when it must outlive this composer (a new comment whose lines change). */
+  draft?: Draft;
+  onDraftChange?: (draft: Draft) => void;
+  /** An AI check owned by the caller, so a running check survives a remount too. */
+  ai?: Advice;
   onSave: (text: string, severity: Severity) => Promise<void> | void;
   onCancel: () => void;
 }) {
-  const [text, setText] = useState(initialText);
-  const [severity, setSeverity] = useState<Severity>(initialSeverity);
+  const [text, setTextState] = useState(draft?.text ?? initialText);
+  const [severity, setSeverityState] = useState<Severity>(draft?.severity ?? initialSeverity);
+  const setText = (t: string) => {
+    setTextState(t);
+    onDraftChange?.({ text: t, severity });
+  };
+  const setSeverity = (s: Severity) => {
+    setSeverityState(s);
+    onDraftChange?.({ text, severity: s });
+  };
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const result = useCommentCheck(text, check);
-  const ai = useAdvice(reviewId, anchor);
+  const ownAi = useAdvice(reviewId);
+  const ai = sharedAi ?? ownAi;
   const empty = !text.trim();
 
   const save = async () => {
@@ -212,7 +235,7 @@ export function CommentComposer({
             Stop AI check
           </Button>
         ) : (
-          <Button size="sm" variant="ghost" disabled={empty} onClick={() => ai.ask(text, severity)}>
+          <Button size="sm" variant="ghost" disabled={empty} onClick={() => ai.ask(anchor, text, severity)}>
             <Sparkles className="size-3" /> Ask AI
           </Button>
         )}
