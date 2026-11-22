@@ -78,11 +78,14 @@ pub fn build_inline(
                     a.new_line
                 }
                 .unwrap_or_default();
-                // Multi-line ranges need the start on the same side and inside the diff.
+                // Multi-line ranges need the start on the same side and in the same hunk;
+                // otherwise the comment goes on its last line only.
                 let start_line = match (f.line_start, f.line_end) {
                     (Some(start), Some(_)) if start < line => index
                         .locate(&a.new_path, start, a.side)
-                        .filter(|s| s.side == a.side)
+                        .filter(|s| {
+                            s.side == a.side && index.same_hunk(&a.new_path, start, line, a.side)
+                        })
                         .map(|_| start),
                     _ => None,
                 };
@@ -294,6 +297,25 @@ mod tests {
                 "**a.rs:40**\n\nNot in diff".to_string()
             )]
         );
+    }
+
+    #[test]
+    fn ranges_across_hunks_post_on_their_last_line() {
+        let diff = "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n\
+@@ -1,2 +1,2 @@\n x\n-old\n+new\n@@ -40,2 +40,2 @@\n y\n-old2\n+new2\n";
+        let index = DiffIndex::parse(diff);
+        let settings = resolve(
+            &SettingsOverrides::default(),
+            &SettingsOverrides::default(),
+            None,
+        );
+        let (inline, _) = build_inline(
+            &[finding("f", Some(2), Some(41), "Both")],
+            &index,
+            &settings,
+        )
+        .unwrap();
+        assert_eq!((inline[0].line, inline[0].start_line), (41, None));
     }
 
     #[test]

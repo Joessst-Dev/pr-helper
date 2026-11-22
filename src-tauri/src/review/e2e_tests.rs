@@ -640,6 +640,9 @@ async fn user_comments_are_checked_and_posted() {
     )
     .unwrap();
     assert_eq!(removed.source, FindingSource::User);
+    let edited =
+        user_comment::update_finding(&h.svc, &removed.id, true, "Why drop it?\n\nDetails").unwrap();
+    assert_eq!(edited.title, "Why drop it?");
     assert!(removed.in_diff && removed.selected);
 
     // The AI check runs a fresh locked-down session outside any checkout.
@@ -668,18 +671,12 @@ async fn user_comments_are_checked_and_posted() {
     assert!(args.contains("--setting-sources user") && args.contains("--strict-mcp-config"));
     assert!(args.contains("--tools Read Grep Glob Skill") && !args.contains("--add-dir"));
     let cwd = std::fs::read_to_string(dir.join("cwd.txt")).unwrap();
-    assert!(cwd.contains("comment-checks"));
+    assert!(cwd.contains("comment-check-"));
     let prompt = std::fs::read_to_string(dir.join("prompt.txt")).unwrap();
     assert!(prompt.contains("comment.md") && prompt.contains("file.txt"));
-    // The material is gone afterwards.
-    assert!(
-        !h.svc
-            .cache
-            .review_dir(&review.id)
-            .join("comment-checks")
-            .read_dir()
-            .is_ok_and(|mut d| d.next().is_some())
-    );
+    // The material is gone afterwards, and nothing else was created for it.
+    assert!(!std::path::Path::new(cwd.trim()).exists());
+    assert!(!h.svc.cache.review_dir(&review.id).exists());
 
     let mine = user_comment::add(
         &h.svc,

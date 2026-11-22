@@ -12,7 +12,15 @@ import type { Severity } from "../lib/bindings/Severity";
 import type { SubmitMode } from "../lib/bindings/SubmitMode";
 import type { Verdict } from "../lib/bindings/Verdict";
 import { useReviewProgress } from "../lib/events";
-import { formatCost, relativeTime, SEVERITIES, SEVERITY_LABEL, severityRank, shortSha } from "../lib/format";
+import {
+  commentTitle,
+  formatCost,
+  relativeTime,
+  SEVERITIES,
+  SEVERITY_LABEL,
+  severityRank,
+  shortSha,
+} from "../lib/format";
 import { ReviewStatusBadge, VerdictBadge } from "../components/badges";
 import type { CommentActions } from "../components/CommentComposer";
 import { CriticalFiles } from "../components/CriticalFiles";
@@ -232,8 +240,11 @@ export function ReviewResults({
   const [saveErrors, setSaveErrors] = useState<Record<string, string>>({});
 
   const update = (id: string, patch: Partial<Finding>) => {
-    setFindings((fs) => fs.map((f) => (f.id === id ? { ...f, ...patch } : f)));
     const f = findings.find((x) => x.id === id)!;
+    // The backend titles a user comment by its first line; keep the card in step.
+    const title = f.source === "user" && patch.proposedComment != null ? commentTitle(patch.proposedComment) : "";
+    if (title) patch = { ...patch, title };
+    setFindings((fs) => fs.map((x) => (x.id === id ? { ...x, ...patch } : x)));
     const next = { ...f, ...patch };
     const save = api
       .updateFinding(id, next.selected, next.proposedComment)
@@ -248,35 +259,6 @@ export function ReviewResults({
     pendingSaves.current.set(id, save);
   };
 
-  const userComments = useMemo(() => findings.filter((f) => f.source === "user"), [findings]);
-  const commentActions: CommentActions = {
-    reviewId,
-    comments: userComments,
-    check,
-    onAdd: async (anchor, severity, body) => {
-      const added = await api.addUserComment({
-        reviewId,
-        file: anchor.file,
-        lineStart: anchor.lineStart,
-        lineEnd: anchor.lineEnd !== anchor.lineStart ? anchor.lineEnd : null,
-        side: anchor.side,
-        severity,
-        body,
-      });
-      // Same place the backend gives it: after every finding of the same or a higher severity.
-      setFindings((fs) => {
-        const at = fs.reduce((i, f, k) => (severityRank(f.severity) <= severityRank(added.severity) ? k + 1 : i), 0);
-        return [...fs.slice(0, at), added, ...fs.slice(at)];
-      });
-    },
-    onEdit: (id, proposedComment) => update(id, { proposedComment }),
-    onDelete: async (id) => {
-      await api.deleteUserComment(id);
-      pendingSaves.current.delete(id);
-      setSaveErrors(({ [id]: _, ...rest }) => rest);
-      setFindings((fs) => fs.filter((f) => f.id !== id));
-    },
-  };
 
   const counts = useMemo(() => {
     const c = Object.fromEntries(SEVERITIES.map((s) => [s, 0])) as Record<Severity, number>;
@@ -311,6 +293,39 @@ export function ReviewResults({
     },
     onError: onChanged,
   });
+
+  const userComments = useMemo(() => findings.filter((f) => f.source === "user"), [findings]);
+  const commentActions: CommentActions = {
+    reviewId,
+    comments: userComments,
+    check,
+    onAdd: async (anchor, severity, body) => {
+      const added = await api.addUserComment({
+        reviewId,
+        file: anchor.file,
+        lineStart: anchor.lineStart,
+        lineEnd: anchor.lineEnd !== anchor.lineStart ? anchor.lineEnd : null,
+        side: anchor.side,
+        severity,
+        body,
+      });
+      // Same place the backend gives it: after every finding of the same or a higher severity.
+      setFindings((fs) => {
+        const at = fs.reduce((i, f, k) => (severityRank(f.severity) <= severityRank(added.severity) ? k + 1 : i), 0);
+        return [...fs.slice(0, at), added, ...fs.slice(at)];
+      });
+    },
+    onEdit: (id, proposedComment) => update(id, { proposedComment }),
+    onDelete: async (id) => {
+      // An edit still being saved would fail on the deleted row and bring back its error.
+      await pendingSaves.current.get(id)?.catch(() => {});
+      await api.deleteUserComment(id);
+      pendingSaves.current.delete(id);
+      setSaveErrors(({ [id]: _, ...rest }) => rest);
+      setFindings((fs) => fs.filter((f) => f.id !== id));
+    },
+    posting: post.isPending,
+  };
 
   const setAll = (value: boolean) => {
     selectable.forEach((f) => {
@@ -390,7 +405,7 @@ export function ReviewResults({
                   check={check}
                   onToggle={(selected) => update(f.id, { selected })}
                   onEdit={(proposedComment) => update(f.id, { proposedComment })}
-                  onDelete={f.source === "user" ? () => commentActions.onDelete(f.id) : undefined}
+                  onDelete={f.source === "user" && !post.isPending ? () => commentActions.onDelete(f.id) : undefined}
                   saveError={saveErrors[f.id]}
                 />
               ))}

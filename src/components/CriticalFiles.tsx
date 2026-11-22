@@ -112,6 +112,8 @@ export function CodeView({
   file: CriticalFile;
   comments?: CommentActions;
 }) {
+  // Lives here, not in the views, so switching between File and Diff keeps the draft.
+  const composing = useNewComment(reviewId);
   const query = useQuery({
     queryKey: ["reviewFile", reviewId, file.path],
     queryFn: () => api.getReviewFile(reviewId, file.path),
@@ -175,9 +177,16 @@ export function CodeView({
         )}
       </div>
       {effective === "file" && content != null ? (
-        <FileLines path={file.path} content={content} diff={diff} focus={file.focusLines} comments={comments} />
+        <FileLines
+          path={file.path}
+          content={content}
+          diff={diff}
+          focus={file.focusLines}
+          comments={comments}
+          composing={composing}
+        />
       ) : file.note === "pruned" ? null : (
-        <DiffLines path={file.path} diff={diff} focus={file.focusLines} comments={comments} />
+        <DiffLines path={file.path} diff={diff} focus={file.focusLines} comments={comments} composing={composing} />
       )}
     </div>
   );
@@ -364,12 +373,14 @@ function FileLines({
   diff,
   focus,
   comments,
+  composing,
 }: {
   path: string;
   content: string;
   diff: FileDiffLine[];
   focus: LineRange[];
   comments?: CommentActions;
+  composing: NewComment;
 }) {
   const lines = useMemo(() => {
     const l = content.split("\n");
@@ -385,7 +396,6 @@ function FileLines({
     [diff],
   );
   const tokens = useTokens(content, path);
-  const composing = useNewComment(comments?.reviewId ?? "");
   const { range, pick } = composing;
   const saved = useMemo(() => commentsByLine(path, comments), [path, comments]);
   // Jump to what the reviewer pointed at, else to the first change.
@@ -450,14 +460,15 @@ function DiffLines({
   diff,
   focus,
   comments,
+  composing,
 }: {
   path: string;
   diff: FileDiffLine[];
   focus: LineRange[];
   comments?: CommentActions;
+  composing: NewComment;
 }) {
   const tokens = useDiffTokens(diff, path);
-  const composing = useNewComment(comments?.reviewId ?? "");
   const { range, pick } = composing;
   const saved = useMemo(() => commentsByLine(path, comments), [path, comments]);
   const firstFocus = diff.findIndex((d) => d.new != null && inRanges(d.new, focus));

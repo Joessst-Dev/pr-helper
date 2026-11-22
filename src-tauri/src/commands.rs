@@ -298,7 +298,7 @@ pub fn update_finding(
     selected: bool,
     proposed_comment: String,
 ) -> AppResult<Finding> {
-    svc.db.update_finding(&id, selected, &proposed_comment)
+    user_comment::update_finding(&svc, &id, selected, &proposed_comment)
 }
 
 /// Adds a comment the user wrote on lines of a critical file. It is posted like a finding.

@@ -915,7 +915,7 @@ impl Db {
             selected: r.get("selected")?,
             posted_at: r.get("posted_at")?,
             posted_ref: r.get("posted_ref")?,
-            source: FindingSource::parse(&r.get::<_, String>("source")?),
+            source: FindingSource::parse(&r.get::<_, String>("source")?).unwrap_or_default(),
         })
     }
 
@@ -1029,6 +1029,16 @@ impl Db {
             ));
         }
         Ok(())
+    }
+
+    pub fn set_finding_title(&self, id: &str, title: &str) -> AppResult<Finding> {
+        self.with(|c| {
+            c.execute(
+                "UPDATE findings SET title = ?2 WHERE id = ?1",
+                params![id, title],
+            )
+        })?;
+        self.get_finding(id)
     }
 
     pub fn mark_finding_posted(&self, id: &str, posted_ref: Option<&str>) -> AppResult<()> {

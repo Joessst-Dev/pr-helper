@@ -2,6 +2,8 @@
 
 use serde::Deserialize;
 
+use crate::review::user_comment::CommentAssessment;
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct RawReview {
     pub verdict: String,
@@ -58,7 +60,7 @@ pub struct RawFinding {
 /// The answer of a user comment check.
 #[derive(Debug, Clone, Deserialize)]
 pub struct RawCommentAdvice {
-    pub assessment: String,
+    pub assessment: CommentAssessment,
     #[serde(default)]
     pub feedback: String,
     #[serde(default)]

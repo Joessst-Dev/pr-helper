@@ -3,6 +3,7 @@
 //! A user comment is stored as a finding with `source = user`, so selecting, editing and posting
 //! (including `finalize_body`) work exactly as for the reviewer's findings.
 
+use std::fmt::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,6 +24,7 @@ use crate::review::prompt::{comment_check_prompt, comment_check_system_prompt};
 use crate::review::runner::{self, RunRequest, ToolPolicy};
 use crate::review::schema::{RawCommentAdvice, comment_check_schema};
 use crate::service::Service;
+use crate::settings::EffectiveSettings;
 
 pub const USER_CATEGORY: &str = "comment";
 const MAX_BODY_CHARS: usize = 20_000;
@@ -80,6 +82,8 @@ fn diff_number(d: &FileDiffLine, side: Side) -> Option<u32> {
     }
 }
 
+/// Checks the lines against the stored file and diff and tells whether they can be commented
+/// on inline (`in_diff`) or end up in the review body.
 fn validate_anchor(input: &UserCommentInput, content: &CriticalFileContent) -> AppResult<Anchor> {
     let start = input.line_start;
     let end = input.line_end.unwrap_or(start);
@@ -166,6 +170,11 @@ fn checked_body(body: &str) -> AppResult<&str> {
     Ok(body)
 }
 
+/// Stores a comment the user wrote on lines of a critical file of a finished review.
+///
+/// # Errors
+/// Fails when the body is empty or too long, the file is not a critical file of the review (or
+/// its code was pruned), or the lines are not part of the stored file or diff.
 pub fn add(svc: &Service, input: &UserCommentInput) -> AppResult<Finding> {
     let body = checked_body(&input.body)?;
     let content = critical_file(svc, &input.review_id, &input.file)?;
@@ -196,6 +205,24 @@ pub fn add(svc: &Service, input: &UserCommentInput) -> AppResult<Finding> {
     svc.db.insert_user_finding(&finding)
 }
 
+/// Saves the selection and text of any finding. The title of a user comment is its first line,
+/// so it follows the text.
+///
+/// # Errors
+/// Fails when the finding does not exist or the database write fails.
+pub fn update_finding(svc: &Service, id: &str, selected: bool, text: &str) -> AppResult<Finding> {
+    let finding = svc.db.update_finding(id, selected, text)?;
+    let title = title_of(text);
+    if finding.source != FindingSource::User || title.is_empty() || title == finding.title {
+        return Ok(finding);
+    }
+    svc.db.set_finding_title(id, &title)
+}
+
+/// Deletes one of the user's own comments.
+///
+/// # Errors
+/// Fails for reviewer findings and for comments that were posted already.
 pub fn delete(svc: &Service, id: &str) -> AppResult<()> {
     svc.db.delete_user_finding(id)
 }
@@ -216,12 +243,8 @@ fn render_diff(diff: &[FileDiffLine]) -> String {
             DiffLineKind::Removed => '-',
             DiffLineKind::Context => ' ',
         };
-        out.push_str(&format!(
-            "{:>5} {:>5} {mark}{}\n",
-            num(d.old),
-            num(d.new),
-            d.text
-        ));
+        // Writing to a String cannot fail.
+        let _ = writeln!(out, "{:>5} {:>5} {mark}{}", num(d.old), num(d.new), d.text);
     }
     out
 }
@@ -267,7 +290,7 @@ fn check_request(
     claude: PathBuf,
     dir: &Path,
     has_file: bool,
-    settings: &crate::settings::EffectiveSettings,
+    settings: &EffectiveSettings,
 ) -> RunRequest {
     RunRequest {
         policy: ToolPolicy::Reviewer,
@@ -287,30 +310,25 @@ fn check_request(
     }
 }
 
+/// The model's answer with the comment rules applied in code, never trusted from the prompt.
 fn advice_from(
     raw: RawCommentAdvice,
     forbid_attribution: bool,
     cost_usd: Option<f64>,
-) -> AppResult<CommentAdvice> {
-    let assessment = match raw.assessment.as_str() {
-        "valid" => CommentAssessment::Valid,
-        "partly_valid" => CommentAssessment::PartlyValid,
-        "not_valid" => CommentAssessment::NotValid,
-        other => {
-            return Err(AppError::Reviewer(format!(
-                "unexpected assessment \"{other}\""
-            )));
-        }
-    };
-    Ok(CommentAdvice {
-        assessment,
+) -> CommentAdvice {
+    CommentAdvice {
+        assessment: raw.assessment,
         feedback: sanitize_dashes(raw.feedback.trim()),
         suggested_comment: sanitize_comment(&raw.suggested_comment, forbid_attribution),
         cost_usd,
-    })
+    }
 }
 
 /// Asks a fresh, locked-down Claude run to check the user's comment against the stored code.
+///
+/// # Errors
+/// Fails on the same input checks as [`add`], when the `claude` CLI can't be found, when the run
+/// fails, times out or is cancelled, or when its answer does not match the schema.
 pub async fn check(
     svc: &Arc<Service>,
     input: &UserCommentInput,
@@ -324,18 +342,20 @@ pub async fn check(
     let config = svc.db.app_config()?;
     let claude = env::resolve_tool("claude", config.claude_path.as_deref())?;
 
-    let dir = svc
-        .cache
-        .review_dir(&input.review_id)
-        .join("comment-checks")
-        .join(new_id());
+    // A sibling of the review dirs (like the ticket source test), removed as a whole: the
+    // review's own dir may already be gone, and recreating it would leave it behind.
+    let dir = svc.cache.review_dir(&format!("comment-check-{}", new_id()));
     let result = async {
         write_material(&dir, input, &content).await?;
         let request = check_request(claude, &dir, content.content.is_some(), &settings);
         let outcome = runner::run(request, cancel, |_| {}).await?;
         let raw: RawCommentAdvice = serde_json::from_value(outcome.output)
             .map_err(|e| AppError::Reviewer(format!("unexpected answer format: {e}")))?;
-        advice_from(raw, settings.forbid_ai_attribution.value, outcome.cost_usd)
+        Ok(advice_from(
+            raw,
+            settings.forbid_ai_attribution.value,
+            outcome.cost_usd,
+        ))
     }
     .await;
     let _ = tokio::fs::remove_dir_all(&dir).await;
@@ -382,27 +402,62 @@ mod tests {
         }
     }
 
-    #[test]
-    fn anchors_are_validated_against_file_and_diff() {
-        let c = content(true);
-        let a = validate_anchor(&input(2, Some(3), Side::Right), &c).unwrap();
-        assert_eq!((a.start, a.end, a.in_diff), (2, 3, true));
-        // In the file but outside the diff: allowed, posted as a general comment.
-        let a = validate_anchor(&input(5, None, Side::Right), &c).unwrap();
-        assert!(!a.in_diff);
-        assert!(validate_anchor(&input(6, None, Side::Right), &c).is_err());
-        assert!(validate_anchor(&input(3, Some(2), Side::Right), &c).is_err());
-        assert!(validate_anchor(&input(0, None, Side::Right), &c).is_err());
-        // Removed lines use the old side.
-        let a = validate_anchor(&input(2, None, Side::Left), &c).unwrap();
-        assert!(a.in_diff);
-        assert!(validate_anchor(&input(1, None, Side::Left), &c).is_err());
-        // A range ending on a context line would be posted on the new side.
-        assert!(validate_anchor(&input(2, Some(3), Side::Left), &c).is_err());
-        // Without the file, only diff lines.
-        let c = content(false);
-        assert!(validate_anchor(&input(5, None, Side::Right), &c).is_err());
-        assert!(validate_anchor(&input(4, None, Side::Right), &c).is_ok());
+    mod validate_anchor {
+        use super::*;
+
+        fn check(start: u32, end: Option<u32>, side: Side, with_file: bool) -> AppResult<Anchor> {
+            super::validate_anchor(&input(start, end, side), &content(with_file))
+        }
+
+        #[test]
+        fn accepts_a_range_of_changed_lines_inline() {
+            let a = check(2, Some(3), Side::Right, true).unwrap();
+            assert_eq!((a.start, a.end, a.in_diff), (2, 3, true));
+        }
+
+        #[test]
+        fn accepts_file_lines_outside_the_diff_as_general_comments() {
+            let a = check(5, None, Side::Right, true).unwrap();
+            assert!(!a.in_diff, "line 5 is not in the diff: {a:?}");
+        }
+
+        #[test]
+        fn rejects_lines_past_the_end_of_the_file() {
+            assert!(check(6, None, Side::Right, true).is_err());
+        }
+
+        #[test]
+        fn rejects_reversed_ranges() {
+            assert!(check(3, Some(2), Side::Right, true).is_err());
+        }
+
+        #[test]
+        fn rejects_line_zero() {
+            assert!(check(0, None, Side::Right, true).is_err());
+        }
+
+        #[test]
+        fn accepts_removed_lines_on_the_old_side() {
+            let a = check(2, None, Side::Left, true).unwrap();
+            assert!(a.in_diff, "removed line 2 is in the diff: {a:?}");
+        }
+
+        #[test]
+        fn rejects_context_lines_on_the_old_side() {
+            assert!(check(1, None, Side::Left, true).is_err());
+        }
+
+        #[test]
+        fn rejects_old_side_ranges_ending_on_a_context_line() {
+            // Posting would move such a comment to the new line with the same number.
+            assert!(check(2, Some(3), Side::Left, true).is_err());
+        }
+
+        #[test]
+        fn accepts_only_diff_lines_without_the_file() {
+            assert!(check(5, None, Side::Right, false).is_err());
+            assert!(check(4, None, Side::Right, false).is_ok());
+        }
     }
 
     #[test]
@@ -458,23 +513,47 @@ mod tests {
         assert_eq!(req.cwd, Path::new("/tmp/x"));
     }
 
+    mod advice_from {
+        use super::*;
+
+        fn raw(feedback: &str, suggested: &str) -> RawCommentAdvice {
+            RawCommentAdvice {
+                assessment: CommentAssessment::PartlyValid,
+                feedback: feedback.into(),
+                suggested_comment: suggested.into(),
+            }
+        }
+
+        #[test]
+        fn keeps_the_assessment_and_cost() {
+            let a = super::advice_from(raw("ok", "ok"), true, Some(0.01));
+            assert_eq!(
+                (a.assessment, a.cost_usd),
+                (CommentAssessment::PartlyValid, Some(0.01))
+            );
+        }
+
+        #[test]
+        fn removes_dashes_from_the_feedback() {
+            let a = super::advice_from(raw("Mostly right — but see line 3", "x"), true, None);
+            assert!(!a.feedback.contains('—'), "feedback: {}", a.feedback);
+        }
+
+        #[test]
+        fn applies_the_comment_rules_to_the_suggestion() {
+            let suggested = "Handle the error — it panics.\n\nCo-Authored-By: Claude <x@y>";
+            let a = super::advice_from(raw("x", suggested), true, None);
+            assert_eq!(a.suggested_comment, "Handle the error, it panics.");
+        }
+    }
+
     #[test]
-    fn advice_is_sanitized() {
-        let raw = RawCommentAdvice {
-            assessment: "partly_valid".into(),
-            feedback: "Mostly right — but see line 3".into(),
-            suggested_comment: "Handle the error — it panics.\n\nCo-Authored-By: Claude <x@y>"
-                .into(),
-        };
-        let a = advice_from(raw, true, Some(0.01)).unwrap();
-        assert_eq!(a.assessment, CommentAssessment::PartlyValid);
-        assert!(!a.feedback.contains('—'));
-        assert_eq!(a.suggested_comment, "Handle the error, it panics.");
-        let bad = RawCommentAdvice {
-            assessment: "great".into(),
-            feedback: String::new(),
-            suggested_comment: String::new(),
-        };
-        assert!(advice_from(bad, true, None).is_err());
+    fn unknown_assessments_are_rejected_when_parsing() {
+        let answer = serde_json::json!({
+            "assessment": "great",
+            "feedback": "",
+            "suggested_comment": "",
+        });
+        assert!(serde_json::from_value::<RawCommentAdvice>(answer).is_err());
     }
 }

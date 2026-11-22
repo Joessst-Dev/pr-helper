@@ -221,6 +221,43 @@ describe("CriticalFiles", () => {
       expect(screen.getByRole("textbox", { name: "Your comment" })).toHaveValue("");
     });
 
+    it("keeps the draft when switching between file and diff view", async () => {
+      renderWith(actions());
+      await openAuth();
+      await userEvent.click(screen.getByRole("button", { name: "Comment on line 2" }));
+      await userEvent.type(screen.getByRole("textbox", { name: "Your comment" }), "Keep me");
+      await userEvent.click(screen.getByRole("button", { name: "Diff" }));
+      // Line 2 is an added line in the diff, so the composer follows it there.
+      expect(await screen.findByRole("textbox", { name: "Your comment" })).toHaveValue("Keep me");
+      await userEvent.click(screen.getByRole("button", { name: "File" }));
+      expect(screen.getByRole("textbox", { name: "Your comment" })).toHaveValue("Keep me");
+    });
+
+    it("does not offer AI advice for other lines than it checked", async () => {
+      checkUserComment.mockResolvedValue({
+        assessment: "valid",
+        feedback: "Right.",
+        suggestedComment: "About line 2.",
+        costUsd: null,
+      });
+      renderWith(actions());
+      await openAuth();
+      await userEvent.click(screen.getByRole("button", { name: "Comment on line 2" }));
+      await userEvent.type(screen.getByRole("textbox", { name: "Your comment" }), "x");
+      await userEvent.click(screen.getByRole("button", { name: /Ask AI/ }));
+      expect(await screen.findByRole("button", { name: "Use suggestion" })).toBeInTheDocument();
+      await userEvent.click(screen.getByRole("button", { name: "Comment on line 4" }));
+      expect(screen.queryByRole("button", { name: "Use suggestion" })).toBeNull();
+      expect(screen.getByText(/The AI feedback was for line 2/)).toBeInTheDocument();
+    });
+
+    it("blocks deleting while a post is running", async () => {
+      const mine = finding({ id: "u1", source: "user", file: "src/auth.rs", lineStart: 2 });
+      renderWith(actions({ comments: [mine], posting: true }));
+      await openAuth();
+      expect(screen.getByRole("button", { name: "Delete comment" })).toBeDisabled();
+    });
+
     it("points to the diff view for comments on removed lines", async () => {
       const removed = finding({ id: "u2", source: "user", file: "src/auth.rs", lineStart: 2, side: "left" });
       renderWith(actions({ comments: [removed] }));

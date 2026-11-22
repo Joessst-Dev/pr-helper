@@ -23,6 +23,8 @@ export type CommentActions = {
   onAdd: (anchor: CommentAnchor, severity: Severity, text: string) => Promise<void>;
   onEdit: (id: string, text: string) => void;
   onDelete: (id: string) => Promise<void>;
+  /** A post is running: deleting now could drop a comment that is already on its way. */
+  posting?: boolean;
 };
 
 const ASSESSMENT: Record<CommentAssessment, { label: string; tone: "ok" | "warn" | "danger" }> = {
@@ -30,6 +32,9 @@ const ASSESSMENT: Record<CommentAssessment, { label: string; tone: "ok" | "warn"
   partly_valid: { label: "Partly holds", tone: "warn" },
   not_valid: { label: "Does not hold", tone: "danger" },
 };
+
+const sameAnchor = (a: CommentAnchor, b: CommentAnchor) =>
+  a.file === b.file && a.side === b.side && a.lineStart === b.lineStart && a.lineEnd === b.lineEnd;
 
 export function anchorLabel(a: Pick<CommentAnchor, "lineStart" | "lineEnd" | "side">) {
   const lines = a.lineEnd !== a.lineStart ? `lines ${a.lineStart}-${a.lineEnd}` : `line ${a.lineStart}`;
@@ -45,11 +50,13 @@ export type Advice = ReturnType<typeof useAdvice>;
 /** Runs the AI check of a draft; cancels it when the owner goes away or a new check starts. */
 export function useAdvice(reviewId: string) {
   const running = useRef<string | null>(null);
-  const [state, setState] = useState<{ busy: boolean; advice: CommentAdvice | null; error: string | null }>({
-    busy: false,
-    advice: null,
-    error: null,
-  });
+  const [state, setState] = useState<{
+    busy: boolean;
+    advice: CommentAdvice | null;
+    error: string | null;
+    /** The lines the check was for; the selection may have moved on since. */
+    checked: CommentAnchor | null;
+  }>({ busy: false, advice: null, error: null, checked: null });
   const cancel = () => {
     if (running.current) void api.cancelCommentCheck(running.current).catch(() => {});
     running.current = null;
@@ -60,7 +67,7 @@ export function useAdvice(reviewId: string) {
     cancel();
     const id = crypto.randomUUID();
     running.current = id;
-    setState({ busy: true, advice: null, error: null });
+    setState({ busy: true, advice: null, error: null, checked: anchor });
     try {
       const advice = await api.checkUserComment(
         {
@@ -74,16 +81,16 @@ export function useAdvice(reviewId: string) {
         },
         id,
       );
-      if (running.current === id) setState({ busy: false, advice, error: null });
+      if (running.current === id) setState((s) => ({ ...s, busy: false, advice }));
     } catch (e) {
-      if (running.current === id) setState({ busy: false, advice: null, error: errorMessage(e) });
+      if (running.current === id) setState((s) => ({ ...s, busy: false, error: errorMessage(e) }));
     } finally {
       if (running.current === id) running.current = null;
     }
   };
   const stop = () => {
     cancel();
-    setState({ busy: false, advice: null, error: null });
+    setState({ busy: false, advice: null, error: null, checked: null });
   };
   const dismiss = () => setState((s) => ({ ...s, advice: null }));
   return { ...state, ask, stop, dismiss };
@@ -167,6 +174,8 @@ export function CommentComposer({
   const result = useCommentCheck(text, check);
   const ownAi = useAdvice(reviewId);
   const ai = sharedAi ?? ownAi;
+  // Advice for other lines must not be applied to these.
+  const fits = !ai.checked || sameAnchor(ai.checked, anchor);
   const empty = !text.trim();
 
   const save = async () => {
@@ -195,7 +204,12 @@ export function CommentComposer({
         onChange={(e) => setText(e.target.value)}
       />
       <RulesWarning text={text} result={result} />
-      {ai.advice && (
+      {!fits && (ai.advice || ai.error) && (
+        <div className="text-xs text-muted">
+          The AI feedback was for {anchorLabel(ai.checked!)}. Ask again for the lines selected now.
+        </div>
+      )}
+      {fits && ai.advice && (
         <AdvicePanel
           advice={ai.advice}
           onUse={() => {
@@ -205,7 +219,7 @@ export function CommentComposer({
           onDismiss={ai.dismiss}
         />
       )}
-      {ai.error && (
+      {fits && ai.error && (
         <div role="alert" className="text-xs text-danger">
           The AI check failed: {ai.error}
         </div>
@@ -301,6 +315,7 @@ export function UserComment({ comment, actions }: { comment: Finding; actions: C
               variant="ghost"
               aria-label="Delete comment"
               busy={deleting}
+              disabled={actions.posting}
               onClick={async () => {
                 setDeleting(true);
                 setError(null);

@@ -92,6 +92,30 @@ describe("ReviewResults", () => {
     ]);
   });
 
+  it("retitles an own comment when its text changes", async () => {
+    const mine = finding({ id: "u1", source: "user", category: "comment", title: "Typo here", proposedComment: "Typo here" });
+    renderResults([mine]);
+    const box = screen.getAllByRole("textbox", { name: "Proposed comment" }).slice(-1)[0];
+    await userEvent.clear(box);
+    await userEvent.type(box, "This leaks the token");
+    await userEvent.tab();
+    expect(await screen.findByRole("checkbox", { name: "Select finding: This leaks the token" })).toBeInTheDocument();
+  });
+
+  it("deletes an own comment only after its pending edit was saved", async () => {
+    let finishSave: () => void = () => {};
+    updateFinding.mockImplementationOnce(() => new Promise<void>((r) => (finishSave = r)));
+    const mine = finding({ id: "u1", source: "user", category: "comment", title: "Mine", proposedComment: "Mine" });
+    renderResults([mine]);
+    await userEvent.type(screen.getAllByRole("textbox", { name: "Proposed comment" }).slice(-1)[0], " more");
+    await userEvent.tab();
+    await userEvent.click(screen.getByRole("button", { name: "Delete comment" }));
+    expect(deleteUserComment).not.toHaveBeenCalled();
+    finishSave();
+    await waitFor(() => expect(deleteUserComment).toHaveBeenCalledWith("u1"));
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
   it("posts the user's own comments with the findings and can delete them", async () => {
     const mine = finding({ id: "u1", source: "user", category: "comment", title: "Rename this", severity: "medium" });
     renderResults([mine]);

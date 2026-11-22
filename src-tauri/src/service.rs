@@ -111,14 +111,18 @@ pub struct Service {
 
 /// Unregisters a ticket load or comment check when it ends, also when the command future is
 /// dropped.
-struct TicketLoadGuard<'a> {
-    loads: &'a Mutex<HashMap<String, CancellationToken>>,
+struct CancelGuard<'a> {
+    running: &'a Mutex<HashMap<String, CancellationToken>>,
     id: String,
 }
 
-impl Drop for TicketLoadGuard<'_> {
+impl Drop for CancelGuard<'_> {
     fn drop(&mut self) {
-        self.loads.lock().unwrap().remove(&self.id);
+        // A panic in drop would abort; a poisoned map is still usable here.
+        self.running
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.id);
     }
 }
 
@@ -478,8 +482,8 @@ impl Service {
             .entry(request_id.to_string())
             .or_default()
             .clone();
-        let _guard = TicketLoadGuard {
-            loads: &self.ticket_loads,
+        let _guard = CancelGuard {
+            running: &self.ticket_loads,
             id: request_id.to_string(),
         };
         let cancelled = || AppError::Reviewer("cancelled".into());
@@ -594,12 +598,12 @@ impl Service {
         let cancel = self
             .comment_checks
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .entry(request_id.to_string())
             .or_default()
             .clone();
-        let _guard = TicketLoadGuard {
-            loads: &self.comment_checks,
+        let _guard = CancelGuard {
+            running: &self.comment_checks,
             id: request_id.to_string(),
         };
         user_comment::check(self, input, cancel).await
@@ -608,7 +612,10 @@ impl Service {
     /// Returns whether a check with this id was running.
     pub fn cancel_comment_check(&self, request_id: &str) -> AppResult<bool> {
         validate_request_id(request_id)?;
-        let mut checks = self.comment_checks.lock().unwrap();
+        let mut checks = self
+            .comment_checks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let running = checks.contains_key(request_id);
         checks.entry(request_id.to_string()).or_default().cancel();
         if !running && checks.len() > 64 {

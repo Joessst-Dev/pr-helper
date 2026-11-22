@@ -402,11 +402,11 @@ impl FindingSource {
         }
     }
 
-    pub fn parse(s: &str) -> Self {
-        if s == "user" {
-            Self::User
-        } else {
-            Self::Reviewer
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "reviewer" => Some(Self::Reviewer),
+            "user" => Some(Self::User),
+            _ => None,
         }
     }
 }
