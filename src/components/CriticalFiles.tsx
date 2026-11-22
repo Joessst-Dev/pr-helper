@@ -38,7 +38,7 @@ export function CriticalFiles({
       <div className="flex items-center gap-2 border-b border-line px-4 py-2 text-xs font-medium text-muted">
         <FileSearch className="size-3.5" /> Files to review yourself
         {comments && (
-          <span className="ml-auto font-normal">Click a line number to comment, shift-click to select a range.</span>
+          <span className="ml-auto font-normal">Click a line number to comment, or drag over line numbers for a range.</span>
         )}
       </div>
       <ul className="divide-y divide-line">
@@ -253,22 +253,35 @@ function useScrollTo(deps: unknown[]) {
 
 type Selection = { side: Side; start: number; end: number };
 
-/** Lines picked for a new comment: a click starts a selection, a shift-click on the same side extends it. */
+/**
+ * Lines picked for a new comment. Pressing a line number and dragging over others selects a
+ * range on the same side; a click picks one line and a shift-click extends the selection.
+ */
 function useLineSelection() {
   const [sel, setSel] = useState<{ side: Side; from: number; to: number } | null>(null);
+  const [dragging, setDragging] = useState(false);
   const pick = (side: Side, line: number, extend: boolean) =>
     setSel((s) => (extend && s && s.side === side ? { ...s, to: line } : { side, from: line, to: line }));
+  const startDrag = (side: Side, line: number, extend: boolean) => {
+    pick(side, line, extend);
+    setDragging(true);
+    // The button can be released anywhere, also outside the code box.
+    window.addEventListener("mouseup", () => setDragging(false), { once: true });
+  };
+  const dragOver = (side: Side, line: number) => {
+    if (dragging) setSel((s) => (s && s.side === side ? { ...s, to: line } : s));
+  };
   const range: Selection | null = sel && {
     side: sel.side,
     start: Math.min(sel.from, sel.to),
     end: Math.max(sel.from, sel.to),
   };
-  return { range, pick, clear: () => setSel(null) };
+  return { range, dragging, pick, startDrag, dragOver, clear: () => setSel(null) };
 }
 
 /** A new comment in the making: its lines, its text and its AI check, all kept while the lines change. */
 function useNewComment(reviewId: string) {
-  const { range, pick, clear } = useLineSelection();
+  const { range, dragging, pick, startDrag, dragOver, clear } = useLineSelection();
   const [draft, setDraft] = useState<Draft>(EMPTY_DRAFT);
   const ai = useAdvice(reviewId);
   const done = () => {
@@ -276,7 +289,7 @@ function useNewComment(reviewId: string) {
     setDraft(EMPTY_DRAFT);
     ai.stop();
   };
-  return { range, pick, draft, setDraft, ai, done };
+  return { range, dragging, pick, startDrag, dragOver, draft, setDraft, ai, done };
 }
 
 type NewComment = ReturnType<typeof useNewComment>;
@@ -299,20 +312,33 @@ function LineNumber({
   line,
   side,
   className,
-  onPick,
+  composing,
 }: {
   line: number | null;
   side: Side;
   className: string;
-  onPick?: (side: Side, line: number, extend: boolean) => void;
+  /** Set when this number can start a comment. */
+  composing?: NewComment;
 }) {
-  if (line == null || !onPick) return <span className={clsx(className, "text-muted select-none")}>{line ?? ""}</span>;
+  if (line == null || !composing) {
+    return <span className={clsx(className, "text-muted select-none")}>{line ?? ""}</span>;
+  }
   return (
     <button
       type="button"
       aria-label={`Comment on ${side === "left" ? "removed " : ""}line ${line}`}
+      title="Drag over line numbers to comment on a range"
       className={clsx(className, "cursor-pointer text-muted select-none hover:text-accent hover:underline")}
-      onClick={(e) => onPick(side, line, e.shiftKey)}
+      onMouseDown={(e) => {
+        if (e.button !== 0) return;
+        // Keeps the drag from selecting the code text instead.
+        e.preventDefault();
+        composing.startDrag(side, line, e.shiftKey);
+      }}
+      // Mouse clicks are handled on mouse down; this is for the keyboard (Enter or Space).
+      onClick={(e) => {
+        if (e.detail === 0) composing.pick(side, line, e.shiftKey);
+      }}
     >
       {line}
     </button>
@@ -340,7 +366,7 @@ function RowExtras({
   const selection = composing.range;
   if (!actions || line == null) return null;
   const mine = saved.get(`${side}:${line}`) ?? [];
-  const compose = selection?.side === side && selection.end === line;
+  const compose = !composing.dragging && selection?.side === side && selection.end === line;
   if (mine.length === 0 && !compose) return null;
   return (
     <div className="sticky left-0 w-full">
@@ -396,7 +422,7 @@ function FileLines({
     [diff],
   );
   const tokens = useTokens(content, path);
-  const { range, pick } = composing;
+  const { range } = composing;
   const saved = useMemo(() => commentsByLine(path, comments), [path, comments]);
   // Jump to what the reviewer pointed at, else to the first change.
   const first = focus[0]?.start ?? [...changed].sort((a, b) => a - b)[0] ?? 1;
@@ -417,6 +443,7 @@ function FileLines({
             <div
               ref={no === first ? target : undefined}
               data-line={no}
+              onMouseEnter={comments ? () => composing.dragOver("right", no) : undefined}
               data-changed={isChanged || undefined}
               data-focus={isFocus || undefined}
               data-selected={isSelected || undefined}
@@ -433,7 +460,7 @@ function FileLines({
                 line={no}
                 side="right"
                 className="w-12 shrink-0 pr-3 text-right"
-                onPick={comments && pick}
+                composing={comments && composing}
               />
               <span className="pr-4 whitespace-pre">
                 <Code text={text} tokens={tokens?.[i]} />
@@ -469,7 +496,7 @@ function DiffLines({
   composing: NewComment;
 }) {
   const tokens = useDiffTokens(diff, path);
-  const { range, pick } = composing;
+  const { range } = composing;
   const saved = useMemo(() => commentsByLine(path, comments), [path, comments]);
   const firstFocus = diff.findIndex((d) => d.new != null && inRanges(d.new, focus));
   const first = firstFocus >= 0 ? firstFocus : diff.findIndex((d) => d.kind !== "context");
@@ -497,6 +524,7 @@ function DiffLines({
             <div
               ref={i === first ? target : undefined}
               data-kind={d.kind}
+              onMouseEnter={comments && line != null ? () => composing.dragOver(side, line) : undefined}
               data-selected={isSelected || undefined}
               className={clsx(
                 "flex min-w-max",
@@ -510,13 +538,13 @@ function DiffLines({
                 line={d.old}
                 side="left"
                 className="w-10 shrink-0 pr-2 text-right"
-                onPick={comments && d.kind === "removed" ? pick : undefined}
+                composing={comments && d.kind === "removed" ? composing : undefined}
               />
               <LineNumber
                 line={d.new}
                 side="right"
                 className="w-10 shrink-0 pr-2 text-right"
-                onPick={comments && d.kind !== "removed" ? pick : undefined}
+                composing={comments && d.kind !== "removed" ? composing : undefined}
               />
               <span className="w-4 shrink-0 text-muted select-none">{mark}</span>
               <span className="pr-4 whitespace-pre">

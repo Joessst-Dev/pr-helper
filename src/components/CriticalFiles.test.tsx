@@ -268,6 +268,49 @@ describe("CriticalFiles", () => {
       expect(screen.queryByText(/shown in the Diff view/)).toBeNull();
     });
 
+    it("selects a range by dragging over line numbers", async () => {
+      const { container } = renderWith(actions());
+      await openAuth();
+      fireEvent.mouseDown(screen.getByRole("button", { name: "Comment on line 4" }));
+      fireEvent.mouseEnter(container.querySelector('[data-line="3"]')!);
+      fireEvent.mouseEnter(container.querySelector('[data-line="2"]')!);
+      expect(container.querySelectorAll("[data-selected]")).toHaveLength(3);
+      // The box waits for the button to be released.
+      expect(screen.queryByRole("textbox", { name: "Your comment" })).toBeNull();
+      fireEvent.mouseUp(window);
+      expect(screen.getByText("Your comment on lines 2-4")).toBeInTheDocument();
+      // Moving the mouse afterwards changes nothing.
+      fireEvent.mouseEnter(container.querySelector('[data-line="1"]')!);
+      expect(screen.getByText("Your comment on lines 2-4")).toBeInTheDocument();
+    });
+
+    it("keeps a dragged range on one side of the diff", async () => {
+      const { container } = renderWith(actions());
+      await openAuth();
+      await userEvent.click(screen.getByRole("button", { name: "Diff" }));
+      fireEvent.mouseDown(await screen.findByRole("button", { name: "Comment on removed line 2" }));
+      fireEvent.mouseEnter(container.querySelector('[data-kind="added"]')!);
+      fireEvent.mouseUp(window);
+      expect(screen.getByText("Your comment on line 2 (removed)")).toBeInTheDocument();
+    });
+
+    it("extends the selection with shift and the mouse", async () => {
+      renderWith(actions());
+      await openAuth();
+      await userEvent.click(screen.getByRole("button", { name: "Comment on line 2" }));
+      fireEvent.mouseDown(screen.getByRole("button", { name: "Comment on line 4" }), { shiftKey: true });
+      fireEvent.mouseUp(window);
+      expect(screen.getByText("Your comment on lines 2-4")).toBeInTheDocument();
+    });
+
+    it("picks a line with the keyboard", async () => {
+      renderWith(actions());
+      await openAuth();
+      screen.getByRole("button", { name: "Comment on line 3" }).focus();
+      await userEvent.keyboard("{Enter}");
+      expect(screen.getByText("Your comment on line 3")).toBeInTheDocument();
+    });
+
     it("warns that lines outside the diff become a general comment", async () => {
       renderWith(actions());
       await openAuth();
