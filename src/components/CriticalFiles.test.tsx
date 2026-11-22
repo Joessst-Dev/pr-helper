@@ -1,14 +1,22 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { CriticalFile } from "../lib/bindings/CriticalFile";
 import type { CriticalFileContent } from "../lib/bindings/CriticalFileContent";
 import { CriticalFiles } from "./CriticalFiles";
+import type { CommentActions } from "./CommentComposer";
+import { finding } from "../test/fixtures";
 
 const getReviewFile = vi.fn();
+const checkUserComment = vi.fn();
+const cancelCommentCheck = vi.fn();
 vi.mock("../lib/api", () => ({
-  api: { getReviewFile: (...a: unknown[]) => getReviewFile(...a) },
+  api: {
+    getReviewFile: (...a: unknown[]) => getReviewFile(...a),
+    checkUserComment: (...a: unknown[]) => checkUserComment(...a),
+    cancelCommentCheck: (...a: unknown[]) => cancelCommentCheck(...a),
+  },
   errorMessage: (e: unknown) => String(e),
 }));
 // Highlighting is covered by shiki itself; here every line gets one token, so we can check
@@ -132,5 +140,169 @@ describe("CriticalFiles", () => {
     expect(await screen.findByText(/Binary file, only the diff is shown/)).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "File" })).toBeNull();
     expect(screen.getByText("Binary files differ")).toBeInTheDocument();
+  });
+
+  describe("own comments", () => {
+    function actions(overrides: Partial<CommentActions> = {}): CommentActions {
+      return {
+        reviewId: "r1",
+        comments: [],
+        check: async (text) => ({ dashViolations: [], attributionViolations: [], sanitized: text }),
+        onAdd: vi.fn().mockResolvedValue(undefined),
+        onEdit: vi.fn(),
+        onDelete: vi.fn().mockResolvedValue(undefined),
+        ...overrides,
+      };
+    }
+
+    function renderWith(a: CommentActions) {
+      return render(
+        <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+          <CriticalFiles reviewId="r1" files={files} comments={a} />
+        </QueryClientProvider>,
+      );
+    }
+
+    async function openAuth() {
+      await userEvent.click(screen.getByRole("button", { name: /src\/auth\.rs/ }));
+      await screen.findByText("fn check() {}");
+    }
+
+    beforeEach(() => {
+      checkUserComment.mockReset();
+      cancelCommentCheck.mockReset().mockResolvedValue(true);
+    });
+
+    it("comments on a range of the file picked with click and shift-click", async () => {
+      const a = actions();
+      const { container } = renderWith(a);
+      await openAuth();
+      await userEvent.click(screen.getByRole("button", { name: "Comment on line 2" }));
+      fireEvent.click(screen.getByRole("button", { name: "Comment on line 3" }), { shiftKey: true });
+      expect(container.querySelectorAll("[data-selected]")).toHaveLength(2);
+      expect(screen.getByText("Your comment on lines 2-3")).toBeInTheDocument();
+      expect(screen.queryByText(/Not part of the diff/)).toBeNull();
+
+      await userEvent.type(screen.getByRole("textbox", { name: "Your comment" }), "Check the lock order.");
+      await userEvent.selectOptions(screen.getByRole("combobox", { name: "Severity" }), "high");
+      await userEvent.click(screen.getByRole("button", { name: "Add comment" }));
+      expect(a.onAdd).toHaveBeenCalledWith(
+        { file: "src/auth.rs", lineStart: 2, lineEnd: 3, side: "right" },
+        "high",
+        "Check the lock order.",
+      );
+      expect(screen.queryByRole("textbox", { name: "Your comment" })).toBeNull();
+    });
+
+    it("warns that lines outside the diff become a general comment", async () => {
+      renderWith(actions());
+      await openAuth();
+      await userEvent.click(screen.getByRole("button", { name: "Comment on line 4" }));
+      expect(screen.getByText(/Not part of the diff, will be posted as a general comment/)).toBeInTheDocument();
+    });
+
+    it("comments on removed lines on the old side in the diff", async () => {
+      const a = actions();
+      renderWith(a);
+      await openAuth();
+      await userEvent.click(screen.getByRole("button", { name: "Diff" }));
+      await userEvent.click(await screen.findByRole("button", { name: "Comment on removed line 2" }));
+      expect(screen.getByText("Your comment on line 2 (removed)")).toBeInTheDocument();
+      await userEvent.type(screen.getByRole("textbox", { name: "Your comment" }), "Why remove it?");
+      await userEvent.click(screen.getByRole("button", { name: "Add comment" }));
+      expect(a.onAdd).toHaveBeenCalledWith(
+        { file: "src/auth.rs", lineStart: 2, lineEnd: 2, side: "left" },
+        "medium",
+        "Why remove it?",
+      );
+    });
+
+    it("asks the AI about a draft and takes its suggestion", async () => {
+      checkUserComment.mockResolvedValue({
+        assessment: "partly_valid",
+        feedback: "The lock is taken in the caller.",
+        suggestedComment: "Is the caller always holding the lock here?",
+        costUsd: 0.02,
+      });
+      renderWith(actions());
+      await openAuth();
+      await userEvent.click(screen.getByRole("button", { name: "Comment on line 2" }));
+      await userEvent.type(screen.getByRole("textbox", { name: "Your comment" }), "Missing lock");
+      await userEvent.click(screen.getByRole("button", { name: /Ask AI/ }));
+      expect(checkUserComment).toHaveBeenCalledWith(
+        {
+          reviewId: "r1",
+          file: "src/auth.rs",
+          lineStart: 2,
+          lineEnd: null,
+          side: "right",
+          severity: "medium",
+          body: "Missing lock",
+        },
+        expect.any(String),
+      );
+      expect(await screen.findByText("Partly holds")).toBeInTheDocument();
+      expect(screen.getByText("The lock is taken in the caller.")).toBeInTheDocument();
+      await userEvent.click(screen.getByRole("button", { name: "Use suggestion" }));
+      expect(screen.getByRole("textbox", { name: "Your comment" })).toHaveValue(
+        "Is the caller always holding the lock here?",
+      );
+      expect(screen.queryByText("Partly holds")).toBeNull();
+    });
+
+    it("cancels a running AI check when the composer closes", async () => {
+      checkUserComment.mockReturnValue(new Promise(() => {}));
+      renderWith(actions());
+      await openAuth();
+      await userEvent.click(screen.getByRole("button", { name: "Comment on line 2" }));
+      await userEvent.type(screen.getByRole("textbox", { name: "Your comment" }), "x");
+      await userEvent.click(screen.getByRole("button", { name: /Ask AI/ }));
+      const requestId = checkUserComment.mock.calls[0][1];
+      await userEvent.click(screen.getByRole("button", { name: "Cancel" }));
+      expect(cancelCommentCheck).toHaveBeenCalledWith(requestId);
+    });
+
+    it("shows saved comments under their line and deletes them", async () => {
+      const mine = finding({
+        id: "u1",
+        source: "user",
+        file: "src/auth.rs",
+        lineStart: 2,
+        lineEnd: null,
+        severity: "low",
+        proposedComment: "Rename this.",
+      });
+      const a = actions({ comments: [mine] });
+      const { container } = renderWith(a);
+      // The file row counts the comments.
+      expect(screen.getByRole("button", { name: /src\/auth\.rs/ })).toHaveTextContent("1");
+      await openAuth();
+      const saved = container.querySelector('[data-user-comment="u1"]')!;
+      expect(saved).toHaveTextContent("Rename this.");
+      // It sits right after line 2.
+      expect(saved.parentElement!.previousElementSibling).toHaveAttribute("data-line", "2");
+      await userEvent.click(screen.getByRole("button", { name: "Delete comment" }));
+      expect(a.onDelete).toHaveBeenCalledWith("u1");
+    });
+
+    it("edits a saved comment", async () => {
+      const mine = finding({ id: "u1", source: "user", file: "src/auth.rs", lineStart: 2, proposedComment: "Old" });
+      const a = actions({ comments: [mine] });
+      renderWith(a);
+      await openAuth();
+      await userEvent.click(screen.getByRole("button", { name: "Edit comment" }));
+      expect(screen.queryByRole("combobox", { name: "Severity" })).toBeNull();
+      const box = screen.getByRole("textbox", { name: "Your comment" });
+      await userEvent.clear(box);
+      await userEvent.type(box, "New");
+      await userEvent.click(screen.getByRole("button", { name: "Save" }));
+      expect(a.onEdit).toHaveBeenCalledWith("u1", "New");
+    });
+
+    it("is read-only without comment actions", async () => {
+      renderFiles();
+      await openAuth();
+      expect(screen.queryByRole("button", { name: "Comment on line 2" })).toBeNull();
+    });
   });
 });

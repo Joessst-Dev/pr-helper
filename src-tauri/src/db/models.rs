@@ -384,6 +384,33 @@ pub enum Side {
     Left,
 }
 
+/// Who wrote a finding: the reviewer, or the user on a file they reviewed by hand.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "lowercase")]
+#[ts(export)]
+pub enum FindingSource {
+    #[default]
+    Reviewer,
+    User,
+}
+
+impl FindingSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Reviewer => "reviewer",
+            Self::User => "user",
+        }
+    }
+
+    pub fn parse(s: &str) -> Self {
+        if s == "user" {
+            Self::User
+        } else {
+            Self::Reviewer
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
@@ -407,6 +434,7 @@ pub struct Finding {
     pub selected: bool,
     pub posted_at: Option<String>,
     pub posted_ref: Option<String>,
+    pub source: FindingSource,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]

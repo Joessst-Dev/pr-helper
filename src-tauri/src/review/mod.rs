@@ -9,3 +9,4 @@ pub mod queue;
 pub mod runner;
 pub mod schema;
 pub mod skills;
+pub mod user_comment;

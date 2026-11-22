@@ -265,6 +265,7 @@ mod tests {
             selected: true,
             posted_at: None,
             posted_ref: None,
+            source: Default::default(),
         }
     }
 
@@ -293,6 +294,23 @@ mod tests {
                 "**a.rs:40**\n\nNot in diff".to_string()
             )]
         );
+    }
+
+    #[test]
+    fn user_comments_on_removed_lines_anchor_on_the_left() {
+        let index = DiffIndex::parse(DIFF);
+        let settings = resolve(
+            &SettingsOverrides::default(),
+            &SettingsOverrides::default(),
+            None,
+        );
+        let mut removed = finding("mine", Some(2), None, "Why was this removed?");
+        removed.side = Side::Left;
+        removed.source = crate::db::models::FindingSource::User;
+        let (inline, general) = build_inline(&[removed], &index, &settings).unwrap();
+        assert!(general.is_empty());
+        assert_eq!((inline[0].side, inline[0].line), (Side::Left, 2));
+        assert_eq!(inline[0].old_line, Some(2));
     }
 
     #[test]

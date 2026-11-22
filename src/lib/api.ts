@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { AppConfig } from "./bindings/AppConfig";
+import type { CommentAdvice } from "./bindings/CommentAdvice";
 import type { CommentCheck } from "./bindings/CommentCheck";
 import type { CriticalFileContent } from "./bindings/CriticalFileContent";
 import type { EffectiveSettings } from "./bindings/EffectiveSettings";
@@ -22,6 +23,7 @@ import type { TicketLoad } from "./bindings/TicketLoad";
 import type { TicketSource } from "./bindings/TicketSource";
 import type { TicketSourceInput } from "./bindings/TicketSourceInput";
 import type { TrackedPr } from "./bindings/TrackedPr";
+import type { UserCommentInput } from "./bindings/UserCommentInput";
 
 /** Typed wrappers around the Tauri commands in `src-tauri/src/commands.rs`. */
 export const api = {
@@ -58,6 +60,11 @@ export const api = {
     invoke<Finding>("update_finding", { id, selected, proposedComment }),
   checkCommentText: (serverId: string, repo: string, text: string) =>
     invoke<CommentCheck>("check_comment_text", { serverId, repo, text }),
+  addUserComment: (input: UserCommentInput) => invoke<Finding>("add_user_comment", { input }),
+  deleteUserComment: (id: string) => invoke<void>("delete_user_comment", { id }),
+  checkUserComment: (input: UserCommentInput, requestId: string) =>
+    invoke<CommentAdvice>("check_user_comment", { input, requestId }),
+  cancelCommentCheck: (requestId: string) => invoke<boolean>("cancel_comment_check", { requestId }),
   postFindings: (request: PostRequest) => invoke<PostOutcome>("post_findings", { request }),
   resumeCommand: (reviewId: string) => invoke<string>("resume_command", { reviewId }),
 

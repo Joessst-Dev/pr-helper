@@ -14,6 +14,7 @@ import type { Verdict } from "../lib/bindings/Verdict";
 import { useReviewProgress } from "../lib/events";
 import { formatCost, relativeTime, SEVERITIES, SEVERITY_LABEL, shortSha } from "../lib/format";
 import { ReviewStatusBadge, VerdictBadge } from "../components/badges";
+import type { CommentActions } from "../components/CommentComposer";
 import { CriticalFiles } from "../components/CriticalFiles";
 import { FindingCard, RulesWarning, useCommentCheck } from "../components/FindingCard";
 import { TicketChips } from "../components/TicketChips";
@@ -247,6 +248,32 @@ export function ReviewResults({
     pendingSaves.current.set(id, save);
   };
 
+  const userComments = useMemo(() => findings.filter((f) => f.source === "user"), [findings]);
+  const commentActions: CommentActions = {
+    reviewId,
+    comments: userComments,
+    check,
+    onAdd: async (anchor, severity, body) => {
+      const added = await api.addUserComment({
+        reviewId,
+        file: anchor.file,
+        lineStart: anchor.lineStart,
+        lineEnd: anchor.lineEnd !== anchor.lineStart ? anchor.lineEnd : null,
+        side: anchor.side,
+        severity,
+        body,
+      });
+      setFindings((fs) => [...fs, added]);
+    },
+    onEdit: (id, proposedComment) => update(id, { proposedComment }),
+    onDelete: async (id) => {
+      await api.deleteUserComment(id);
+      pendingSaves.current.delete(id);
+      setSaveErrors(({ [id]: _, ...rest }) => rest);
+      setFindings((fs) => fs.filter((f) => f.id !== id));
+    },
+  };
+
   const counts = useMemo(() => {
     const c = Object.fromEntries(SEVERITIES.map((s) => [s, 0])) as Record<Severity, number>;
     findings.forEach((f) => c[f.severity]++);
@@ -308,10 +335,13 @@ export function ReviewResults({
         </label>
       </Card>
 
-      <CriticalFiles reviewId={reviewId} files={criticalFiles} />
+      <CriticalFiles reviewId={reviewId} files={criticalFiles} comments={commentActions} />
 
       {findings.length === 0 ? (
-        <EmptyState title="No findings">The reviewer found nothing worth commenting on.</EmptyState>
+        <EmptyState title="No findings">
+          The reviewer found nothing worth commenting on.
+          {criticalFiles.length > 0 && " You can still add your own comments in the files above."}
+        </EmptyState>
       ) : (
         <>
           <div className="flex flex-wrap items-center gap-2">
@@ -356,6 +386,7 @@ export function ReviewResults({
                   check={check}
                   onToggle={(selected) => update(f.id, { selected })}
                   onEdit={(proposedComment) => update(f.id, { proposedComment })}
+                  onDelete={f.source === "user" ? () => commentActions.onDelete(f.id) : undefined}
                   saveError={saveErrors[f.id]}
                 />
               ))}

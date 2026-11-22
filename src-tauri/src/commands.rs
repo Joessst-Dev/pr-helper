@@ -14,6 +14,7 @@ use crate::review::post::{self, PostOutcome, PostRequest};
 use crate::review::postprocess::{CommentCheck, check_comment};
 use crate::review::queue;
 use crate::review::skills::validate_skill_dir;
+use crate::review::user_comment::{self, CommentAdvice, UserCommentInput};
 use crate::service::{ProgressEvent, Service, TicketLoad, TicketPlan};
 use crate::settings::{AppConfig, EffectiveSettings, SettingsOverrides};
 
@@ -298,6 +299,32 @@ pub fn update_finding(
     proposed_comment: String,
 ) -> AppResult<Finding> {
     svc.db.update_finding(&id, selected, &proposed_comment)
+}
+
+/// Adds a comment the user wrote on lines of a critical file. It is posted like a finding.
+#[tauri::command]
+pub fn add_user_comment(svc: Svc<'_>, input: UserCommentInput) -> AppResult<Finding> {
+    user_comment::add(&svc, &input)
+}
+
+#[tauri::command]
+pub fn delete_user_comment(svc: Svc<'_>, id: String) -> AppResult<()> {
+    user_comment::delete(&svc, &id)
+}
+
+/// Asks the AI whether a (possibly unsaved) user comment holds and how to word it.
+#[tauri::command]
+pub async fn check_user_comment(
+    svc: Svc<'_>,
+    input: UserCommentInput,
+    request_id: String,
+) -> AppResult<CommentAdvice> {
+    svc.check_user_comment(&input, &request_id).await
+}
+
+#[tauri::command]
+pub fn cancel_comment_check(svc: Svc<'_>, request_id: String) -> AppResult<bool> {
+    svc.cancel_comment_check(&request_id)
 }
 
 #[tauri::command]

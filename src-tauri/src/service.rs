@@ -17,6 +17,7 @@ use crate::error::{AppError, AppResult};
 use crate::git::repo_cache::RepoCache;
 use crate::providers::{GitProvider, make_provider};
 use crate::review::queue::ReviewQueue;
+use crate::review::user_comment::{self, CommentAdvice, UserCommentInput};
 use crate::secrets::SecretStore;
 use crate::settings::{EffectiveSettings, SettingsOverrides, resolve};
 use crate::tickets::jira::{JiraAuth, JiraClient, parse_extra_fields};
@@ -104,9 +105,12 @@ pub struct Service {
     logs: Mutex<HashMap<String, Vec<ProgressEvent>>>,
     /// Running ticket loads of the PR view, by request id, so the UI can cancel them.
     ticket_loads: Mutex<HashMap<String, CancellationToken>>,
+    /// Running AI checks of user comments, by request id, so the UI can cancel them.
+    comment_checks: Mutex<HashMap<String, CancellationToken>>,
 }
 
-/// Unregisters a ticket load when it ends, also when the command future is dropped.
+/// Unregisters a ticket load or comment check when it ends, also when the command future is
+/// dropped.
 struct TicketLoadGuard<'a> {
     loads: &'a Mutex<HashMap<String, CancellationToken>>,
     id: String,
@@ -142,6 +146,7 @@ impl Service {
             provider_factory: provider_factory.unwrap_or_else(|| Box::new(make_provider)),
             logs: Mutex::new(HashMap::new()),
             ticket_loads: Mutex::new(HashMap::new()),
+            comment_checks: Mutex::new(HashMap::new()),
         }))
     }
 
@@ -575,6 +580,39 @@ impl Service {
             if loads.len() > 64 {
                 loads.retain(|_, t| !t.is_cancelled());
             }
+        }
+        Ok(running)
+    }
+
+    /// Runs the AI check of a user comment; `cancel_comment_check` stops it.
+    pub async fn check_user_comment(
+        self: &Arc<Self>,
+        input: &UserCommentInput,
+        request_id: &str,
+    ) -> AppResult<CommentAdvice> {
+        validate_request_id(request_id)?;
+        let cancel = self
+            .comment_checks
+            .lock()
+            .unwrap()
+            .entry(request_id.to_string())
+            .or_default()
+            .clone();
+        let _guard = TicketLoadGuard {
+            loads: &self.comment_checks,
+            id: request_id.to_string(),
+        };
+        user_comment::check(self, input, cancel).await
+    }
+
+    /// Returns whether a check with this id was running.
+    pub fn cancel_comment_check(&self, request_id: &str) -> AppResult<bool> {
+        validate_request_id(request_id)?;
+        let mut checks = self.comment_checks.lock().unwrap();
+        let running = checks.contains_key(request_id);
+        checks.entry(request_id.to_string()).or_default().cancel();
+        if !running && checks.len() > 64 {
+            checks.retain(|_, t| !t.is_cancelled());
         }
         Ok(running)
     }

@@ -8,10 +8,12 @@ import { finding } from "../test/fixtures";
 vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: vi.fn() }));
 const postFindings = vi.fn();
 const updateFinding = vi.fn();
+const deleteUserComment = vi.fn();
 vi.mock("../lib/api", () => ({
   api: {
     postFindings: (...a: unknown[]) => postFindings(...a),
     updateFinding: (...a: unknown[]) => updateFinding(...a),
+    deleteUserComment: (...a: unknown[]) => deleteUserComment(...a),
     checkCommentText: async (_s: string, _r: string, text: string) => ({
       dashViolations: [],
       attributionViolations: [],
@@ -21,11 +23,12 @@ vi.mock("../lib/api", () => ({
   errorMessage: (e: unknown) => String(e),
 }));
 
-function renderResults() {
+function renderResults(extra: ReturnType<typeof finding>[] = []) {
   const findings = [
     finding({ id: "a", severity: "critical", title: "SQL injection" }),
     finding({ id: "b", severity: "low", title: "Naming", selected: false }),
     finding({ id: "c", severity: "nit", title: "Typo", selected: false }),
+    ...extra,
   ];
   return render(
     <QueryClientProvider client={new QueryClient()}>
@@ -46,6 +49,17 @@ describe("ReviewResults", () => {
   beforeEach(() => {
     postFindings.mockReset().mockResolvedValue({ posted: 2, folded: 0, reviewUrl: null, headMoved: false });
     updateFinding.mockReset().mockResolvedValue({});
+    deleteUserComment.mockReset().mockResolvedValue(undefined);
+  });
+
+  it("posts the user's own comments with the findings and can delete them", async () => {
+    const mine = finding({ id: "u1", source: "user", category: "comment", title: "Rename this", severity: "medium" });
+    renderResults([mine]);
+    expect(screen.getByText(/of 4 selected/)).toHaveTextContent("2 of 4 selected");
+    await userEvent.click(screen.getByRole("button", { name: "Delete comment" }));
+    expect(deleteUserComment).toHaveBeenCalledWith("u1");
+    await waitFor(() => expect(screen.queryByText("Rename this")).toBeNull());
+    expect(screen.getByText(/of 3 selected/)).toHaveTextContent("1 of 3 selected");
   });
 
   it("posts exactly the selected findings with the chosen mode", async () => {

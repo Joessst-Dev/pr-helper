@@ -53,4 +53,34 @@ describe("FindingCard", () => {
     expect(screen.getByRole("checkbox")).toBeDisabled();
     expect(screen.getByRole("textbox", { name: "Proposed comment" })).toBeDisabled();
   });
+
+  it("marks the user's own comments and deletes them until posted", async () => {
+    const onDelete = vi.fn().mockRejectedValueOnce("gone").mockResolvedValue(undefined);
+    const mine = finding({ source: "user", category: "comment", explanation: "" });
+    const { rerender } = render(
+      <FindingCard finding={mine} check={cleanCheck} onToggle={vi.fn()} onEdit={vi.fn()} onDelete={onDelete} />,
+    );
+    expect(screen.getAllByText("Your comment")).toHaveLength(2);
+    expect(screen.queryByText("comment")).toBeNull();
+    await userEvent.click(screen.getByRole("button", { name: "Delete comment" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Not deleted: gone");
+    await userEvent.click(screen.getByRole("button", { name: "Delete comment" }));
+    expect(onDelete).toHaveBeenCalledTimes(2);
+
+    rerender(
+      <FindingCard
+        finding={{ ...mine, postedAt: "2026-01-01T00:00:00Z" }}
+        check={cleanCheck}
+        onToggle={vi.fn()}
+        onEdit={vi.fn()}
+        onDelete={onDelete}
+      />,
+    );
+    expect(screen.queryByRole("button", { name: "Delete comment" })).toBeNull();
+  });
+
+  it("offers no delete for reviewer findings", () => {
+    render(<FindingCard finding={finding()} check={cleanCheck} onToggle={vi.fn()} onEdit={vi.fn()} />);
+    expect(screen.queryByRole("button", { name: "Delete comment" })).toBeNull();
+  });
 });

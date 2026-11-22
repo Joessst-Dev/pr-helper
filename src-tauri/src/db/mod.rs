@@ -915,6 +915,7 @@ impl Db {
             selected: r.get("selected")?,
             posted_at: r.get("posted_at")?,
             posted_ref: r.get("posted_ref")?,
+            source: FindingSource::parse(&r.get::<_, String>("source")?),
         })
     }
 
@@ -952,6 +953,55 @@ impl Db {
             )
         })?;
         self.get_finding(id)
+    }
+
+    /// Stores a comment the user wrote on a critical file. It goes after the reviewer's findings.
+    pub fn insert_user_finding(&self, f: &Finding) -> AppResult<Finding> {
+        self.with(|c| {
+            c.execute(
+                "INSERT INTO findings (id, review_id, position, severity, category, title, file,
+                   line_start, line_end, side, explanation, proposed_comment, suggestion, in_diff,
+                   diff_excerpt, selected, source)
+                 VALUES (?1, ?2,
+                   (SELECT COALESCE(MAX(position), -1) + 1 FROM findings WHERE review_id = ?2),
+                   ?3, ?4, ?5, ?6, ?7, ?8, ?9, '', ?10, NULL, ?11, NULL, ?12, 'user')",
+                params![
+                    f.id,
+                    f.review_id,
+                    f.severity.as_str(),
+                    f.category,
+                    f.title,
+                    f.file,
+                    f.line_start,
+                    f.line_end,
+                    if f.side == Side::Left {
+                        "left"
+                    } else {
+                        "right"
+                    },
+                    f.proposed_comment,
+                    f.in_diff,
+                    f.selected,
+                ],
+            )
+        })?;
+        self.get_finding(&f.id)
+    }
+
+    /// Deletes a comment the user wrote, unless it was posted already.
+    pub fn delete_user_finding(&self, id: &str) -> AppResult<()> {
+        let removed = self.with(|c| {
+            c.execute(
+                "DELETE FROM findings WHERE id = ?1 AND source = 'user' AND posted_at IS NULL",
+                [id],
+            )
+        })?;
+        if removed == 0 {
+            return Err(AppError::invalid(
+                "only your own comments that were not posted yet can be deleted",
+            ));
+        }
+        Ok(())
     }
 
     pub fn mark_finding_posted(&self, id: &str, posted_ref: Option<&str>) -> AppResult<()> {
@@ -1114,6 +1164,66 @@ mod tests {
     }
 
     #[test]
+    fn user_findings_follow_the_reviewer_and_only_they_can_be_deleted() {
+        let db = Db::open_in_memory().unwrap();
+        let s = db.insert_server(&server_input()).unwrap();
+        let review = db
+            .insert_review(&sample_pr(&s.id), ReviewTrigger::Manual)
+            .unwrap();
+        let mut finding = Finding {
+            id: new_id(),
+            review_id: review.id.clone(),
+            position: 0,
+            severity: Severity::Low,
+            category: "bug".into(),
+            title: "t".into(),
+            file: Some("a.rs".into()),
+            line_start: Some(3),
+            line_end: None,
+            side: Side::Right,
+            explanation: String::new(),
+            proposed_comment: "c".into(),
+            suggestion: None,
+            in_diff: true,
+            diff_excerpt: None,
+            selected: true,
+            posted_at: None,
+            posted_ref: None,
+            source: FindingSource::User,
+        };
+        // The reviewer's insert relies on the column default.
+        db.complete_review(
+            &review.id,
+            Verdict::Comment,
+            "",
+            None,
+            std::slice::from_ref(&finding),
+            &[],
+        )
+        .unwrap();
+        let reviewer = db.list_findings(&review.id).unwrap().remove(0);
+        assert_eq!(reviewer.source, FindingSource::Reviewer);
+
+        finding.id = new_id();
+        finding.side = Side::Left;
+        finding.line_end = Some(5);
+        let mine = db.insert_user_finding(&finding).unwrap();
+        assert_eq!(mine.source, FindingSource::User);
+        assert_eq!(mine.position, 1);
+        assert_eq!((mine.side, mine.line_end), (Side::Left, Some(5)));
+
+        assert!(db.delete_user_finding(&reviewer.id).is_err());
+        db.mark_finding_posted(&mine.id, None).unwrap();
+        assert!(db.delete_user_finding(&mine.id).is_err());
+
+        finding.id = new_id();
+        let other = db.insert_user_finding(&finding).unwrap();
+        assert_eq!(other.position, 2);
+        db.delete_user_finding(&other.id).unwrap();
+        assert_eq!(db.list_findings(&review.id).unwrap().len(), 2);
+    }
+
+    #[test]
     fn review_lifecycle_updates_tracking() {
         let db = Db::open_in_memory().unwrap();
         let s = db.insert_server(&server_input()).unwrap();
@@ -1141,6 +1251,7 @@ mod tests {
             selected: true,
             posted_at: None,
             posted_ref: None,
+            source: Default::default(),
         };
         db.complete_review(
             &review.id,

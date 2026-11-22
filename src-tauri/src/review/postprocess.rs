@@ -648,6 +648,7 @@ fn to_finding(f: RawFinding, review_id: &str, forbid: bool, diff: &DiffIndex) ->
         selected: false,
         posted_at: None,
         posted_ref: None,
+        source: Default::default(),
     })
 }
 
