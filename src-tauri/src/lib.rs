@@ -208,6 +208,7 @@ pub fn run() {
             commands::get_pr_detail,
             commands::load_pr_tickets,
             commands::cancel_ticket_load,
+            commands::load_ticket_image,
             commands::start_review,
             commands::cancel_review,
             commands::get_review,

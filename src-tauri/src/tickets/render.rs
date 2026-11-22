@@ -96,6 +96,7 @@ mod tests {
                 body: "LGTM".into(),
             }],
             comment_total: 4,
+            ..Default::default()
         };
         let md = render(std::slice::from_ref(&t));
         assert!(md.contains("## ABC-1\n- Summary: Reset password"));

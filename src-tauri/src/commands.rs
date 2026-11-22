@@ -196,6 +196,18 @@ pub async fn load_pr_tickets(
 }
 
 #[tauri::command]
+pub async fn load_ticket_image(
+    svc: Svc<'_>,
+    server_id: String,
+    repo: String,
+    key: String,
+    attachment_id: String,
+) -> AppResult<String> {
+    svc.load_ticket_image(&server_id, &repo, &key, &attachment_id)
+        .await
+}
+
+#[tauri::command]
 pub fn cancel_ticket_load(svc: Svc<'_>, request_id: String) -> AppResult<bool> {
     svc.cancel_ticket_load(&request_id)
 }

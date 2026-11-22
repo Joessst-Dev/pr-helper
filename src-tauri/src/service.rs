@@ -519,6 +519,49 @@ impl Service {
         Ok(loaded)
     }
 
+    /// An image attachment of a ticket as a `data:` URL, fetched with the Jira source that is
+    /// configured for the server or repo. Like [`Self::load_pr_tickets`], the ticket must be in
+    /// an allowed project, and the attachment must belong to it. The webview never sees the
+    /// credentials.
+    pub async fn load_ticket_image(
+        &self,
+        server_id: &str,
+        repo: &str,
+        key: &str,
+        attachment_id: &str,
+    ) -> AppResult<String> {
+        use base64::Engine;
+        let settings = self.effective_settings(server_id, Some(repo))?;
+        let Some(source_id) = settings.ticket_source_id.value.as_deref() else {
+            return Err(AppError::invalid(
+                "no ticket source is configured for this repository",
+            ));
+        };
+        let projects = tickets::parse_project_keys(&settings.ticket_project_keys.value);
+        let Some(key) = tickets::filter_keys(&[key.to_string()], &projects).pop() else {
+            return Err(AppError::invalid(format!(
+                "ticket {key:?} is not in an allowed project"
+            )));
+        };
+        let source = self.db.get_ticket_source(source_id)?;
+        let token = match source.kind {
+            TicketSourceKind::Mcp => {
+                return Err(AppError::invalid(
+                    "images can only be loaded from a Jira REST source",
+                ));
+            }
+            _ => self.secrets.require(&Self::ticket_secret_id(&source.id))?,
+        };
+        let (mime, bytes) = self
+            .jira_client(&source, token)?
+            .attachment_image(&key, attachment_id)
+            .await?;
+        Ok(format!(
+            "data:{mime};base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        ))
+    }
+
     /// Cancels a running ticket load of the PR view, including an MCP fetcher run.
     /// Returns whether a load with this id was running.
     pub fn cancel_ticket_load(&self, request_id: &str) -> AppResult<bool> {

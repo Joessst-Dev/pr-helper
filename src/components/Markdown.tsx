@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import { type ReactNode, useMemo } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -32,12 +32,14 @@ function ExternalLink({ href, children }: { href?: string; children?: ReactNode 
   );
 }
 
+function ImageLink({ src, alt }: { src?: unknown; alt?: string }) {
+  return <ExternalLink href={typeof src === "string" ? src : undefined}>[image{alt ? `: ${alt}` : ""}]</ExternalLink>;
+}
+
 const components: Components = {
   a: ({ href, children }) => <ExternalLink href={href}>{children}</ExternalLink>,
   // Remote images are never loaded (tracking pixels, IP leaks). Show a link instead.
-  img: ({ src, alt }) => (
-    <ExternalLink href={typeof src === "string" ? src : undefined}>[image{alt ? `: ${alt}` : ""}]</ExternalLink>
-  ),
+  img: ({ src, alt }) => <ImageLink src={src} alt={alt} />,
   h1: ({ children }) => <h3 className="mt-4 mb-2 text-base font-semibold first:mt-0">{children}</h3>,
   h2: ({ children }) => <h4 className="mt-4 mb-2 text-[15px] font-semibold first:mt-0">{children}</h4>,
   h3: ({ children }) => <h5 className="mt-3 mb-1.5 font-semibold first:mt-0">{children}</h5>,
@@ -71,14 +73,44 @@ const components: Components = {
   hr: () => <hr className="my-3 border-line" />,
 };
 
+/** Decoded image source as written in the markdown (file names come URL-encoded). */
+function imageSource(src: unknown): string | undefined {
+  if (typeof src !== "string") return undefined;
+  try {
+    return decodeURIComponent(src);
+  } catch {
+    return src;
+  }
+}
+
 /**
- * Renders author-controlled markdown (PR descriptions). Raw HTML is dropped, images are not
- * loaded and links open in the system browser, never in the app's webview.
+ * Renders author-controlled markdown (PR descriptions, tickets). Raw HTML is dropped, remote
+ * images are not loaded and links open in the system browser, never in the app's webview.
+ *
+ * `renderImage` may display images the app can load safely itself (ticket attachments). It
+ * returns `null` for anything else, which is then shown as a link like without it.
  */
-export function Markdown({ children }: { children: string }) {
+export function Markdown({
+  children,
+  renderImage,
+}: {
+  children: string;
+  renderImage?: (src: string, alt: string) => ReactNode | null;
+}) {
+  const all = useMemo<Components>(() => {
+    if (!renderImage) return components;
+    return {
+      ...components,
+      img: (props) => {
+        const src = imageSource(props.src);
+        const custom = src ? renderImage(src, props.alt ?? "") : null;
+        return custom ?? <ImageLink src={props.src} alt={props.alt} />;
+      },
+    };
+  }, [renderImage]);
   return (
     <div className="text-[13px] leading-relaxed break-words">
-      <ReactMarkdown remarkPlugins={[remarkGfm]} skipHtml components={components}>
+      <ReactMarkdown remarkPlugins={[remarkGfm]} skipHtml components={all}>
         {children}
       </ReactMarkdown>
     </div>
