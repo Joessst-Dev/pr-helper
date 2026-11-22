@@ -1012,6 +1012,30 @@ async fn pr_view_tickets_follow_settings_and_the_project_allow_list() {
     assert_eq!(loaded[0].ticket.as_ref().unwrap().summary, "Reset password");
     assert!(loaded[1].ticket.is_none());
     assert!(loaded[1].error.is_some());
+
+    // Images come through the configured source, as a data URL.
+    wiremock::Mock::given(method("GET"))
+        .and(path("/rest/api/2/attachment/5"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "mimeType": "image/png",
+                "size": 3,
+                "content": format!("{}/secure/attachment/5/a.png", jira.uri())
+            })),
+        )
+        .mount(&jira)
+        .await;
+    wiremock::Mock::given(method("GET"))
+        .and(path("/secure/attachment/5/a.png"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(b"abc".to_vec()))
+        .mount(&jira)
+        .await;
+    assert_eq!(
+        svc.load_ticket_image(&server.id, &pr.repo, "5")
+            .await
+            .unwrap(),
+        "data:image/png;base64,YWJj"
+    );
 }
 
 #[tokio::test]

@@ -1,4 +1,4 @@
-import { type ReactNode, useState } from "react";
+import { type ReactNode, useCallback, useState } from "react";
 import { Link, useParams } from "react-router";
 import { useQuery } from "@tanstack/react-query";
 import { ArrowLeft, ExternalLink, FileText, Play, RefreshCw, Ticket as TicketIcon } from "lucide-react";
@@ -7,8 +7,10 @@ import { api, errorMessage } from "../lib/api";
 import type { PrTicketInfo } from "../lib/bindings/PrTicketInfo";
 import type { Review } from "../lib/bindings/Review";
 import type { Ticket } from "../lib/bindings/Ticket";
+import type { TicketAttachment } from "../lib/bindings/TicketAttachment";
 import type { TicketLoad } from "../lib/bindings/TicketLoad";
 import { relativeTime } from "../lib/format";
+import { jiraToMarkdown } from "../lib/jiraMarkup";
 import { useStartReview } from "../lib/useStartReview";
 import { Markdown } from "../components/Markdown";
 import { ReviewStatusBadge } from "../components/badges";
@@ -212,7 +214,7 @@ export function TicketsSection({ serverId, repo, info }: { serverId: string; rep
       {tickets.data && (
         <div className="space-y-3">
           {tickets.data.map((t) => (
-            <TicketResult key={t.key} load={t} />
+            <TicketResult key={t.key} load={t} serverId={serverId} repo={repo} />
           ))}
         </div>
       )}
@@ -220,7 +222,7 @@ export function TicketsSection({ serverId, repo, info }: { serverId: string; rep
   );
 }
 
-function TicketResult({ load }: { load: TicketLoad }) {
+function TicketResult({ load, serverId, repo }: { load: TicketLoad; serverId: string; repo: string }) {
   if (!load.ticket) {
     return (
       <Card className="p-4 text-[13px]">
@@ -229,12 +231,23 @@ function TicketResult({ load }: { load: TicketLoad }) {
       </Card>
     );
   }
-  return <TicketCard ticket={load.ticket} />;
+  return <TicketCard ticket={load.ticket} serverId={serverId} repo={repo} />;
 }
 
-/** Ticket text is shown as plain text: Jira returns wiki markup or flattened rich text, not markdown. */
-function TicketCard({ ticket }: { ticket: Ticket }) {
+function TicketCard({ ticket, serverId, repo }: { ticket: Ticket; serverId: string; repo: string }) {
   const url = ticket.url;
+  // Embedded images refer to attachments by file name; the newest one with that name wins.
+  const renderImage = useCallback(
+    (src: string, alt: string) => {
+      const attachment = ticket.attachments.filter((a) => a.filename === src).pop();
+      return attachment ? <TicketImage serverId={serverId} repo={repo} attachment={attachment} alt={alt} /> : null;
+    },
+    [ticket.attachments, serverId, repo],
+  );
+  const text = (value: string) => (
+    <Markdown renderImage={renderImage}>{ticket.textFormat === "jira_wiki" ? jiraToMarkdown(value) : value}</Markdown>
+  );
+
   return (
     <Card className="space-y-3 p-4 text-[13px]">
       <div className="flex flex-wrap items-center gap-2">
@@ -250,15 +263,11 @@ function TicketCard({ ticket }: { ticket: Ticket }) {
         {ticket.status && <Badge tone="accent">{ticket.status}</Badge>}
       </div>
       {ticket.parent && <div className="text-xs text-muted">Parent: {ticket.parent}</div>}
-      {ticket.description ? (
-        <p className="whitespace-pre-wrap">{ticket.description}</p>
-      ) : (
-        <p className="text-muted">No description.</p>
-      )}
-      {ticket.fields.map(([name, text]) => (
+      {ticket.description ? text(ticket.description) : <p className="text-muted">No description.</p>}
+      {ticket.fields.map(([name, value]) => (
         <div key={name}>
-          <div className="text-xs font-medium text-muted">{name}</div>
-          <p className="whitespace-pre-wrap">{text}</p>
+          <div className="mb-1 text-xs font-medium text-muted">{name}</div>
+          {text(value)}
         </div>
       ))}
       {ticket.comments.length > 0 && (
@@ -268,18 +277,51 @@ function TicketCard({ ticket }: { ticket: Ticket }) {
               ? `${ticket.commentTotal} comments`
               : `Last ${ticket.comments.length} of ${ticket.commentTotal} comments`}
           </summary>
-          <ul className="mt-2 space-y-2">
+          <ul className="mt-2 space-y-3">
             {ticket.comments.map((c, i) => (
               <li key={i} className="border-l-2 border-line pl-3">
-                <div className="text-xs text-muted">
-                  {c.author} · {c.created}
+                <div className="mb-1 text-xs text-muted">
+                  {c.author} · {formatCreated(c.created)}
                 </div>
-                <p className="whitespace-pre-wrap">{c.body}</p>
+                {text(c.body)}
               </li>
             ))}
           </ul>
         </details>
       )}
     </Card>
+  );
+}
+
+function formatCreated(created: string) {
+  return Number.isNaN(Date.parse(created)) ? created : relativeTime(created);
+}
+
+/** An image attachment, downloaded by the backend with the Jira credentials. */
+function TicketImage({
+  serverId,
+  repo,
+  attachment,
+  alt,
+}: {
+  serverId: string;
+  repo: string;
+  attachment: TicketAttachment;
+  alt: string;
+}) {
+  const image = useQuery({
+    queryKey: ["ticket-image", serverId, repo, attachment.id],
+    queryFn: () => api.loadTicketImage(serverId, repo, attachment.id),
+    staleTime: Infinity,
+    retry: false,
+  });
+  if (image.data) {
+    return <img src={image.data} alt={alt || attachment.filename} className="my-1 max-h-[480px] max-w-full rounded border border-line" />;
+  }
+  return (
+    <span className="inline-flex items-center gap-1 text-xs text-muted" title={image.error ? errorMessage(image.error) : undefined}>
+      {image.isLoading && <Spinner />}[image: {attachment.filename}
+      {image.error ? " could not be loaded" : ""}]
+    </span>
   );
 }

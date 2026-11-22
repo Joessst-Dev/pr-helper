@@ -5,13 +5,19 @@
 use reqwest::StatusCode;
 use serde_json::Value;
 
-use super::{MAX_COMMENTS, Ticket, TicketComment, browse_url, is_valid_key, truncate};
+use super::{
+    MAX_COMMENTS, Ticket, TicketAttachment, TicketComment, TicketTextFormat, browse_url,
+    is_displayable_image, is_valid_key, truncate,
+};
 use crate::error::{AppError, AppResult};
 
 const NAME: &str = "Jira";
 const MAX_DESCRIPTION: usize = 8_000;
 const MAX_FIELD: usize = 4_000;
 const MAX_COMMENT: usize = 1_500;
+/// Largest image attachment the app downloads for display.
+pub const MAX_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
+const MAX_ATTACHMENTS: usize = 50;
 
 pub enum JiraAuth {
     /// Jira Cloud: account email plus API token.
@@ -103,6 +109,7 @@ impl JiraClient {
             "description",
             "parent",
             "comment",
+            "attachment",
         ]
         .into_iter()
         .map(str::to_string)
@@ -114,6 +121,68 @@ impl JiraClient {
         ]);
         let v = self.send(req, &format!("Ticket {key}")).await?;
         Ok(parse_issue(&v, key, extra_fields, &self.base))
+    }
+
+    /// Downloads an image attachment: `(mime type, bytes)`. Only displayable image types up to
+    /// [`MAX_IMAGE_BYTES`], and the credentials only ever go to the configured Jira host.
+    pub async fn attachment_image(&self, id: &str) -> AppResult<(String, Vec<u8>)> {
+        if id.is_empty() || id.len() > 20 || !id.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(AppError::invalid(format!("invalid attachment id {id:?}")));
+        }
+        let meta = self
+            .send(self.get(&format!("/attachment/{id}")), "The attachment")
+            .await?;
+        let mime = meta["mimeType"]
+            .as_str()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if !is_displayable_image(&mime) {
+            return Err(AppError::invalid(format!(
+                "attachment {id} is not a supported image ({mime})"
+            )));
+        }
+        if meta["size"].as_u64().unwrap_or(0) > MAX_IMAGE_BYTES {
+            return Err(AppError::invalid(format!("attachment {id} is too large")));
+        }
+        let content = meta["content"]
+            .as_str()
+            .ok_or_else(|| AppError::invalid("Jira returned no attachment URL"))?;
+        let url = reqwest::Url::parse(content)
+            .map_err(|_| AppError::invalid("Jira returned an invalid attachment URL"))?;
+        let base = reqwest::Url::parse(&self.base)
+            .map_err(|_| AppError::invalid("the Jira URL is invalid"))?;
+        if url.origin() != base.origin() {
+            return Err(AppError::invalid(
+                "the attachment is not hosted on the configured Jira site",
+            ));
+        }
+        // reqwest drops the Authorization header if Jira redirects to another host (Cloud
+        // serves attachment bytes from its media service with a signed URL).
+        let req = self.client.get(url);
+        let req = match &self.auth {
+            JiraAuth::Basic { email, token } => req.basic_auth(email, Some(token)),
+            JiraAuth::Bearer(token) => req.bearer_auth(token),
+        };
+        let mut resp = req.send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(AppError::Api {
+                provider: NAME,
+                status: status.as_u16(),
+                message: format!("attachment {id} could not be downloaded"),
+            });
+        }
+        if resp.content_length().unwrap_or(0) > MAX_IMAGE_BYTES {
+            return Err(AppError::invalid(format!("attachment {id} is too large")));
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = resp.chunk().await? {
+            bytes.extend_from_slice(&chunk);
+            if bytes.len() as u64 > MAX_IMAGE_BYTES {
+                return Err(AppError::invalid(format!("attachment {id} is too large")));
+            }
+        }
+        Ok((mime, bytes))
     }
 }
 
@@ -183,7 +252,36 @@ fn parse_issue(v: &Value, key: &str, extra_fields: &[String], base: &str) -> Tic
         fields,
         comments,
         comment_total,
+        text_format: TicketTextFormat::JiraWiki,
+        attachments: parse_attachments(&f["attachment"]),
     }
+}
+
+/// Image attachments, newest last, as the text references them by file name.
+fn parse_attachments(v: &Value) -> Vec<TicketAttachment> {
+    v.as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|a| {
+            let id = match &a["id"] {
+                Value::String(s) => s.clone(),
+                Value::Number(n) => n.to_string(),
+                _ => return None,
+            };
+            let mime_type = a["mimeType"].as_str()?.to_ascii_lowercase();
+            let filename = a["filename"].as_str()?.to_string();
+            (is_displayable_image(&mime_type)
+                && !id.is_empty()
+                && id.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| TicketAttachment {
+                id,
+                filename,
+                mime_type,
+                size: a["size"].as_u64().unwrap_or(0),
+            })
+        })
+        .take(MAX_ATTACHMENTS)
+        .collect()
 }
 
 /// Best-effort plain text for any Jira field value.
@@ -265,7 +363,13 @@ mod tests {
                 "description": "As a user I want to reset my password.",
                 "parent": {"key": "ABC-1", "fields": {"summary": "Account epic"}},
                 "customfield_10035": "* Reset link expires after 1 hour",
-                "comment": {"total": 12, "comments": comments}
+                "comment": {"total": 12, "comments": comments},
+                "attachment": [
+                    {"id": "10001", "filename": "flow.png", "mimeType": "image/png", "size": 2048},
+                    {"id": 10002, "filename": "spec.pdf", "mimeType": "application/pdf", "size": 1},
+                    {"id": "10003", "filename": "logo.svg", "mimeType": "image/svg+xml", "size": 1},
+                    {"id": "../x", "filename": "evil.png", "mimeType": "image/png", "size": 1}
+                ]
             }
         })
     }
@@ -280,7 +384,7 @@ mod tests {
             .and(query_param("expand", "names"))
             .and(query_param(
                 "fields",
-                "summary,issuetype,status,description,parent,comment,customfield_10035",
+                "summary,issuetype,status,description,parent,comment,attachment,customfield_10035",
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(issue_json()))
             .expect(1)
@@ -312,10 +416,84 @@ mod tests {
         assert_eq!(t.comments[0].body, "comment 3");
         assert_eq!(t.comments[9].author, "User 12");
         assert_eq!(t.comment_total, 12);
+        assert_eq!(t.text_format, TicketTextFormat::JiraWiki);
+        // Only displayable images with a numeric id; no PDFs, no SVG.
+        assert_eq!(
+            t.attachments,
+            vec![TicketAttachment {
+                id: "10001".into(),
+                filename: "flow.png".into(),
+                mime_type: "image/png".into(),
+                size: 2048,
+            }]
+        );
         assert_eq!(
             t.url.as_deref(),
             Some(format!("{}/browse/ABC-12", server.uri()).as_str())
         );
+    }
+
+    async fn mock_attachment(server: &MockServer, id: &str, meta: Value) {
+        Mock::given(method("GET"))
+            .and(path(format!("/rest/api/2/attachment/{id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(meta))
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn image_attachments_download_only_from_the_jira_site() {
+        let server = MockServer::start().await;
+        let base = server.uri();
+        mock_attachment(
+            &server,
+            "1",
+            serde_json::json!({"mimeType": "image/png", "size": 4,
+                "content": format!("{base}/secure/attachment/1/flow.png")}),
+        )
+        .await;
+        Mock::given(method("GET"))
+            .and(path("/secure/attachment/1/flow.png"))
+            .and(header("authorization", "Bearer pat"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"\x89PNG".to_vec()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        mock_attachment(
+            &server,
+            "2",
+            serde_json::json!({"mimeType": "image/png", "size": 4,
+                "content": "https://attacker.example/steal.png"}),
+        )
+        .await;
+        mock_attachment(
+            &server,
+            "3",
+            serde_json::json!({"mimeType": "text/html", "size": 4,
+                "content": format!("{base}/secure/attachment/3/x.html")}),
+        )
+        .await;
+        mock_attachment(
+            &server,
+            "4",
+            serde_json::json!({"mimeType": "image/png", "size": MAX_IMAGE_BYTES + 1,
+                "content": format!("{base}/secure/attachment/4/big.png")}),
+        )
+        .await;
+
+        let jira = client(&server, JiraAuth::Bearer("pat".into()));
+        let (mime, bytes) = jira.attachment_image("1").await.unwrap();
+        assert_eq!(mime, "image/png");
+        assert_eq!(bytes, b"\x89PNG");
+        for (id, expected) in [
+            ("2", "not hosted on the configured Jira site"),
+            ("3", "not a supported image"),
+            ("4", "too large"),
+            ("../1", "invalid attachment id"),
+        ] {
+            let err = jira.attachment_image(id).await.unwrap_err().to_string();
+            assert!(err.contains(expected), "{id}: {err}");
+        }
     }
 
     #[tokio::test]

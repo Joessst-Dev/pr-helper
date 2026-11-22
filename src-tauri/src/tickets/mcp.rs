@@ -12,7 +12,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
-use super::{MAX_COMMENTS, Ticket, TicketComment, browse_url, is_valid_key, truncate};
+use super::{
+    MAX_COMMENTS, Ticket, TicketComment, TicketTextFormat, browse_url, is_valid_key, truncate,
+};
 use crate::db::models::TicketSource;
 use crate::error::{AppError, AppResult};
 use crate::review::runner::{self, RunRequest, ToolPolicy};
@@ -258,6 +260,8 @@ fn to_ticket(raw: RawTicket, key: &str, base_url: &str) -> AppResult<Ticket> {
             })
             .collect(),
         comment_total: raw.comment_total.max(n),
+        text_format: TicketTextFormat::Markdown,
+        attachments: Vec::new(),
     })
 }
 

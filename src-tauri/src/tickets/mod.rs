@@ -42,6 +42,30 @@ pub struct TicketComment {
     pub body: String,
 }
 
+/// How the free text of a ticket (description, fields, comments) is written.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum TicketTextFormat {
+    /// Jira wiki markup, as the REST v2 API returns it.
+    JiraWiki,
+    /// Markdown or plain text, e.g. from an MCP server.
+    #[default]
+    Markdown,
+}
+
+/// An image attached to a ticket. The bytes are fetched on demand through the app.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct TicketAttachment {
+    pub id: String,
+    pub filename: String,
+    pub mime_type: String,
+    #[ts(type = "number")]
+    pub size: u64,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
@@ -61,6 +85,9 @@ pub struct Ticket {
     /// Total number of comments on the ticket.
     #[ts(type = "number")]
     pub comment_total: usize,
+    pub text_format: TicketTextFormat,
+    /// Image attachments, which the text can embed by file name.
+    pub attachments: Vec<TicketAttachment>,
 }
 
 pub fn is_valid_key(key: &str) -> bool {
@@ -129,6 +156,19 @@ pub fn filter_keys(requested: &[String], allowed_projects: &[String]) -> Vec<Str
         }
     }
     keys
+}
+
+/// Image types the app displays from ticket attachments. No SVG.
+pub const IMAGE_MIME_TYPES: &[&str] = &[
+    "image/png",
+    "image/jpeg",
+    "image/gif",
+    "image/webp",
+    "image/bmp",
+];
+
+pub fn is_displayable_image(mime_type: &str) -> bool {
+    IMAGE_MIME_TYPES.contains(&mime_type.trim().to_ascii_lowercase().as_str())
 }
 
 /// `{base}/browse/{key}`, if the base URL is known.

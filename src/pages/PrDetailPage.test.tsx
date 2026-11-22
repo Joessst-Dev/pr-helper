@@ -12,11 +12,13 @@ vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: vi.fn() }));
 const loadPrTickets = vi.fn();
 const getPrDetail = vi.fn();
 const cancelTicketLoad = vi.fn();
+const loadTicketImage = vi.fn();
 vi.mock("../lib/api", () => ({
   api: {
     loadPrTickets: (...a: unknown[]) => loadPrTickets(...a),
     getPrDetail: (...a: unknown[]) => getPrDetail(...a),
     cancelTicketLoad: (...a: unknown[]) => cancelTicketLoad(...a),
+    loadTicketImage: (...a: unknown[]) => loadTicketImage(...a),
   },
   errorMessage: (e: unknown) => String(e),
 }));
@@ -30,11 +32,13 @@ const loaded: TicketLoad[] = [
       summary: "Reset password",
       issueType: "Story",
       status: "In Progress",
-      description: "As a user I want to reset my password.",
+      description: "*FFT:* As a user I want to reset my password.\n!flow.png|thumbnail!\n!https://t.example/pixel.png!",
       parent: null,
       fields: [["Acceptance criteria", "Email is sent"]],
       comments: [],
       commentTotal: 0,
+      textFormat: "jira_wiki",
+      attachments: [{ id: "10001", filename: "flow.png", mimeType: "image/png", size: 10 }],
     },
     error: null,
   },
@@ -53,6 +57,8 @@ describe("TicketsSection", () => {
   beforeEach(() => {
     loadPrTickets.mockReset();
     loadPrTickets.mockResolvedValue(loaded);
+    loadTicketImage.mockReset();
+    loadTicketImage.mockResolvedValue("data:image/png;base64,AAAA");
   });
 
   it("loads Jira REST tickets right away", async () => {
@@ -61,6 +67,17 @@ describe("TicketsSection", () => {
     expect(loadPrTickets).toHaveBeenCalledWith("s1", "acme/app", ["ABC-7", "ABC-8"], expect.any(String));
     expect(screen.getByText("Email is sent")).toBeInTheDocument();
     expect(screen.getByText(/could not be loaded: not found/)).toBeInTheDocument();
+  });
+
+  it("renders Jira wiki markup and loads attached images through the backend", async () => {
+    const { container } = renderSection({ sourceName: "Acme Jira", sourceKind: "jira_cloud", keys: ["ABC-7"], message: null });
+    expect((await screen.findByText("FFT:")).tagName).toBe("STRONG");
+    const img = await screen.findByRole("img", { name: "flow.png" });
+    expect(img).toHaveAttribute("src", "data:image/png;base64,AAAA");
+    expect(loadTicketImage).toHaveBeenCalledWith("s1", "acme/app", "10001");
+    // Images that are not attachments stay links and are never loaded.
+    expect(container.querySelectorAll("img")).toHaveLength(1);
+    expect(screen.getByRole("link", { name: "[image: pixel.png]" })).toBeInTheDocument();
   });
 
   it("waits for a click with an MCP source", async () => {
