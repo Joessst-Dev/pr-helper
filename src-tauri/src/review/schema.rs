@@ -2,6 +2,8 @@
 
 use serde::Deserialize;
 
+use crate::review::user_comment::CommentAssessment;
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct RawReview {
     pub verdict: String,
@@ -53,6 +55,39 @@ pub struct RawFinding {
     pub proposed_comment: String,
     #[serde(default)]
     pub suggestion: Option<String>,
+}
+
+/// The answer of a user comment check.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RawCommentAdvice {
+    pub assessment: CommentAssessment,
+    #[serde(default)]
+    pub feedback: String,
+    #[serde(default)]
+    pub suggested_comment: String,
+}
+
+pub fn comment_check_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["assessment", "feedback", "suggested_comment"],
+        "properties": {
+            "assessment": {
+                "type": "string",
+                "enum": ["valid", "partly_valid", "not_valid"],
+                "description": "valid: the concern holds against the code. partly_valid: it holds in part or misses something important. not_valid: the code does not have this problem."
+            },
+            "feedback": {
+                "type": "string",
+                "description": "For the person who wrote the draft, in English: why the concern does or does not hold, with the evidence, and anything it misses. Two to six sentences."
+            },
+            "suggested_comment": {
+                "type": "string",
+                "description": "An improved version of the draft for the PR author, in the configured comment language. Keep the author's intent and tone. If the concern does not hold, rewrite it as a question or say it can be dropped."
+            }
+        }
+    })
 }
 
 pub fn review_schema() -> serde_json::Value {

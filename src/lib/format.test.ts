@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatCost, location, relativeTime, severityRank } from "./format";
+import { commentTitle, formatCost, location, relativeTime, severityRank } from "./format";
 
 describe("format", () => {
   it("formats relative times", () => {
@@ -26,5 +26,11 @@ describe("format", () => {
     expect(formatCost(0.004)).toBe("<$0.01");
     expect(formatCost(1.234)).toBe("$1.23");
     expect(formatCost(null)).toBe("");
+  });
+
+  it("titles a comment by its first non-empty line, shortened like the backend", () => {
+    expect(commentTitle("\n  First line \nmore")).toBe("First line");
+    expect([...commentTitle("x".repeat(200))]).toHaveLength(80);
+    expect(commentTitle("   ")).toBe("");
   });
 });

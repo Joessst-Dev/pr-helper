@@ -17,6 +17,8 @@ pub enum LineKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiffLine {
     pub kind: LineKind,
+    /// Which hunk of the file the line is in, counted from 0.
+    pub hunk: usize,
     pub old: Option<u32>,
     pub new: Option<u32>,
     pub text: String,
@@ -76,6 +78,7 @@ impl DiffIndex {
         let mut current: Option<FileDiff> = None;
         let (mut old_no, mut new_no) = (0u32, 0u32);
         let mut in_hunk = false;
+        let mut hunk = 0usize;
 
         let flush = |f: Option<FileDiff>, files: &mut HashMap<String, FileDiff>| {
             if let Some(f) = f {
@@ -125,6 +128,8 @@ impl DiffIndex {
                     old_no = o;
                     new_no = n;
                     in_hunk = true;
+                    // Lines are pushed before the next header, so the first hunk is 0.
+                    hunk = file.lines.last().map_or(0, |l| l.hunk + 1);
                 }
                 continue;
             }
@@ -133,6 +138,7 @@ impl DiffIndex {
                 Some(b' ') | None => {
                     file.right.insert(new_no, Some(old_no));
                     file.lines.push(DiffLine {
+                        hunk,
                         kind: LineKind::Context,
                         old: Some(old_no),
                         new: Some(new_no),
@@ -144,6 +150,7 @@ impl DiffIndex {
                 Some(b'+') => {
                     file.right.insert(new_no, None);
                     file.lines.push(DiffLine {
+                        hunk,
                         kind: LineKind::Added,
                         old: None,
                         new: Some(new_no),
@@ -154,6 +161,7 @@ impl DiffIndex {
                 Some(b'-') => {
                     file.left.insert(old_no);
                     file.lines.push(DiffLine {
+                        hunk,
                         kind: LineKind::Removed,
                         old: Some(old_no),
                         new: None,
@@ -209,6 +217,25 @@ impl DiffIndex {
             Side::Right => right().or_else(left),
             Side::Left => left().or_else(right),
         }
+    }
+
+    /// Whether two lines of a file are in the same hunk. GitHub rejects multi-line comments
+    /// whose start and end are in different hunks.
+    pub fn same_hunk(&self, path: &str, start: u32, end: u32, side: Side) -> bool {
+        let Some(f) = self.file(path) else {
+            return false;
+        };
+        let hunk_of = |n: u32| {
+            f.lines.iter().find_map(|l| {
+                let number = match side {
+                    Side::Right if l.kind != LineKind::Removed => l.new,
+                    Side::Left if l.kind != LineKind::Added => l.old,
+                    _ => None,
+                };
+                (number == Some(n)).then_some(l.hunk)
+            })
+        };
+        matches!((hunk_of(start), hunk_of(end)), (Some(a), Some(b)) if a == b)
     }
 
     /// A few diff lines around the anchor, rendered as a mini unified diff for the UI.
@@ -410,6 +437,17 @@ deleted file mode 100644
         let (short, cut) = f.view_lines(2);
         assert!(cut);
         assert_eq!(short.len(), 2);
+    }
+
+    #[test]
+    fn same_hunk_tells_hunks_apart() {
+        let diff = "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n\
+@@ -1,2 +1,2 @@\n x\n-old\n+new\n@@ -40,2 +40,2 @@\n y\n-old2\n+new2\n";
+        let index = DiffIndex::parse(diff);
+        assert!(index.same_hunk("a.rs", 1, 2, Side::Right));
+        assert!(!index.same_hunk("a.rs", 2, 41, Side::Right));
+        assert!(!index.same_hunk("a.rs", 2, 41, Side::Left));
+        assert!(!index.same_hunk("a.rs", 2, 99, Side::Right));
     }
 
     #[test]

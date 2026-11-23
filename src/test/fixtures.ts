@@ -22,6 +22,7 @@ export function finding(overrides: Partial<Finding> = {}): Finding {
     selected: true,
     postedAt: null,
     postedRef: null,
+    source: "reviewer",
     ...overrides,
   };
 }

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
-use crate::db::models::{Finding, ProviderKind, Review, Side};
+use crate::db::models::{Finding, FindingSource, ProviderKind, Review, Side};
 use crate::error::{AppError, AppResult};
 use crate::git::diff::DiffIndex;
 use crate::git::repo_cache::FetchSpec;
@@ -67,7 +67,12 @@ pub fn build_inline(
         }
         let anchor_line = f.line_end.or(f.line_start);
         let anchor = match (&f.file, anchor_line) {
-            (Some(path), Some(line)) => index.locate(path, line, f.side),
+            (Some(path), Some(line)) => index
+                .locate(path, line, f.side)
+                // `locate` falls back to the other side for the reviewer's slips. The user
+                // picked the side on purpose: a new line outside the diff must not land on a
+                // removed line with the same number, it goes into the review body.
+                .filter(|a| f.source != FindingSource::User || a.side == f.side),
             _ => None,
         };
         match anchor {
@@ -78,11 +83,14 @@ pub fn build_inline(
                     a.new_line
                 }
                 .unwrap_or_default();
-                // Multi-line ranges need the start on the same side and inside the diff.
+                // Multi-line ranges need the start on the same side and in the same hunk;
+                // otherwise the comment goes on its last line only.
                 let start_line = match (f.line_start, f.line_end) {
                     (Some(start), Some(_)) if start < line => index
                         .locate(&a.new_path, start, a.side)
-                        .filter(|s| s.side == a.side)
+                        .filter(|s| {
+                            s.side == a.side && index.same_hunk(&a.new_path, start, line, a.side)
+                        })
                         .map(|_| start),
                     _ => None,
                 };
@@ -100,9 +108,12 @@ pub fn build_inline(
                 });
             }
             None => {
-                let heading = match (&f.file, f.line_start) {
-                    (Some(path), Some(line)) => format!("**{path}:{line}**\n\n"),
-                    (Some(path), None) => format!("**{path}**\n\n"),
+                let heading = match (&f.file, f.line_start, f.line_end) {
+                    (Some(path), Some(start), Some(end)) if end != start => {
+                        format!("**{path}:{start}-{end}**\n\n")
+                    }
+                    (Some(path), Some(line), _) => format!("**{path}:{line}**\n\n"),
+                    (Some(path), None, _) => format!("**{path}**\n\n"),
                     _ => String::new(),
                 };
                 general.push((f.id.clone(), format!("{heading}{body}")));
@@ -265,6 +276,7 @@ mod tests {
             selected: true,
             posted_at: None,
             posted_ref: None,
+            source: Default::default(),
         }
     }
 
@@ -293,6 +305,93 @@ mod tests {
                 "**a.rs:40**\n\nNot in diff".to_string()
             )]
         );
+    }
+
+    #[test]
+    fn user_comments_outside_the_diff_never_move_to_the_other_side() {
+        let index = DiffIndex::parse(DIFF);
+        let settings = resolve(
+            &SettingsOverrides::default(),
+            &SettingsOverrides::default(),
+            None,
+        );
+        // New line 9 is not in the diff; old line 2 is removed. A reviewer finding on right
+        // line 2 would be accepted on the left, a user comment on right line 9 has no match.
+        let mut mine = finding("mine", Some(9), None, "Unchanged line");
+        mine.source = FindingSource::User;
+        let (inline, general) = build_inline(&[mine], &index, &settings).unwrap();
+        assert!(inline.is_empty(), "posted inline: {inline:?}");
+        assert_eq!(general[0].1, "**a.rs:9**\n\nUnchanged line");
+    }
+
+    #[test]
+    fn user_comments_do_not_fall_back_to_a_removed_line_with_the_same_number() {
+        // Old line 3 is removed; new line 3 is outside this diff.
+        let diff = "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -3,1 +2,0 @@\n-gone\n";
+        let index = DiffIndex::parse(diff);
+        let settings = resolve(
+            &SettingsOverrides::default(),
+            &SettingsOverrides::default(),
+            None,
+        );
+        let mut mine = finding("mine", Some(3), None, "About new line 3");
+        mine.source = FindingSource::User;
+        let (inline, general) = build_inline(&[mine], &index, &settings).unwrap();
+        assert!(inline.is_empty(), "posted inline: {inline:?}");
+        assert_eq!(general.len(), 1);
+    }
+
+    #[test]
+    fn general_comments_on_a_range_name_the_whole_range() {
+        let index = DiffIndex::parse(DIFF);
+        let settings = resolve(
+            &SettingsOverrides::default(),
+            &SettingsOverrides::default(),
+            None,
+        );
+        let (_, general) = build_inline(
+            &[finding("f", Some(20), Some(24), "Block")],
+            &index,
+            &settings,
+        )
+        .unwrap();
+        assert_eq!(general[0].1, "**a.rs:20-24**\n\nBlock");
+    }
+
+    #[test]
+    fn ranges_across_hunks_post_on_their_last_line() {
+        let diff = "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n\
+@@ -1,2 +1,2 @@\n x\n-old\n+new\n@@ -40,2 +40,2 @@\n y\n-old2\n+new2\n";
+        let index = DiffIndex::parse(diff);
+        let settings = resolve(
+            &SettingsOverrides::default(),
+            &SettingsOverrides::default(),
+            None,
+        );
+        let (inline, _) = build_inline(
+            &[finding("f", Some(2), Some(41), "Both")],
+            &index,
+            &settings,
+        )
+        .unwrap();
+        assert_eq!((inline[0].line, inline[0].start_line), (41, None));
+    }
+
+    #[test]
+    fn user_comments_on_removed_lines_anchor_on_the_left() {
+        let index = DiffIndex::parse(DIFF);
+        let settings = resolve(
+            &SettingsOverrides::default(),
+            &SettingsOverrides::default(),
+            None,
+        );
+        let mut removed = finding("mine", Some(2), None, "Why was this removed?");
+        removed.side = Side::Left;
+        removed.source = crate::db::models::FindingSource::User;
+        let (inline, general) = build_inline(&[removed], &index, &settings).unwrap();
+        assert!(general.is_empty());
+        assert_eq!((inline[0].side, inline[0].line), (Side::Left, 2));
+        assert_eq!(inline[0].old_line, Some(2));
     }
 
     #[test]

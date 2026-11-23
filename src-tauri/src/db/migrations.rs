@@ -131,6 +131,9 @@ CREATE TABLE review_files (
     PRIMARY KEY (review_id, path)
 );
 "#,
+    r#"
+ALTER TABLE findings ADD COLUMN source TEXT NOT NULL DEFAULT 'reviewer';
+"#,
 ];
 
 pub fn run(conn: &mut Connection) -> rusqlite::Result<()> {

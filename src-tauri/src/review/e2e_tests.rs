@@ -13,6 +13,7 @@ use crate::error::AppResult;
 use crate::providers::{GitProvider, PostResult, PrFilter, ReviewEvent, ReviewSubmission};
 use crate::review::post::{PostRequest, SubmitMode, post_findings};
 use crate::review::queue;
+use crate::review::user_comment::{self, CommentAssessment, UserCommentInput};
 use crate::secrets::{MemoryStore, SecretStore};
 use crate::service::Service;
 use crate::service::testing::RecordingSink;
@@ -605,6 +606,152 @@ async fn steering_text_in_a_ticket_blocks_auto_approve() {
             .iter()
             .any(|(t, _)| t.starts_with("Approve manually?"))
     );
+}
+
+fn user_comment(review_id: &str, line: u32, side: Side, body: &str) -> UserCommentInput {
+    UserCommentInput {
+        review_id: review_id.into(),
+        file: "lib.rs".into(),
+        line_start: line,
+        line_end: None,
+        side,
+        severity: Severity::Medium,
+        body: body.into(),
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn user_comments_are_checked_and_posted() {
+    let h = harness("comment", SettingsOverrides::default());
+    let review = queue::enqueue(&h.svc, h.pr.clone(), ReviewTrigger::Manual).unwrap();
+    let review = wait_finished(&h.svc, &review.id).await;
+    assert_eq!(review.status, ReviewStatus::Done);
+
+    // Only the critical files of the review can be commented on.
+    let mut outside = user_comment(&review.id, 1, Side::Right, "x");
+    outside.file = "other.rs".into();
+    assert!(user_comment::add(&h.svc, &outside).is_err());
+    assert!(user_comment::add(&h.svc, &user_comment(&review.id, 9, Side::Right, "x")).is_err());
+
+    let removed = user_comment::add(
+        &h.svc,
+        &user_comment(&review.id, 2, Side::Left, "Why drop the plain version?"),
+    )
+    .unwrap();
+    assert_eq!(removed.source, FindingSource::User);
+    let edited =
+        user_comment::update_finding(&h.svc, &removed.id, true, "Why drop it?\n\nDetails").unwrap();
+    assert_eq!(edited.title, "Why drop it?");
+    assert!(user_comment::update_finding(&h.svc, &removed.id, true, "  ").is_err());
+    assert!(user_comment::update_finding(&h.svc, &removed.id, true, &"x".repeat(20_001)).is_err());
+    assert!(removed.in_diff && removed.selected);
+
+    // The AI check runs a fresh locked-down session outside any checkout.
+    let dir = h.tmp.path();
+    let advice = serde_json::json!({
+        "assessment": "valid",
+        "feedback": "Holds — b now calls unsafe_thing.",
+        "suggested_comment": "Please document why `unsafe_thing` is safe here -- it is not obvious.",
+    });
+    let stream = [
+        serde_json::json!({"type":"system","subtype":"init","session_id":"c","model":"claude-test"}),
+        serde_json::json!({"type":"result","subtype":"success","is_error":false,"session_id":"c","total_cost_usd":0.01,"structured_output":advice}),
+    ]
+    .map(|v| v.to_string())
+    .join("\n");
+    std::fs::write(dir.join("stream.jsonl"), stream).unwrap();
+    let draft = user_comment(&review.id, 2, Side::Right, "unsafe_thing needs a comment");
+    let a = h.svc.check_user_comment(&draft, "check-1").await.unwrap();
+    assert_eq!(a.assessment, CommentAssessment::Valid);
+    assert_eq!(
+        a.suggested_comment,
+        "Please document why `unsafe_thing` is safe here, it is not obvious."
+    );
+    assert!(!a.feedback.contains('—'));
+    let args = std::fs::read_to_string(dir.join("args.txt")).unwrap();
+    assert!(args.contains("--setting-sources user") && args.contains("--strict-mcp-config"));
+    assert!(args.contains("--tools Read Grep Glob Skill") && !args.contains("--add-dir"));
+    let cwd = std::fs::read_to_string(dir.join("cwd.txt")).unwrap();
+    assert!(cwd.contains("comment-check-"));
+    let prompt = std::fs::read_to_string(dir.join("prompt.txt")).unwrap();
+    assert!(prompt.contains("comment.md") && prompt.contains("file.txt"));
+    // The material is gone afterwards, and nothing else was created for it.
+    assert!(!std::path::Path::new(cwd.trim()).exists());
+    assert!(!h.svc.cache.review_dir(&review.id).exists());
+
+    let mine = user_comment::add(
+        &h.svc,
+        &user_comment(&review.id, 2, Side::Right, &a.suggested_comment),
+    )
+    .unwrap();
+    let outcome = post_findings(
+        &h.svc,
+        PostRequest {
+            review_id: review.id.clone(),
+            finding_ids: vec![removed.id.clone(), mine.id.clone()],
+            mode: SubmitMode::Comment,
+            summary: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome.posted, 2);
+    {
+        let rec = h.recorded.lock().unwrap();
+        let inline = &rec.submissions[0].inline;
+        assert_eq!((inline[0].side, inline[0].line), (Side::Left, 2));
+        assert_eq!((inline[1].side, inline[1].line), (Side::Right, 2));
+    }
+    // Posted comments stay.
+    assert!(user_comment::delete(&h.svc, &mine.id).is_err());
+
+    // A re-review lists the reviewer's previous findings, never the user's comments.
+    write_fake_claude(dir, "comment");
+    let again = queue::enqueue(&h.svc, h.pr.clone(), ReviewTrigger::Manual).unwrap();
+    assert_eq!(
+        wait_finished(&h.svc, &again.id).await.status,
+        ReviewStatus::Done
+    );
+    let prompt = std::fs::read_to_string(dir.join("prompt.txt")).unwrap();
+    assert!(prompt.contains("Explain unsafe_thing"));
+    assert!(!prompt.contains("Why drop the plain version?"));
+}
+
+/// Checks a user comment with the real `claude` CLI (haiku, costs under a cent).
+#[cfg(unix)]
+#[tokio::test]
+#[ignore]
+async fn real_claude_comment_check() {
+    let h = harness(
+        "comment",
+        SettingsOverrides {
+            model: Some("haiku".into()),
+            ..Default::default()
+        },
+    );
+    // The review itself uses the fake CLI; only the comment check talks to the real one.
+    let review = queue::enqueue(&h.svc, h.pr.clone(), ReviewTrigger::Manual).unwrap();
+    let review = wait_finished(&h.svc, &review.id).await;
+    assert_eq!(review.status, ReviewStatus::Done);
+    h.svc.db.set_app_config(&AppConfig::default()).unwrap();
+    let draft = user_comment(
+        &review.id,
+        2,
+        Side::Right,
+        "b now calls unsafe_thing without explaining why that is safe.",
+    );
+    let a = h
+        .svc
+        .check_user_comment(&draft, "real-check")
+        .await
+        .unwrap();
+    println!(
+        "{:?} cost={:?}\nfeedback: {}\nsuggested: {}",
+        a.assessment, a.cost_usd, a.feedback, a.suggested_comment
+    );
+    assert!(!a.suggested_comment.is_empty());
+    assert!(crate::review::postprocess::dash_violations(&a.suggested_comment).is_empty());
 }
 
 /// Runs the real `claude` CLI (costs a few cents). `cargo test real_claude -- --ignored`

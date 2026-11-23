@@ -4,14 +4,21 @@ import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ReviewResults } from "./ReviewPage";
 import { finding } from "../test/fixtures";
+import type { CriticalFile } from "../lib/bindings/CriticalFile";
 
 vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: vi.fn() }));
 const postFindings = vi.fn();
 const updateFinding = vi.fn();
+const deleteUserComment = vi.fn();
+const addUserComment = vi.fn();
+const getReviewFile = vi.fn();
 vi.mock("../lib/api", () => ({
   api: {
+    addUserComment: (...a: unknown[]) => addUserComment(...a),
+    getReviewFile: (...a: unknown[]) => getReviewFile(...a),
     postFindings: (...a: unknown[]) => postFindings(...a),
     updateFinding: (...a: unknown[]) => updateFinding(...a),
+    deleteUserComment: (...a: unknown[]) => deleteUserComment(...a),
     checkCommentText: async (_s: string, _r: string, text: string) => ({
       dashViolations: [],
       attributionViolations: [],
@@ -21,11 +28,12 @@ vi.mock("../lib/api", () => ({
   errorMessage: (e: unknown) => String(e),
 }));
 
-function renderResults() {
+function renderResults(extra: ReturnType<typeof finding>[] = [], criticalFiles: CriticalFile[] = []) {
   const findings = [
     finding({ id: "a", severity: "critical", title: "SQL injection" }),
     finding({ id: "b", severity: "low", title: "Naming", selected: false }),
     finding({ id: "c", severity: "nit", title: "Typo", selected: false }),
+    ...extra,
   ];
   return render(
     <QueryClientProvider client={new QueryClient()}>
@@ -36,6 +44,7 @@ function renderResults() {
         summary="Two issues."
         verdict="request_changes"
         findings={findings}
+        criticalFiles={criticalFiles}
         onChanged={vi.fn()}
       />
     </QueryClientProvider>,
@@ -46,6 +55,75 @@ describe("ReviewResults", () => {
   beforeEach(() => {
     postFindings.mockReset().mockResolvedValue({ posted: 2, folded: 0, reviewUrl: null, headMoved: false });
     updateFinding.mockReset().mockResolvedValue({});
+    deleteUserComment.mockReset().mockResolvedValue(undefined);
+  });
+
+  it("adds an own comment in severity order", async () => {
+    getReviewFile.mockResolvedValue({
+      content: "fn a() {}\nfn b() {}\n",
+      diff: [{ kind: "added", old: null, new: 2, text: "fn b() {}" }],
+      diffTruncated: false,
+    });
+    addUserComment.mockImplementation(async (input) =>
+      finding({ id: "u1", source: "user", title: "Mine", severity: input.severity, proposedComment: input.body }),
+    );
+    renderResults([], [{ path: "src/b.rs", reason: "r", focusLines: [], note: null }]);
+    await userEvent.click(screen.getByRole("button", { name: /src\/b\.rs/ }));
+    await userEvent.click(await screen.findByRole("button", { name: "Comment on line 2" }));
+    await userEvent.type(screen.getByRole("textbox", { name: "Your comment" }), "Mine");
+    await userEvent.selectOptions(screen.getByRole("combobox", { name: "Severity" }), "high");
+    await userEvent.click(screen.getByRole("button", { name: "Add comment" }));
+    expect(addUserComment).toHaveBeenCalledWith({
+      reviewId: "r1",
+      file: "src/b.rs",
+      lineStart: 2,
+      lineEnd: null,
+      side: "right",
+      severity: "high",
+      body: "Mine",
+    });
+    // After the critical finding, before the low and nit ones.
+    const titles = await screen.findAllByRole("checkbox", { name: /Select finding/ });
+    expect(titles.map((c) => c.getAttribute("aria-label"))).toEqual([
+      "Select finding: SQL injection",
+      "Select finding: Mine",
+      "Select finding: Naming",
+      "Select finding: Typo",
+    ]);
+  });
+
+  it("retitles an own comment when its text changes", async () => {
+    const mine = finding({ id: "u1", source: "user", category: "comment", title: "Typo here", proposedComment: "Typo here" });
+    renderResults([mine]);
+    const box = screen.getAllByRole("textbox", { name: "Proposed comment" }).slice(-1)[0];
+    await userEvent.clear(box);
+    await userEvent.type(box, "This leaks the token");
+    await userEvent.tab();
+    expect(await screen.findByRole("checkbox", { name: "Select finding: This leaks the token" })).toBeInTheDocument();
+  });
+
+  it("deletes an own comment only after its pending edit was saved", async () => {
+    let finishSave: () => void = () => {};
+    updateFinding.mockImplementationOnce(() => new Promise<void>((r) => (finishSave = r)));
+    const mine = finding({ id: "u1", source: "user", category: "comment", title: "Mine", proposedComment: "Mine" });
+    renderResults([mine]);
+    await userEvent.type(screen.getAllByRole("textbox", { name: "Proposed comment" }).slice(-1)[0], " more");
+    await userEvent.tab();
+    await userEvent.click(screen.getByRole("button", { name: "Delete comment" }));
+    expect(deleteUserComment).not.toHaveBeenCalled();
+    finishSave();
+    await waitFor(() => expect(deleteUserComment).toHaveBeenCalledWith("u1"));
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("posts the user's own comments with the findings and can delete them", async () => {
+    const mine = finding({ id: "u1", source: "user", category: "comment", title: "Rename this", severity: "medium" });
+    renderResults([mine]);
+    expect(screen.getByText(/of 4 selected/)).toHaveTextContent("2 of 4 selected");
+    await userEvent.click(screen.getByRole("button", { name: "Delete comment" }));
+    expect(deleteUserComment).toHaveBeenCalledWith("u1");
+    await waitFor(() => expect(screen.queryByText("Rename this")).toBeNull());
+    expect(screen.getByText(/of 3 selected/)).toHaveTextContent("1 of 3 selected");
   });
 
   it("posts exactly the selected findings with the chosen mode", async () => {

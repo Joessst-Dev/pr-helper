@@ -1,9 +1,10 @@
 import { useEffect, useState } from "react";
 import clsx from "clsx";
-import { ChevronDown, ChevronRight, CircleCheck, ExternalLink, TriangleAlert } from "lucide-react";
+import { ChevronDown, ChevronRight, CircleCheck, ExternalLink, Trash2, TriangleAlert } from "lucide-react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import type { CommentCheck } from "../lib/bindings/CommentCheck";
 import type { Finding } from "../lib/bindings/Finding";
+import { errorMessage } from "../lib/api";
 import { location } from "../lib/format";
 import { SeverityBadge } from "./badges";
 import { Badge, TextArea } from "./ui";
@@ -72,12 +73,15 @@ export function FindingCard({
   check,
   onToggle,
   onEdit,
+  onDelete,
   saveError,
 }: {
   finding: Finding;
   check: CheckFn;
   onToggle: (selected: boolean) => void;
   onEdit: (text: string) => void;
+  /** Set for the user's own comments, which can be deleted until they are posted. */
+  onDelete?: () => Promise<void>;
   /** Set when the last change to this finding could not be saved. */
   saveError?: string;
 }) {
@@ -86,6 +90,9 @@ export function FindingCard({
   const [showDiff, setShowDiff] = useState(false);
   const posted = !!finding.postedAt;
   const result = useCommentCheck(text, check);
+  const mine = finding.source === "user";
+  const [deleting, setDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
 
   useEffect(() => setText(finding.proposedComment), [finding.id, finding.proposedComment]);
 
@@ -111,13 +118,18 @@ export function FindingCard({
             {open ? <ChevronDown className="size-3.5 text-muted" /> : <ChevronRight className="size-3.5 text-muted" />}
             <SeverityBadge severity={finding.severity} />
             <span className="font-medium">{finding.title}</span>
-            <Badge>{finding.category}</Badge>
+            {mine ? <Badge tone="info">Your comment</Badge> : <Badge>{finding.category}</Badge>}
             {posted && (
               <Badge tone="ok">
                 <CircleCheck className="size-3" /> Posted
               </Badge>
             )}
           </div>
+          {deleteError && (
+            <div role="alert" className="mt-1 pl-5 text-xs text-danger">
+              Not deleted: {deleteError}
+            </div>
+          )}
           {saveError && (
             <div role="alert" className="mt-1 pl-5 text-xs text-danger">
               Not saved: {saveError}
@@ -130,6 +142,27 @@ export function FindingCard({
             )}
           </div>
         </button>
+        {onDelete && !posted && (
+          <button
+            type="button"
+            className="rounded p-1 text-muted hover:text-danger disabled:opacity-50"
+            title="Delete comment"
+            aria-label="Delete comment"
+            disabled={deleting}
+            onClick={async () => {
+              setDeleting(true);
+              setDeleteError(null);
+              try {
+                await onDelete();
+              } catch (e) {
+                setDeleteError(errorMessage(e));
+                setDeleting(false);
+              }
+            }}
+          >
+            <Trash2 className="size-3.5" />
+          </button>
+        )}
         {posted && finding.postedRef && (
           <button
             type="button"
@@ -145,7 +178,9 @@ export function FindingCard({
 
       {open && (
         <div className="space-y-3 border-t border-line px-4 py-3 pl-11">
-          <p className="text-[13px] leading-relaxed whitespace-pre-wrap text-fg/85">{finding.explanation}</p>
+          {finding.explanation && (
+            <p className="text-[13px] leading-relaxed whitespace-pre-wrap text-fg/85">{finding.explanation}</p>
+          )}
 
           {finding.diffExcerpt && (
             <div>
@@ -161,7 +196,7 @@ export function FindingCard({
           )}
 
           <div>
-            <div className="mb-1 text-xs font-medium text-muted">Proposed comment</div>
+            <div className="mb-1 text-xs font-medium text-muted">{mine ? "Your comment" : "Proposed comment"}</div>
             <TextArea
               aria-label="Proposed comment"
               rows={Math.min(10, Math.max(3, text.split("\n").length + 1))}

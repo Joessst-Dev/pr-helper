@@ -915,6 +915,7 @@ impl Db {
             selected: r.get("selected")?,
             posted_at: r.get("posted_at")?,
             posted_ref: r.get("posted_ref")?,
+            source: FindingSource::parse(&r.get::<_, String>("source")?).unwrap_or_default(),
         })
     }
 
@@ -949,6 +950,92 @@ impl Db {
             c.execute(
                 "UPDATE findings SET selected = ?2, proposed_comment = ?3 WHERE id = ?1",
                 params![id, selected, proposed_comment],
+            )
+        })?;
+        self.get_finding(id)
+    }
+
+    /// Stores a comment the user wrote on a critical file. It keeps the severity order: it goes
+    /// after every finding of the same or a higher severity, and the rest move down one place.
+    pub fn insert_user_finding(&self, f: &Finding) -> AppResult<Finding> {
+        {
+            let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+            let tx = conn.transaction()?;
+            let ranked: Vec<(u32, u8)> = {
+                let mut stmt = tx.prepare(
+                    "SELECT position, severity FROM findings WHERE review_id = ?1 ORDER BY position",
+                )?;
+                stmt.query_map([&f.review_id], |r| {
+                    let severity: String = r.get(1)?;
+                    Ok((
+                        r.get(0)?,
+                        Severity::parse(&severity).unwrap_or(Severity::Low).rank(),
+                    ))
+                })?
+                .collect::<rusqlite::Result<_>>()?
+            };
+            let position = ranked
+                .iter()
+                .filter(|(_, rank)| *rank <= f.severity.rank())
+                .map(|(p, _)| p + 1)
+                .max()
+                .unwrap_or(0);
+            tx.execute(
+                "UPDATE findings SET position = position + 1 WHERE review_id = ?1 AND position >= ?2",
+                params![f.review_id, position],
+            )?;
+            tx.execute(
+                "INSERT INTO findings (id, review_id, position, severity, category, title, file,
+                   line_start, line_end, side, explanation, proposed_comment, suggestion, in_diff,
+                   diff_excerpt, selected, source)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, '', ?11, NULL, ?12, NULL, ?13,
+                   'user')",
+                params![
+                    f.id,
+                    f.review_id,
+                    position,
+                    f.severity.as_str(),
+                    f.category,
+                    f.title,
+                    f.file,
+                    f.line_start,
+                    f.line_end,
+                    if f.side == Side::Left {
+                        "left"
+                    } else {
+                        "right"
+                    },
+                    f.proposed_comment,
+                    f.in_diff,
+                    f.selected,
+                ],
+            )?;
+            tx.commit()?;
+        }
+        self.get_finding(&f.id)
+    }
+
+    /// Deletes a comment the user wrote, unless it was posted already.
+    pub fn delete_user_finding(&self, id: &str) -> AppResult<()> {
+        let removed = self.with(|c| {
+            c.execute(
+                "DELETE FROM findings WHERE id = ?1 AND source = 'user' AND posted_at IS NULL",
+                [id],
+            )
+        })?;
+        if removed == 0 {
+            return Err(AppError::invalid(
+                "only your own comments that were not posted yet can be deleted",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn set_finding_title(&self, id: &str, title: &str) -> AppResult<Finding> {
+        self.with(|c| {
+            c.execute(
+                "UPDATE findings SET title = ?2 WHERE id = ?1",
+                params![id, title],
             )
         })?;
         self.get_finding(id)
@@ -1114,6 +1201,79 @@ mod tests {
     }
 
     #[test]
+    fn user_findings_follow_the_reviewer_and_only_they_can_be_deleted() {
+        let db = Db::open_in_memory().unwrap();
+        let s = db.insert_server(&server_input()).unwrap();
+        let review = db
+            .insert_review(&sample_pr(&s.id), ReviewTrigger::Manual)
+            .unwrap();
+        let mut finding = Finding {
+            id: new_id(),
+            review_id: review.id.clone(),
+            position: 0,
+            severity: Severity::Low,
+            category: "bug".into(),
+            title: "t".into(),
+            file: Some("a.rs".into()),
+            line_start: Some(3),
+            line_end: None,
+            side: Side::Right,
+            explanation: String::new(),
+            proposed_comment: "c".into(),
+            suggestion: None,
+            in_diff: true,
+            diff_excerpt: None,
+            selected: true,
+            posted_at: None,
+            posted_ref: None,
+            source: FindingSource::User,
+        };
+        // The reviewer's insert relies on the column default.
+        db.complete_review(
+            &review.id,
+            Verdict::Comment,
+            "",
+            None,
+            std::slice::from_ref(&finding),
+            &[],
+        )
+        .unwrap();
+        let reviewer = db.list_findings(&review.id).unwrap().remove(0);
+        assert_eq!(reviewer.source, FindingSource::Reviewer);
+
+        finding.id = new_id();
+        finding.side = Side::Left;
+        finding.line_end = Some(5);
+        let mine = db.insert_user_finding(&finding).unwrap();
+        assert_eq!(mine.source, FindingSource::User);
+        assert_eq!(mine.position, 1);
+        assert_eq!((mine.side, mine.line_end), (Side::Left, Some(5)));
+
+        assert!(db.delete_user_finding(&reviewer.id).is_err());
+        db.mark_finding_posted(&mine.id, None).unwrap();
+        assert!(db.delete_user_finding(&mine.id).is_err());
+
+        finding.id = new_id();
+        let other = db.insert_user_finding(&finding).unwrap();
+        assert_eq!(other.position, 2);
+        db.delete_user_finding(&other.id).unwrap();
+        assert_eq!(db.list_findings(&review.id).unwrap().len(), 2);
+
+        // A critical comment goes before the low findings, keeping the severity order.
+        finding.id = new_id();
+        finding.severity = Severity::Critical;
+        let critical = db.insert_user_finding(&finding).unwrap();
+        assert_eq!(critical.position, 0);
+        let order: Vec<_> = db
+            .list_findings(&review.id)
+            .unwrap()
+            .into_iter()
+            .map(|f| (f.id, f.position))
+            .collect();
+        assert_eq!(order, [(critical.id, 0), (reviewer.id, 1), (mine.id, 2)]);
+    }
+
+    #[test]
     fn review_lifecycle_updates_tracking() {
         let db = Db::open_in_memory().unwrap();
         let s = db.insert_server(&server_input()).unwrap();
@@ -1141,6 +1301,7 @@ mod tests {
             selected: true,
             posted_at: None,
             posted_ref: None,
+            source: Default::default(),
         };
         db.complete_review(
             &review.id,

@@ -56,3 +56,16 @@ export function location(file: string | null, lineStart: number | null, lineEnd:
   if (lineStart == null) return file;
   return lineEnd != null && lineEnd !== lineStart ? `${file}:${lineStart}-${lineEnd}` : `${file}:${lineStart}`;
 }
+
+const MAX_TITLE_CHARS = 80;
+
+/** The title of a user comment: its first non-empty line, shortened. Mirrors `title_of` in Rust. */
+export function commentTitle(text: string): string {
+  const first =
+    text
+      .split("\n")
+      .map((l) => l.trim())
+      .find((l) => l) ?? "";
+  const chars = [...first];
+  return chars.length <= MAX_TITLE_CHARS ? first : `${chars.slice(0, MAX_TITLE_CHARS - 1).join("").trimEnd()}…`;
+}

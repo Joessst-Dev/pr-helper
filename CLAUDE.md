@@ -52,7 +52,7 @@ Where a public skill conflicts with this file or a project skill, this file wins
 
 - Proposed comments never contain `--`, em dashes or en dashes in prose. Inline code, fenced code and URLs are exempt.
 - When `forbid_ai_attribution` is on (the default), no AI/Claude attribution of any kind, and no footers.
-- Findings are sorted by severity: critical > high > medium > low > nit. `skip_nits` drops nits.
+- Findings are sorted by severity: critical > high > medium > low > nit. `skip_nits` drops the reviewer's nits; the user's own comments (`source = user`) keep the severity they picked, nit included.
 - `finalize_body` runs again on user-edited text right before posting.
 - An approve verdict with any medium-or-higher finding is downgraded.
 - `scope` findings (unmet ticket requirements) are capped at medium. They are dropped unless a ticket was loaded and `ticketScopeCheck` is on.
