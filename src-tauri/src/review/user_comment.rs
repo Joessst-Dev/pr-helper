@@ -94,8 +94,10 @@ fn validate_anchor(input: &UserCommentInput, content: &CriticalFileContent) -> A
     let in_diff_line = |n: u32| content.diff.iter().any(|d| diff_number(d, side) == Some(n));
     let exists = match (side, &content.content) {
         (Side::Right, Some(text)) => (end as usize) <= text.lines().count().max(1),
-        // Without the file only diff lines can be commented on.
-        _ => (start..=end).all(in_diff_line),
+        // Without the file only diff lines can be commented on. A range may span a hunk gap,
+        // so only its ends are checked; posting uses the last line when they are in different
+        // hunks.
+        _ => in_diff_line(start) && in_diff_line(end),
     };
     if !exists {
         return Err(AppError::invalid(
@@ -209,8 +211,13 @@ pub fn add(svc: &Service, input: &UserCommentInput) -> AppResult<Finding> {
 /// so it follows the text.
 ///
 /// # Errors
-/// Fails when the finding does not exist or the database write fails.
+/// Fails when the finding does not exist, a user comment's text is empty or too long, or the
+/// database write fails.
 pub fn update_finding(svc: &Service, id: &str, selected: bool, text: &str) -> AppResult<Finding> {
+    // A user comment keeps the rules it was added with: not empty, not too long.
+    if svc.db.get_finding(id)?.source == FindingSource::User {
+        checked_body(text)?;
+    }
     let finding = svc.db.update_finding(id, selected, text)?;
     let title = title_of(text);
     if finding.source != FindingSource::User || title.is_empty() || title == finding.title {
@@ -440,6 +447,15 @@ mod tests {
         fn accepts_removed_lines_on_the_old_side() {
             let a = check(2, None, Side::Left, true).unwrap();
             assert!(a.in_diff, "removed line 2 is in the diff: {a:?}");
+        }
+
+        #[test]
+        fn accepts_removed_ranges_across_a_hunk_gap() {
+            let mut c = content(true);
+            c.diff.push(line(DiffLineKind::Context, Some(30), Some(31)));
+            c.diff.push(line(DiffLineKind::Removed, Some(40), None));
+            let a = super::validate_anchor(&input(2, Some(40), Side::Left), &c);
+            assert!(a.is_ok(), "rejected: {a:?}");
         }
 
         #[test]

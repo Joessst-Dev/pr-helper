@@ -643,6 +643,8 @@ async fn user_comments_are_checked_and_posted() {
     let edited =
         user_comment::update_finding(&h.svc, &removed.id, true, "Why drop it?\n\nDetails").unwrap();
     assert_eq!(edited.title, "Why drop it?");
+    assert!(user_comment::update_finding(&h.svc, &removed.id, true, "  ").is_err());
+    assert!(user_comment::update_finding(&h.svc, &removed.id, true, &"x".repeat(20_001)).is_err());
     assert!(removed.in_diff && removed.selected);
 
     // The AI check runs a fresh locked-down session outside any checkout.
