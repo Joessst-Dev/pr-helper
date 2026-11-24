@@ -953,6 +953,7 @@ impl Db {
     /// Stores a comment the user wrote on a critical file. It keeps the severity order: it goes
     /// after every finding of the same or a higher severity, and the rest move down one place.
     pub fn insert_user_finding(&self, f: &Finding) -> AppResult<Finding> {
+        // Scoped so the connection lock is released before `get_finding` takes it again.
         {
             let mut conn = self.conn.lock().unwrap_or_else(PoisonError::into_inner);
             let tx = conn.transaction()?;

@@ -25,6 +25,8 @@ use crate::service::{ProgressKind, Service, TicketPlan};
 use crate::settings::EffectiveSettings;
 use crate::tickets::{Ticket, render};
 
+/// Runs one queued review to the end. It never fails: the outcome is recorded on the review
+/// (done, failed or cancelled), and the worktree is removed unless the user keeps worktrees.
 pub async fn run_review(
     svc: &Service,
     review_id: &str,

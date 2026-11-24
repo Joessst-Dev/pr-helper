@@ -181,9 +181,16 @@ mod tests {
     }
 
     #[test]
-    fn slugs() {
+    fn slug_lowercases_and_joins_words_with_single_dashes() {
         assert_eq!(slug("Rust Safety!"), "rust-safety");
+        assert_eq!(slug("--API  /  Design--"), "api-design");
+        assert_eq!(slug("Café Größe"), "caf-gr-e");
+    }
+
+    #[test]
+    fn slug_falls_back_to_skill_when_nothing_is_left() {
         assert_eq!(slug("  "), "skill");
+        assert_eq!(slug("!!!"), "skill");
     }
 
     #[tokio::test]

@@ -474,6 +474,8 @@ pub fn finalize_body(text: &str, settings: &EffectiveSettings) -> AppResult<Stri
     Ok(body)
 }
 
+/// Sorts by severity, then PR-wide findings last, then file and line. Also renumbers
+/// `position` to match, which is the order the UI shows.
 pub fn sort_findings(findings: &mut [Finding]) {
     findings.sort_by(|a, b| {
         a.severity
@@ -878,8 +880,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn process_sorts_filters_and_anchors() {
+    /// An approve verdict with one finding per severity, reviewed with `skip_nits` on.
+    fn process_mixed_review() -> Processed {
         let diff = DiffIndex::parse(DIFF);
         let raw_review = RawReview {
             verdict: "approve".into(),
@@ -896,28 +898,64 @@ mod tests {
             skip_nits: Some(true),
             ..Default::default()
         });
-        let p = process(raw_review, "r1", &s, &diff, false);
+        process(raw_review, "r1", &s, &diff, false)
+    }
+
+    #[test]
+    fn process_drops_nits_and_sorts_by_severity() {
+        let p = process_mixed_review();
         let sev: Vec<_> = p.findings.iter().map(|f| f.severity).collect();
         assert_eq!(
             sev,
             vec![Severity::Critical, Severity::Medium, Severity::Low]
         );
-        assert_eq!(p.findings[0].proposed_comment, "Fix this, now");
-        assert!(p.findings[0].in_diff);
-        assert!(p.findings[0].diff_excerpt.is_some());
-        assert!(!p.findings[1].in_diff); // line 50 is not in the diff
-        assert!(p.findings[0].selected && p.findings[1].selected && !p.findings[2].selected);
+    }
+
+    #[test]
+    fn process_numbers_positions_in_sorted_order() {
+        let p = process_mixed_review();
         assert_eq!(
             p.findings.iter().map(|f| f.position).collect::<Vec<_>>(),
             vec![0, 1, 2]
         );
-        // Approve with a critical finding is downgraded.
-        assert_eq!(p.verdict, Verdict::RequestChanges);
-        assert_eq!(p.summary, "Summary, fine");
     }
 
     #[test]
-    fn process_keeps_nits_when_allowed_and_respects_clean_approve() {
+    fn process_sanitizes_dashes_in_comments_and_summary() {
+        let p = process_mixed_review();
+        assert_eq!(
+            (p.findings[0].proposed_comment.as_str(), p.summary.as_str()),
+            ("Fix this, now", "Summary, fine")
+        );
+    }
+
+    #[test]
+    fn process_anchors_findings_on_diff_lines_with_an_excerpt() {
+        let p = process_mixed_review();
+        assert!(p.findings[0].in_diff && p.findings[0].diff_excerpt.is_some());
+    }
+
+    #[test]
+    fn process_marks_findings_outside_the_diff() {
+        let p = process_mixed_review();
+        // Line 50 of a.rs is not part of the diff.
+        assert!(!p.findings[1].in_diff);
+    }
+
+    #[test]
+    fn process_preselects_findings_from_the_default_minimum_severity() {
+        let p = process_mixed_review();
+        let selected: Vec<_> = p.findings.iter().map(|f| f.selected).collect();
+        assert_eq!(selected, vec![true, true, false]);
+    }
+
+    #[test]
+    fn approve_with_a_critical_finding_is_downgraded() {
+        assert_eq!(process_mixed_review().verdict, Verdict::RequestChanges);
+    }
+
+    /// An approve verdict with a single nit, reviewed with default settings.
+    fn process_nit_only_review() -> Processed {
         let diff = DiffIndex::parse(DIFF);
         let raw_review = RawReview {
             verdict: "approve".into(),
@@ -925,15 +963,23 @@ mod tests {
             critical_files: Vec::new(),
             findings: vec![raw("nit", "a.rs", 2, "tiny")],
         };
-        let p = process(
+        process(
             raw_review,
             "r1",
             &settings(SettingsOverrides::default()),
             &diff,
             false,
-        );
-        assert_eq!(p.findings.len(), 1);
-        assert_eq!(p.verdict, Verdict::Approve);
+        )
+    }
+
+    #[test]
+    fn process_keeps_nits_when_skip_nits_is_off() {
+        assert_eq!(process_nit_only_review().findings.len(), 1);
+    }
+
+    #[test]
+    fn approve_with_only_nits_stays_approve() {
+        assert_eq!(process_nit_only_review().verdict, Verdict::Approve);
     }
 
     #[test]

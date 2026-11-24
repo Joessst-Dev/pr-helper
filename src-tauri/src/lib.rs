@@ -247,6 +247,7 @@ pub fn run() {
             if let tauri::RunEvent::Reopen { .. } = event {
                 show_main_window(app);
             }
+            // Both are only used on macOS; this keeps other targets free of unused warnings.
             let _ = (app, event);
         });
 }

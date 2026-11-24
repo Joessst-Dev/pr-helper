@@ -28,6 +28,7 @@ pub enum ToolPolicy {
     TicketFetcher { allowed: Vec<String> },
 }
 
+/// One headless `claude -p` run.
 pub struct RunRequest {
     pub policy: ToolPolicy,
     pub claude: PathBuf,
@@ -35,8 +36,11 @@ pub struct RunRequest {
     pub cwd: PathBuf,
     pub add_dirs: Vec<PathBuf>,
     pub plugin_dir: Option<PathBuf>,
+    /// Appended to Claude Code's own system prompt.
     pub system_prompt: String,
+    /// Sent on stdin, so it never shows up in the process list.
     pub prompt: String,
+    /// JSON schema the final answer must match.
     pub schema: Value,
     pub session_id: String,
     pub model: Option<String>,
@@ -46,6 +50,7 @@ pub struct RunRequest {
 }
 
 impl RunRequest {
+    /// The CLI arguments, including the lockdown flags of the tool policy.
     pub fn args(&self) -> Vec<String> {
         let mut a: Vec<String> = vec![
             "-p".into(),
@@ -65,7 +70,7 @@ impl RunRequest {
         match &self.policy {
             ToolPolicy::Reviewer => {
                 a.extend(["--permission-mode".into(), "default".into()]);
-                // ...and any MCP servers it declares.
+                // Ignore MCP servers the checkout declares in its .mcp.json, too.
                 a.push("--strict-mcp-config".into());
                 a.push("--tools".into());
                 a.extend(REVIEWER_TOOLS.iter().map(ToString::to_string));
@@ -108,6 +113,7 @@ impl RunRequest {
     }
 }
 
+/// Progress of a run, for the review log.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RunEvent {
     Started { session_id: String, model: String },
@@ -115,6 +121,7 @@ pub enum RunEvent {
     Text(String),
 }
 
+/// A successful run's structured answer.
 #[derive(Debug, Clone)]
 pub struct RunOutcome {
     pub session_id: Option<String>,
@@ -222,6 +229,10 @@ fn extract_json(text: &str) -> Option<Value> {
     serde_json::from_str(&text[start..=end]).ok()
 }
 
+/// Runs the CLI and reports its progress through `on_event`.
+///
+/// Reading stops at the `result` line; a CLI that lingers after it gets [`EXIT_GRACE`] to exit
+/// and is killed after that. A cancel or the request's timeout kills the process at once.
 pub async fn run(
     req: RunRequest,
     cancel: CancellationToken,

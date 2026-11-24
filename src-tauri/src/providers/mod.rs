@@ -76,6 +76,8 @@ pub trait GitProvider: Send + Sync {
     fn kind(&self) -> ProviderKind;
     async fn current_user(&self) -> AppResult<String>;
     async fn list_open_prs(&self, filter: PrFilter) -> AppResult<Vec<PullRequest>>;
+    /// Loads one PR. `project_id` is [`PullRequest::project_id`]: `owner/repo` on GitHub, the
+    /// numeric project id on GitLab.
     async fn get_pr(&self, project_id: &str, number: u64) -> AppResult<PullRequest>;
     async fn post_review(
         &self,
@@ -85,6 +87,7 @@ pub trait GitProvider: Send + Sync {
     async fn approve(&self, pr: &PullRequest, body: &str) -> AppResult<()>;
     /// `Authorization` header for git over HTTPS.
     fn git_auth_header(&self) -> String;
+    /// The ref the forge publishes a PR's head under, so forks can be fetched from the base repo.
     fn pr_fetch_ref(&self, number: u64) -> String;
 }
 

@@ -136,6 +136,8 @@ ALTER TABLE findings ADD COLUMN source TEXT NOT NULL DEFAULT 'reviewer';
 ",
 ];
 
+/// Applies the migrations the database has not seen yet, each in its own transaction.
+/// `PRAGMA user_version` counts the ones already applied.
 pub fn run(conn: &mut Connection) -> rusqlite::Result<()> {
     let current: usize = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     for (i, sql) in MIGRATIONS.iter().enumerate().skip(current) {
