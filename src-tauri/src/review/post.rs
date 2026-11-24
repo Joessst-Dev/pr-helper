@@ -1,15 +1,13 @@
 //! Posting the findings the user selected.
 
-use std::sync::Arc;
-
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
-use crate::db::models::{Finding, FindingSource, ProviderKind, Review, Side};
+use crate::db::models::{Finding, FindingSource, ProviderKind, PullRequest, Review, Side};
 use crate::error::{AppError, AppResult};
 use crate::git::diff::DiffIndex;
 use crate::git::repo_cache::FetchSpec;
-use crate::providers::{InlineComment, ReviewEvent, ReviewSubmission, fold_comment};
+use crate::providers::{GitProvider, InlineComment, ReviewEvent, ReviewSubmission, fold_comment};
 use crate::review::postprocess::finalize_body;
 use crate::service::Service;
 use crate::settings::EffectiveSettings;
@@ -123,28 +121,23 @@ pub fn build_inline(
     Ok((inline, general))
 }
 
-pub async fn post_findings(svc: &Arc<Service>, req: PostRequest) -> AppResult<PostOutcome> {
-    let review: Review = svc.db.get_review(&req.review_id)?;
-    let (server, provider) = svc.provider_for(&review.server_id)?;
-    let settings = svc.effective_settings(&review.server_id, Some(&review.repo))?;
-
-    let findings: Vec<Finding> = svc
-        .db
-        .list_findings(&review.id)?
-        .into_iter()
-        .filter(|f| req.finding_ids.contains(&f.id) && f.posted_at.is_none())
-        .collect();
-
-    let mut pr = provider.get_pr(&review.project_id, review.number).await?;
-    let head_moved = pr.head_sha != review.head_sha;
-    if head_moved && req.mode == SubmitMode::Approve && server.kind == ProviderKind::Gitlab {
-        // GitLab approves the merge request as a whole, which now includes unreviewed commits.
-        return Err(AppError::invalid(
-            "new commits arrived after this review; run a new review before approving",
-        ));
+impl From<SubmitMode> for ReviewEvent {
+    fn from(mode: SubmitMode) -> Self {
+        match mode {
+            SubmitMode::Comment => Self::Comment,
+            SubmitMode::RequestChanges => Self::RequestChanges,
+            SubmitMode::Approve => Self::Approve,
+        }
     }
+}
 
-    // Rebuild the diff index for the reviewed commit to validate anchors.
+/// Rebuilds the diff index of the reviewed commit, which the anchors were validated against.
+async fn reviewed_index(
+    svc: &Service,
+    provider: &dyn GitProvider,
+    review: &Review,
+    pr: &PullRequest,
+) -> AppResult<DiffIndex> {
     let base = review
         .base_sha
         .as_deref()
@@ -170,7 +163,33 @@ pub async fn post_findings(svc: &Arc<Service>, req: PostRequest) -> AppResult<Po
             auth_header: Some(&auth),
         })
         .await?;
-    let index = DiffIndex::parse(&svc.cache.diff(&bare, base, &review.head_sha).await?);
+    Ok(DiffIndex::parse(
+        &svc.cache.diff(&bare, base, &review.head_sha).await?,
+    ))
+}
+
+pub async fn post_findings(svc: &Service, req: PostRequest) -> AppResult<PostOutcome> {
+    let review: Review = svc.db.get_review(&req.review_id)?;
+    let (server, provider) = svc.provider_for(&review.server_id)?;
+    let settings = svc.effective_settings(&review.server_id, Some(&review.repo))?;
+
+    let findings: Vec<Finding> = svc
+        .db
+        .list_findings(&review.id)?
+        .into_iter()
+        .filter(|f| req.finding_ids.contains(&f.id) && f.posted_at.is_none())
+        .collect();
+
+    let mut pr = provider.get_pr(&review.project_id, review.number).await?;
+    let head_moved = pr.head_sha != review.head_sha;
+    if head_moved && req.mode == SubmitMode::Approve && server.kind == ProviderKind::Gitlab {
+        // GitLab approves the merge request as a whole, which now includes unreviewed commits.
+        return Err(AppError::invalid(
+            "new commits arrived after this review; run a new review before approving",
+        ));
+    }
+
+    let index = reviewed_index(svc, provider.as_ref(), &review, &pr).await?;
     let (mut inline, general) = build_inline(&findings, &index, &settings)?;
 
     let mut folded_ids: Vec<String> = Vec::with_capacity(general.len());
@@ -193,18 +212,14 @@ pub async fn post_findings(svc: &Arc<Service>, req: PostRequest) -> AppResult<Po
             // GitLab positions must match the current diff version; post as general notes.
             ProviderKind::Gitlab => {
                 for c in inline.drain(..) {
-                    body_parts.push(fold_comment(&c, ""));
+                    body_parts.push(fold_comment(&c));
                     folded_ids.push(c.finding_id);
                 }
             }
         }
     }
 
-    let event = match req.mode {
-        SubmitMode::Comment => ReviewEvent::Comment,
-        SubmitMode::RequestChanges => ReviewEvent::RequestChanges,
-        SubmitMode::Approve => ReviewEvent::Approve,
-    };
+    let event = ReviewEvent::from(req.mode);
     if inline.is_empty() && body_parts.is_empty() && event == ReviewEvent::Comment {
         return Err(AppError::invalid(
             "nothing to post: select at least one finding or add a summary",
@@ -279,7 +294,7 @@ mod tests {
             selected: true,
             posted_at: None,
             posted_ref: None,
-            source: Default::default(),
+            source: FindingSource::Reviewer,
         }
     }
 

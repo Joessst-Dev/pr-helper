@@ -82,105 +82,19 @@ pub struct DiffIndex {
 impl DiffIndex {
     pub fn parse(diff: &str) -> Self {
         let mut files = HashMap::new();
-        let mut current: Option<FileDiff> = None;
-        let (mut old_no, mut new_no) = (0u32, 0u32);
-        let mut in_hunk = false;
-        let mut hunk = 0usize;
-
-        let flush = |f: Option<FileDiff>, files: &mut HashMap<String, FileDiff>| {
-            if let Some(f) = f {
-                let key = if f.new_path.is_empty() {
-                    f.old_path.clone()
-                } else {
-                    f.new_path.clone()
-                };
-                files.insert(key, f);
-            }
-        };
-
+        let mut current: Option<FileParser> = None;
         for raw in diff.lines() {
             if let Some(rest) = raw.strip_prefix("diff --git ") {
-                flush(current.take(), &mut files);
-                let (a, b) = split_git_header(rest);
-                current = Some(FileDiff {
-                    old_path: a,
-                    new_path: b,
-                    ..Default::default()
-                });
-                in_hunk = false;
-                continue;
-            }
-            let Some(file) = current.as_mut() else {
-                continue;
-            };
-
-            if !in_hunk || raw.starts_with("@@") {
-                // `/dev/null` marks an added or deleted file: keep the header's path for that
-                // side, since GitHub and GitLab both expect the file's real path there.
-                if let Some(p) = raw.strip_prefix("--- ") {
-                    if let Some(p) = strip_prefix_path(p, "a/") {
-                        file.old_path = p;
-                    }
-                } else if let Some(p) = raw.strip_prefix("+++ ") {
-                    if let Some(p) = strip_prefix_path(p, "b/") {
-                        file.new_path = p;
-                    }
-                } else if let Some(p) = raw.strip_prefix("rename from ") {
-                    file.old_path = unquote(p);
-                } else if let Some(p) = raw.strip_prefix("rename to ") {
-                    file.new_path = unquote(p);
-                } else if raw.starts_with("@@")
-                    && let Some((o, n)) = parse_hunk_header(raw)
-                {
-                    old_no = o;
-                    new_no = n;
-                    in_hunk = true;
-                    // Lines are pushed before the next header, so the first hunk is 0.
-                    hunk = file.lines.last().map_or(0, |l| l.hunk + 1);
+                if let Some(done) = current.replace(FileParser::new(rest)) {
+                    done.finish_into(&mut files);
                 }
-                continue;
-            }
-
-            match raw.as_bytes().first() {
-                Some(b' ') | None => {
-                    file.right.insert(new_no, Some(old_no));
-                    file.lines.push(DiffLine {
-                        hunk,
-                        kind: LineKind::Context,
-                        old: Some(old_no),
-                        new: Some(new_no),
-                        text: raw.get(1..).unwrap_or("").to_string(),
-                    });
-                    old_no += 1;
-                    new_no += 1;
-                }
-                Some(b'+') => {
-                    file.right.insert(new_no, None);
-                    file.lines.push(DiffLine {
-                        hunk,
-                        kind: LineKind::Added,
-                        old: None,
-                        new: Some(new_no),
-                        text: raw[1..].to_string(),
-                    });
-                    new_no += 1;
-                }
-                Some(b'-') => {
-                    file.left.insert(old_no);
-                    file.lines.push(DiffLine {
-                        hunk,
-                        kind: LineKind::Removed,
-                        old: Some(old_no),
-                        new: None,
-                        text: raw[1..].to_string(),
-                    });
-                    old_no += 1;
-                }
-                Some(b'\\') => {} // "\ No newline at end of file"
-                _ => in_hunk = false,
+            } else if let Some(parser) = current.as_mut() {
+                parser.line(raw);
             }
         }
-        flush(current.take(), &mut files);
+        if let Some(done) = current {
+            done.finish_into(&mut files);
+        }
         Self { files }
     }
 
@@ -269,6 +183,118 @@ impl DiffIndex {
             let _ = write!(out, "{mark}{no:>5} {}", l.text);
         }
         Some(out)
+    }
+}
+
+/// Parser state for one file's section of a unified diff.
+struct FileParser {
+    file: FileDiff,
+    old_no: u32,
+    new_no: u32,
+    in_hunk: bool,
+    hunk: usize,
+}
+
+impl FileParser {
+    /// Starts a file from the rest of its `diff --git` line.
+    fn new(header: &str) -> Self {
+        let (old_path, new_path) = split_git_header(header);
+        Self {
+            file: FileDiff {
+                old_path,
+                new_path,
+                ..Default::default()
+            },
+            old_no: 0,
+            new_no: 0,
+            in_hunk: false,
+            hunk: 0,
+        }
+    }
+
+    fn line(&mut self, raw: &str) {
+        if !self.in_hunk || raw.starts_with("@@") {
+            self.header_line(raw);
+        } else {
+            self.hunk_line(raw);
+        }
+    }
+
+    fn header_line(&mut self, raw: &str) {
+        let file = &mut self.file;
+        // `/dev/null` marks an added or deleted file: keep the header's path for that
+        // side, since GitHub and GitLab both expect the file's real path there.
+        if let Some(p) = raw.strip_prefix("--- ") {
+            if let Some(p) = strip_prefix_path(p, "a/") {
+                file.old_path = p;
+            }
+        } else if let Some(p) = raw.strip_prefix("+++ ") {
+            if let Some(p) = strip_prefix_path(p, "b/") {
+                file.new_path = p;
+            }
+        } else if let Some(p) = raw.strip_prefix("rename from ") {
+            file.old_path = unquote(p);
+        } else if let Some(p) = raw.strip_prefix("rename to ") {
+            file.new_path = unquote(p);
+        } else if raw.starts_with("@@")
+            && let Some((old, new)) = parse_hunk_header(raw)
+        {
+            self.old_no = old;
+            self.new_no = new;
+            self.in_hunk = true;
+            // Lines are pushed before the next header, so the first hunk is 0.
+            self.hunk = file.lines.last().map_or(0, |l| l.hunk + 1);
+        }
+    }
+
+    fn hunk_line(&mut self, raw: &str) {
+        let (old, new) = (self.old_no, self.new_no);
+        match raw.as_bytes().first() {
+            Some(b' ') | None => {
+                self.file.right.insert(new, Some(old));
+                self.push(
+                    LineKind::Context,
+                    Some(old),
+                    Some(new),
+                    raw.get(1..).unwrap_or(""),
+                );
+                self.old_no += 1;
+                self.new_no += 1;
+            }
+            Some(b'+') => {
+                self.file.right.insert(new, None);
+                self.push(LineKind::Added, None, Some(new), &raw[1..]);
+                self.new_no += 1;
+            }
+            Some(b'-') => {
+                self.file.left.insert(old);
+                self.push(LineKind::Removed, Some(old), None, &raw[1..]);
+                self.old_no += 1;
+            }
+            Some(b'\\') => {} // "\ No newline at end of file"
+            _ => self.in_hunk = false,
+        }
+    }
+
+    fn push(&mut self, kind: LineKind, old: Option<u32>, new: Option<u32>, text: &str) {
+        self.file.lines.push(DiffLine {
+            hunk: self.hunk,
+            kind,
+            old,
+            new,
+            text: text.to_string(),
+        });
+    }
+
+    /// Files are keyed by their new path, or the old one for a deleted file.
+    fn finish_into(self, files: &mut HashMap<String, FileDiff>) {
+        let f = self.file;
+        let key = if f.new_path.is_empty() {
+            f.old_path.clone()
+        } else {
+            f.new_path.clone()
+        };
+        files.insert(key, f);
     }
 }
 

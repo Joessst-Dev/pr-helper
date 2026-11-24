@@ -106,12 +106,10 @@ pub fn http_client() -> reqwest::Client {
         .expect("the HTTP client can be built")
 }
 
-pub fn make_provider(
-    server: &Server,
-    token: String,
-    username: Option<String>,
-) -> Arc<dyn GitProvider> {
+/// The provider client for a server. A username known from an earlier login saves a lookup.
+pub fn make_provider(server: &Server, token: String) -> Arc<dyn GitProvider> {
     let client = http_client();
+    let username = server.username.clone();
     match server.kind {
         ProviderKind::Github => Arc::new(github::GitHub::new(server, token, username, client)),
         ProviderKind::Gitlab => Arc::new(gitlab::GitLab::new(server, token, username, client)),
@@ -147,11 +145,11 @@ pub async fn check(
 }
 
 /// Markdown block appended under a heading when a comment can't be attached inline.
-pub fn fold_comment(c: &InlineComment, suggestion_fence: &str) -> String {
+pub fn fold_comment(c: &InlineComment) -> String {
     let mut s = format!("**{}:{}**\n\n{}", c.path, c.line, c.body);
     if let Some(sugg) = &c.suggestion {
         let fence = fence_for(sugg);
-        let _ = write!(s, "\n\n{fence}{suggestion_fence}\n{sugg}\n{fence}");
+        let _ = write!(s, "\n\n{fence}\n{sugg}\n{fence}");
     }
     s
 }

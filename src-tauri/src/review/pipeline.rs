@@ -1,7 +1,6 @@
 //! One review run: fetch, prepare context, run Claude, store findings, follow-up actions.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
@@ -14,10 +13,12 @@ use crate::env;
 use crate::error::{AppError, AppResult};
 use crate::git::diff::DiffIndex;
 use crate::git::repo_cache::{FetchSpec, TreeEntry};
+use crate::providers::GitProvider;
 use crate::review::guard::steering_attempt;
 use crate::review::postprocess::{finalize_body, process};
+use crate::review::prompt::SkillInfo;
 use crate::review::prompt::{PreviousReview, PromptInput, system_prompt, user_prompt};
-use crate::review::runner::{self, RunEvent, RunRequest, ToolPolicy};
+use crate::review::runner::{self, RunEvent, RunOutcome, RunRequest, ToolPolicy};
 use crate::review::schema::{RawReview, review_schema};
 use crate::review::skills::build_plugin;
 use crate::service::{ProgressKind, Service, TicketPlan};
@@ -25,7 +26,7 @@ use crate::settings::EffectiveSettings;
 use crate::tickets::{Ticket, render};
 
 pub async fn run_review(
-    svc: &Arc<Service>,
+    svc: &Service,
     review_id: &str,
     pr: PullRequest,
     trigger: ReviewTrigger,
@@ -93,7 +94,7 @@ async fn cleanup(svc: &Service, pr: &PullRequest, review_dir: &Path) {
 }
 
 async fn execute(
-    svc: &Arc<Service>,
+    svc: &Service,
     review_id: &str,
     pr: &PullRequest,
     review_dir: &Path,
@@ -107,87 +108,28 @@ async fn execute(
         svc.cache.set_git(git);
     }
 
-    let clone_url = pr.clone_url.clone().ok_or_else(|| {
-        AppError::invalid("the provider returned no clone URL for this repository")
-    })?;
-
-    svc.progress(review_id, ProgressKind::Status, "Fetching repository");
-    let auth = provider.git_auth_header();
-    let pr_ref = provider.pr_fetch_ref(pr.number);
-    let bare = svc
-        .cache
-        .ensure_pr(&FetchSpec {
-            server_id: &pr.server_id,
-            repo: &pr.repo,
-            clone_url: &clone_url,
-            pr_ref: &pr_ref,
-            number: pr.number,
-            base_ref: &pr.base_ref,
-            head_sha: &pr.head_sha,
-            base_sha: pr.base_sha.as_deref(),
-            auth_header: Some(&auth),
-        })
-        .await?;
-    check_cancel(&cancel)?;
-
-    let base = svc
-        .cache
-        .base_commit(&bare, pr.base_sha.as_deref(), &pr.base_ref)
-        .await?;
-    svc.db.set_review_base(review_id, &base)?;
-    let diff = svc.cache.diff(&bare, &base, &pr.head_sha).await?;
-    let index = DiffIndex::parse(&diff);
-    let merge_base = svc
-        .cache
-        .merge_base(&bare, &base, &pr.head_sha)
-        .await
-        .unwrap_or_else(|_| base.clone());
-    let commits = svc
-        .cache
-        .commit_log(&bare, &merge_base, &pr.head_sha)
-        .await
-        .unwrap_or_default();
+    let fetched = fetch_and_diff(svc, review_id, pr, provider.as_ref(), &cancel).await?;
 
     let tickets = load_tickets(svc, review_id, pr, &settings, review_dir, &cancel).await;
     check_cancel(&cancel)?;
-
     let steering = steering_attempt(
         &pr.title,
         &pr.description,
-        &commits,
-        &diff,
+        &fetched.commits,
+        &fetched.diff,
         &render::guard_text(&tickets),
     );
 
     // Context files live next to (not inside) the worktree so they never show up as repo files.
     let context_dir = review_dir.join("context");
-    tokio::fs::create_dir_all(&context_dir).await?;
     let has_tickets = !tickets.is_empty();
-    if has_tickets {
-        tokio::fs::write(context_dir.join("tickets.md"), render::render(&tickets)).await?;
-        let refs: Vec<TicketRef> = tickets
-            .iter()
-            .map(|t| TicketRef {
-                key: t.key.clone(),
-                url: t.url.clone(),
-            })
-            .collect();
-        svc.db.set_review_tickets(review_id, &refs)?;
-        svc.publish_review(review_id);
-    }
-    tokio::fs::write(context_dir.join("pr.diff"), &diff).await?;
-    tokio::fs::write(context_dir.join("commits.txt"), &commits).await?;
-    tokio::fs::write(
-        context_dir.join("description.md"),
-        format!("# {}\n\n{}", pr.title, pr.description),
-    )
-    .await?;
+    write_context(svc, review_id, pr, &context_dir, &fetched, tickets).await?;
 
     let previous = svc
         .db
         .last_done_review(&pr.server_id, &pr.repo, pr.number)?;
     // The user's own comments are not the reviewer's to re-report.
-    let previous_findings = match &previous {
+    let previous_findings: Vec<_> = match &previous {
         Some(p) => svc
             .db
             .list_findings(&p.id)?
@@ -196,46 +138,29 @@ async fn execute(
             .collect(),
         None => Vec::new(),
     };
-    let mut has_incremental = false;
-    if let Some(prev) = previous.as_ref().filter(|p| p.head_sha != pr.head_sha)
-        && let Ok(inc) = svc
-            .cache
-            .diff_between(&bare, &prev.head_sha, &pr.head_sha)
-            .await
-    {
-        tokio::fs::write(context_dir.join("incremental.diff"), inc).await?;
-        has_incremental = true;
-    }
+    let has_incremental = match previous.as_ref().filter(|p| p.head_sha != pr.head_sha) {
+        Some(prev) => {
+            write_incremental_diff(svc, &fetched.bare, &prev.head_sha, pr, &context_dir).await?
+        }
+        None => false,
+    };
 
     svc.progress(review_id, ProgressKind::Status, "Checking out PR head");
     let worktree = review_dir.join("worktree");
     svc.cache
-        .add_worktree(&bare, &worktree, &pr.head_sha)
+        .add_worktree(&fetched.bare, &worktree, &pr.head_sha)
         .await?;
     check_cancel(&cancel)?;
 
-    let skills = svc.db.skills_for_review(&pr.server_id, &pr.repo)?;
-    let plugin = build_plugin(&skills, &review_dir.join("plugin")).await?;
-    let (plugin_dir, skill_infos): (Option<PathBuf>, Vec<_>) = match plugin {
-        Some((dir, infos)) => (Some(dir), infos),
-        None => (None, Vec::new()),
-    };
-    if !skill_infos.is_empty() {
-        svc.progress(
-            review_id,
-            ProgressKind::Status,
-            format!("Loaded {} review skill(s)", skill_infos.len()),
-        );
-    }
-
+    let (plugin_dir, skill_infos) = prepare_skills(svc, review_id, pr, review_dir).await?;
     let prompt = user_prompt(&PromptInput {
         pr,
-        base: &base,
+        base: &fetched.base,
         head: &pr.head_sha,
         settings: &settings,
         skills: &skill_infos,
         context_dir: &context_dir,
-        changed_files: index.len(),
+        changed_files: fetched.index.len(),
         previous: previous.as_ref().map(|p| PreviousReview {
             reviewed_sha: &p.head_sha,
             verdict: p.verdict,
@@ -247,14 +172,12 @@ async fn execute(
 
     let session_id = uuid::Uuid::new_v4().to_string();
     svc.db.set_review_session(review_id, &session_id)?;
-    svc.progress(review_id, ProgressKind::Status, "Reviewer running");
-
     let request = RunRequest {
         policy: ToolPolicy::Reviewer,
         claude,
         path_env: env::login_path().to_string(),
-        cwd: worktree.clone(),
-        add_dirs: vec![context_dir.clone()],
+        cwd: worktree,
+        add_dirs: vec![context_dir],
         plugin_dir,
         system_prompt: system_prompt(&settings, has_tickets),
         prompt,
@@ -265,33 +188,17 @@ async fn execute(
         max_budget_usd: settings.max_budget_usd.value,
         timeout: Duration::from_secs(u64::from(config.review_timeout_mins.max(1)) * 60),
     };
-    let svc_events = svc.clone();
-    let rid = review_id.to_string();
-    let outcome = runner::run(request, cancel.clone(), move |event| match event {
-        RunEvent::Started { model, .. } => {
-            svc_events.progress(&rid, ProgressKind::Status, format!("Model: {model}"))
-        }
-        RunEvent::Tool { name, detail } => {
-            let detail = detail.replace(&worktree.to_string_lossy().to_string(), ".");
-            svc_events.progress(
-                &rid,
-                ProgressKind::Tool,
-                format!("{name} {detail}").trim().to_string(),
-            )
-        }
-        RunEvent::Text(text) => svc_events.progress(&rid, ProgressKind::Text, text),
-    })
-    .await?;
+    let outcome = run_reviewer(svc, review_id, request, cancel.clone()).await?;
 
     let raw: RawReview = serde_json::from_value(outcome.output)
         .map_err(|e| AppError::Reviewer(format!("unexpected review format: {e}")))?;
-    let processed = process(raw, review_id, &settings, &index, has_tickets);
+    let processed = process(raw, review_id, &settings, &fetched.index, has_tickets);
     let files = snapshot_files(
         svc,
         review_id,
-        &bare,
+        &fetched.bare,
         &pr.head_sha,
-        &index,
+        &fetched.index,
         processed.critical_files,
         &cancel,
     )
@@ -313,6 +220,176 @@ async fn execute(
         Some(processed.verdict),
     )?;
     Ok((processed.verdict, steering))
+}
+
+/// The PR's commits in the local cache, and what changed between base and head.
+struct Fetched {
+    bare: PathBuf,
+    base: String,
+    diff: String,
+    index: DiffIndex,
+    commits: String,
+}
+
+async fn fetch_and_diff(
+    svc: &Service,
+    review_id: &str,
+    pr: &PullRequest,
+    provider: &dyn GitProvider,
+    cancel: &CancellationToken,
+) -> AppResult<Fetched> {
+    let clone_url = pr.clone_url.as_deref().ok_or_else(|| {
+        AppError::invalid("the provider returned no clone URL for this repository")
+    })?;
+    svc.progress(review_id, ProgressKind::Status, "Fetching repository");
+    let auth = provider.git_auth_header();
+    let pr_ref = provider.pr_fetch_ref(pr.number);
+    let bare = svc
+        .cache
+        .ensure_pr(&FetchSpec {
+            server_id: &pr.server_id,
+            repo: &pr.repo,
+            clone_url,
+            pr_ref: &pr_ref,
+            number: pr.number,
+            base_ref: &pr.base_ref,
+            head_sha: &pr.head_sha,
+            base_sha: pr.base_sha.as_deref(),
+            auth_header: Some(&auth),
+        })
+        .await?;
+    check_cancel(cancel)?;
+
+    let base = svc
+        .cache
+        .base_commit(&bare, pr.base_sha.as_deref(), &pr.base_ref)
+        .await?;
+    svc.db.set_review_base(review_id, &base)?;
+    let diff = svc.cache.diff(&bare, &base, &pr.head_sha).await?;
+    let index = DiffIndex::parse(&diff);
+    // The commit list is context only: without a merge base, list from the base instead, and
+    // without a list, review without one.
+    let merge_base = svc.cache.merge_base(&bare, &base, &pr.head_sha).await;
+    let commits = svc
+        .cache
+        .commit_log(&bare, merge_base.as_deref().unwrap_or(&base), &pr.head_sha)
+        .await
+        .unwrap_or_default();
+    Ok(Fetched {
+        bare,
+        base,
+        diff,
+        index,
+        commits,
+    })
+}
+
+/// Writes the review material the reviewer reads from the context dir.
+async fn write_context(
+    svc: &Service,
+    review_id: &str,
+    pr: &PullRequest,
+    context_dir: &Path,
+    fetched: &Fetched,
+    tickets: Vec<Ticket>,
+) -> AppResult<()> {
+    tokio::fs::create_dir_all(context_dir).await?;
+    if !tickets.is_empty() {
+        tokio::fs::write(context_dir.join("tickets.md"), render::render(&tickets)).await?;
+        let refs: Vec<TicketRef> = tickets
+            .into_iter()
+            .map(|t| TicketRef {
+                key: t.key,
+                url: t.url,
+            })
+            .collect();
+        svc.db.set_review_tickets(review_id, &refs)?;
+        svc.publish_review(review_id);
+    }
+    tokio::fs::write(context_dir.join("pr.diff"), &fetched.diff).await?;
+    tokio::fs::write(context_dir.join("commits.txt"), &fetched.commits).await?;
+    tokio::fs::write(
+        context_dir.join("description.md"),
+        format!("# {}\n\n{}", pr.title, pr.description),
+    )
+    .await?;
+    Ok(())
+}
+
+/// For a re-review, writes what changed since the previously reviewed head. Returns whether
+/// the file was written; without it the reviewer just reviews the whole diff.
+async fn write_incremental_diff(
+    svc: &Service,
+    bare: &Path,
+    reviewed_sha: &str,
+    pr: &PullRequest,
+    context_dir: &Path,
+) -> AppResult<bool> {
+    match svc
+        .cache
+        .diff_between(bare, reviewed_sha, &pr.head_sha)
+        .await
+    {
+        Ok(inc) => {
+            tokio::fs::write(context_dir.join("incremental.diff"), inc).await?;
+            Ok(true)
+        }
+        // E.g. after a force push the old head may be gone.
+        Err(e) => {
+            tracing::debug!("no incremental diff from {reviewed_sha}: {e}");
+            Ok(false)
+        }
+    }
+}
+
+/// Packages the configured review skills as a plugin. Returns its dir, if there is one, and
+/// what the prompt lists.
+async fn prepare_skills(
+    svc: &Service,
+    review_id: &str,
+    pr: &PullRequest,
+    review_dir: &Path,
+) -> AppResult<(Option<PathBuf>, Vec<SkillInfo>)> {
+    let skills = svc.db.skills_for_review(&pr.server_id, &pr.repo)?;
+    let (plugin_dir, skill_infos) = build_plugin(&skills, &review_dir.join("plugin"))
+        .await?
+        .unzip();
+    let skill_infos = skill_infos.unwrap_or_default();
+    if !skill_infos.is_empty() {
+        svc.progress(
+            review_id,
+            ProgressKind::Status,
+            format!("Loaded {} review skill(s)", skill_infos.len()),
+        );
+    }
+    Ok((plugin_dir, skill_infos))
+}
+
+/// Runs the reviewer and streams its progress to the review log.
+async fn run_reviewer(
+    svc: &Service,
+    review_id: &str,
+    request: RunRequest,
+    cancel: CancellationToken,
+) -> AppResult<RunOutcome> {
+    svc.progress(review_id, ProgressKind::Status, "Reviewer running");
+    // Tool details mention absolute paths in the checkout; show them relative to it.
+    let worktree = request.cwd.to_string_lossy().into_owned();
+    runner::run(request, cancel, |event| match event {
+        RunEvent::Started { model, .. } => {
+            svc.progress(review_id, ProgressKind::Status, format!("Model: {model}"));
+        }
+        RunEvent::Tool { name, detail } => {
+            let detail = detail.replace(&worktree, ".");
+            svc.progress(
+                review_id,
+                ProgressKind::Tool,
+                format!("{name} {detail}").trim().to_string(),
+            );
+        }
+        RunEvent::Text(text) => svc.progress(review_id, ProgressKind::Text, text),
+    })
+    .await
 }
 
 /// Files above this size are not stored; the UI shows only their diff.
@@ -384,7 +461,7 @@ async fn snapshot_files(
 /// Loads the tickets linked from the PR, if a ticket source is configured. Never fails the
 /// review: problems are reported in the review log and the review runs without them.
 async fn load_tickets(
-    svc: &Arc<Service>,
+    svc: &Service,
     review_id: &str,
     pr: &PullRequest,
     settings: &EffectiveSettings,
@@ -407,6 +484,7 @@ async fn load_tickets(
         TicketPlan::Ready { source, keys } => (source, keys),
     };
     let mut loaded = Vec::new();
+    let work_dir = review_dir.join("ticket-fetch");
     for key in keys {
         if cancel.is_cancelled() {
             break;
@@ -416,7 +494,6 @@ async fn load_tickets(
             ProgressKind::Status,
             format!("Loading ticket {key}"),
         );
-        let work_dir = review_dir.join("ticket-fetch");
         match svc
             .fetch_ticket(&source, &key, &work_dir, cancel.clone())
             .await
@@ -443,7 +520,7 @@ fn check_cancel(cancel: &CancellationToken) -> AppResult<()> {
 
 /// Notifications and auto-approval once a review is stored.
 async fn after_review(
-    svc: &Arc<Service>,
+    svc: &Service,
     review_id: &str,
     pr: &PullRequest,
     verdict: Verdict,
@@ -456,24 +533,20 @@ async fn after_review(
     let finding_count = svc.db.list_findings(review_id).map_or(0, |f| f.len());
     let label = format!("{}#{}", pr.repo, pr.number);
 
-    if verdict == Verdict::Approve
-        && settings.auto_approve_on_approve_verdict.value
-        && let Some(excerpt) = steering
-    {
-        // The model may have been talked into approving; a human has to decide.
-        svc.progress(
-            review_id,
-            ProgressKind::Error,
-            format!("Auto-approve skipped: the PR text addresses the reviewer (\"{excerpt}\")"),
-        );
-        svc.sink.notify(
-            &format!("Approve manually? {label}"),
-            "The reviewer approved, but the PR text seems to address the reviewer, so nothing was posted automatically.",
-        );
-        return;
-    }
-
     if verdict == Verdict::Approve && settings.auto_approve_on_approve_verdict.value {
+        if let Some(excerpt) = steering {
+            // The model may have been talked into approving; a human has to decide.
+            svc.progress(
+                review_id,
+                ProgressKind::Error,
+                format!("Auto-approve skipped: the PR text addresses the reviewer (\"{excerpt}\")"),
+            );
+            svc.sink.notify(
+                &format!("Approve manually? {label}"),
+                "The reviewer approved, but the PR text seems to address the reviewer, so nothing was posted automatically.",
+            );
+            return;
+        }
         match auto_approve(svc, review_id, pr, &settings).await {
             Ok(true) => {
                 svc.sink.notify(
@@ -523,7 +596,7 @@ async fn after_review(
 
 /// Returns Ok(false) when the PR moved on since the review.
 async fn auto_approve(
-    svc: &Arc<Service>,
+    svc: &Service,
     review_id: &str,
     pr: &PullRequest,
     settings: &EffectiveSettings,

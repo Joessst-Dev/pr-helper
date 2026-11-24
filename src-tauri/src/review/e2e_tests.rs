@@ -237,7 +237,7 @@ fn harness_with(
         secrets,
         tmp.path().join("cache"),
         sink.clone(),
-        Some(Box::new(move |_s, _t, _u| {
+        Some(Box::new(move |_s, _t| {
             Arc::new(FakeProvider {
                 pr: pr2.clone(),
                 recorded: rec2.clone(),
@@ -833,7 +833,7 @@ fn service_with(db: Arc<Db>, secrets: Arc<dyn SecretStore>, cache: PathBuf) -> A
         secrets,
         cache,
         Arc::new(RecordingSink::default()),
-        Some(Box::new(|_s, _t, _u| {
+        Some(Box::new(|_s, _t| {
             Arc::new(FakeProvider {
                 pr: dummy_pr(),
                 recorded: Arc::default(),

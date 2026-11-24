@@ -10,6 +10,7 @@ use super::{
     fold_comment,
 };
 use crate::db::models::{PrState, ProviderKind, PullRequest, Server, Side};
+use crate::db::non_empty;
 use crate::error::{AppError, AppResult};
 
 const NAME: &str = "GitHub";
@@ -60,12 +61,7 @@ impl GitHub {
             graphql,
             token,
             username: tokio::sync::OnceCell::new_with(username),
-            scope: server
-                .pr_scope
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_owned),
+            scope: non_empty(server.pr_scope.as_deref()).map(str::to_owned),
             client,
         }
     }
@@ -359,7 +355,7 @@ query($q: String!, $cursor: String) {
                     if !body.is_empty() {
                         body.push_str("\n\n");
                     }
-                    body.push_str(&fold_comment(c, ""));
+                    body.push_str(&fold_comment(c));
                 }
                 let v = self.submit(pr, event, &body, Vec::new()).await?;
                 (v, sub.inline.iter().map(|c| c.finding_id.clone()).collect())

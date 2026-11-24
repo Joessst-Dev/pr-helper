@@ -267,7 +267,7 @@ number, then the line with +, - or a space.\n\
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::models::{PrState, Severity, Side};
+    use crate::db::models::{FindingSource, PrState, Severity, Side};
     use crate::settings::{SettingsOverrides, resolve};
 
     fn pr() -> PullRequest {
@@ -385,7 +385,7 @@ mod tests {
             selected: true,
             posted_at: None,
             posted_ref: None,
-            source: Default::default(),
+            source: FindingSource::Reviewer,
         };
         let skills = [SkillInfo {
             name: "rust-safety".into(),

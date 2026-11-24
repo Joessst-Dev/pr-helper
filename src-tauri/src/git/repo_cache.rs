@@ -226,43 +226,30 @@ impl RepoCache {
 
     /// Three-dot diff (from the merge base), which is what GitHub and GitLab show.
     pub async fn diff(&self, bare: &Path, base: &str, head: &str) -> AppResult<String> {
-        self.run(
-            Some(bare),
-            &[
-                "diff",
-                "--no-color",
-                "--src-prefix=a/",
-                "--dst-prefix=b/",
-                "--no-ext-diff",
-                "--no-textconv",
-                "-U3",
-                "-M",
-                &format!("{base}...{head}"),
-            ],
-            None,
-        )
-        .await
+        self.git_diff(bare, &[&format!("{base}...{head}")]).await
     }
 
     /// Two-dot diff between two reviewed heads, for incremental re-reviews.
     pub async fn diff_between(&self, bare: &Path, from: &str, to: &str) -> AppResult<String> {
-        self.run(
-            Some(bare),
-            &[
-                "diff",
-                "--no-color",
-                "--src-prefix=a/",
-                "--dst-prefix=b/",
-                "--no-ext-diff",
-                "--no-textconv",
-                "-U3",
-                "-M",
-                from,
-                to,
-            ],
-            None,
-        )
-        .await
+        self.git_diff(bare, &[from, to]).await
+    }
+
+    /// Every diff the reviewer sees is made the same way, so their line numbers agree with the
+    /// index that anchors comments. No external diff drivers or textconv filters from the
+    /// repository run.
+    async fn git_diff(&self, bare: &Path, revs: &[&str]) -> AppResult<String> {
+        const FLAGS: [&str; 8] = [
+            "diff",
+            "--no-color",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+            "--no-ext-diff",
+            "--no-textconv",
+            "-U3",
+            "-M",
+        ];
+        let args: Vec<&str> = FLAGS.iter().chain(revs).copied().collect();
+        self.run(Some(bare), &args, None).await
     }
 
     pub async fn commit_log(&self, bare: &Path, base: &str, head: &str) -> AppResult<String> {

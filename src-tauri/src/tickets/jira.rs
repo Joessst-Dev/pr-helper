@@ -6,15 +6,12 @@ use reqwest::StatusCode;
 use serde_json::Value;
 
 use super::{
-    MAX_COMMENTS, Ticket, TicketAttachment, TicketComment, TicketTextFormat, browse_url,
-    is_displayable_image, is_valid_key, truncate,
+    MAX_COMMENT, MAX_COMMENTS, MAX_DESCRIPTION, MAX_FIELD, Ticket, TicketAttachment, TicketComment,
+    TicketTextFormat, browse_url, is_displayable_image, is_valid_key, truncate,
 };
 use crate::error::{AppError, AppResult};
 
 const NAME: &str = "Jira";
-const MAX_DESCRIPTION: usize = 8_000;
-const MAX_FIELD: usize = 4_000;
-const MAX_COMMENT: usize = 1_500;
 /// Largest image attachment the app downloads for display.
 pub const MAX_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
 const MAX_ATTACHMENTS: usize = 50;
@@ -42,10 +39,15 @@ impl JiraClient {
     }
 
     fn get(&self, path: &str) -> reqwest::RequestBuilder {
-        let req = self
-            .client
-            .get(format!("{}/rest/api/2{path}", self.base))
-            .header("Accept", "application/json");
+        self.authed(
+            self.client
+                .get(format!("{}/rest/api/2{path}", self.base))
+                .header("Accept", "application/json"),
+        )
+    }
+
+    /// Adds the credentials. Only for URLs on the configured Jira site.
+    fn authed(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         match &self.auth {
             JiraAuth::Basic { email, token } => req.basic_auth(email, Some(token)),
             JiraAuth::Bearer(token) => req.bearer_auth(token),
@@ -183,12 +185,7 @@ impl JiraClient {
         }
         // reqwest drops the Authorization header if Jira redirects to another host (Cloud
         // serves attachment bytes from its media service with a signed URL).
-        let req = self.client.get(url);
-        let req = match &self.auth {
-            JiraAuth::Basic { email, token } => req.basic_auth(email, Some(token)),
-            JiraAuth::Bearer(token) => req.bearer_auth(token),
-        };
-        let mut resp = req.send().await?;
+        let mut resp = self.authed(self.client.get(url)).send().await?;
         let status = resp.status();
         if !status.is_success() {
             return Err(AppError::Api {

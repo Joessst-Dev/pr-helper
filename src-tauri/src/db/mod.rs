@@ -145,11 +145,7 @@ impl Db {
                     input.kind.as_str(),
                     input.name.trim(),
                     normalize_base_url(&input.base_url),
-                    input
-                        .pr_scope
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty()),
+                    non_empty(input.pr_scope.as_deref()),
                     now()
                 ],
             )
@@ -166,7 +162,7 @@ impl Db {
                     input.kind.as_str(),
                     input.name.trim(),
                     normalize_base_url(&input.base_url),
-                    input.pr_scope.as_deref().map(str::trim).filter(|s| !s.is_empty()),
+                    non_empty(input.pr_scope.as_deref()),
                 ],
             )
         })?;
@@ -299,11 +295,7 @@ impl Db {
 
     pub fn upsert_skill(&self, id: Option<&str>, input: &SkillInput) -> AppResult<Skill> {
         let id = id.map_or_else(new_id, str::to_string);
-        let repo = input
-            .repo
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty());
+        let repo = non_empty(input.repo.as_deref());
         self.with(|c| {
             c.execute(
                 "INSERT INTO skills (id, server_id, repo, name, description, path, content, enabled, created_at)
@@ -391,12 +383,6 @@ impl Db {
         username: Option<&str>,
     ) -> AppResult<TicketSource> {
         let id = id.map_or_else(new_id, str::to_string);
-        let opt = |v: &Option<String>| {
-            v.as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-        };
         self.with(|c| {
             c.execute(
                 "INSERT INTO ticket_sources (id, kind, name, base_url, email, mcp_server, mcp_tools,
@@ -412,11 +398,11 @@ impl Db {
                     input.kind.as_str(),
                     input.name.trim(),
                     normalize_base_url(&input.base_url),
-                    opt(&input.email),
-                    opt(&input.mcp_server),
-                    opt(&input.mcp_tools),
-                    opt(&input.model),
-                    opt(&input.extra_fields),
+                    non_empty(input.email.as_deref()),
+                    non_empty(input.mcp_server.as_deref()),
+                    non_empty(input.mcp_tools.as_deref()),
+                    non_empty(input.model.as_deref()),
+                    non_empty(input.extra_fields.as_deref()),
                     username,
                     now()
                 ],
@@ -494,14 +480,11 @@ impl Db {
         })
     }
 
-    pub fn list_tracked(&self, only_active: bool) -> AppResult<Vec<TrackedPr>> {
+    /// The PRs still being watched, most recently updated first.
+    pub fn list_tracked(&self) -> AppResult<Vec<TrackedPr>> {
         self.with(|c| {
-            let sql = if only_active {
-                "SELECT * FROM tracked_prs WHERE active = 1 ORDER BY updated_at DESC"
-            } else {
-                "SELECT * FROM tracked_prs ORDER BY updated_at DESC"
-            };
-            let mut stmt = c.prepare(sql)?;
+            let mut stmt =
+                c.prepare("SELECT * FROM tracked_prs WHERE active = 1 ORDER BY updated_at DESC")?;
             let rows = stmt.query_map([], Self::tracked_from_row)?;
             rows.collect()
         })
@@ -595,11 +578,12 @@ impl Db {
             head_sha: r.get("head_sha")?,
             base_sha: r.get("base_sha")?,
             status: ReviewStatus::parse(&status),
-            trigger: if trigger == "auto" {
-                ReviewTrigger::Auto
-            } else {
-                ReviewTrigger::Manual
-            },
+            trigger: parsed_or(
+                ReviewTrigger::parse(&trigger),
+                ReviewTrigger::Manual,
+                "review trigger",
+                &trigger,
+            ),
             session_id: r.get("session_id")?,
             verdict: verdict.as_deref().and_then(Verdict::parse),
             summary: r.get("summary")?,
@@ -631,7 +615,7 @@ impl Db {
                     pr.title,
                     pr.head_sha,
                     pr.base_sha,
-                    if trigger == ReviewTrigger::Auto { "auto" } else { "manual" },
+                    trigger.as_str(),
                     now()
                 ],
             )
@@ -774,11 +758,7 @@ impl Db {
                     f.file,
                     f.line_start,
                     f.line_end,
-                    if f.side == Side::Left {
-                        "left"
-                    } else {
-                        "right"
-                    },
+                    f.side.as_str(),
                     f.explanation,
                     f.proposed_comment,
                     f.suggestion,
@@ -913,11 +893,7 @@ impl Db {
             file: r.get("file")?,
             line_start: r.get("line_start")?,
             line_end: r.get("line_end")?,
-            side: if side == "left" {
-                Side::Left
-            } else {
-                Side::Right
-            },
+            side: parsed_or(Side::parse(&side), Side::Right, "side", &side),
             explanation: r.get("explanation")?,
             proposed_comment: r.get("proposed_comment")?,
             suggestion: r.get("suggestion")?,
@@ -930,7 +906,7 @@ impl Db {
                 let source: String = r.get("source")?;
                 parsed_or(
                     FindingSource::parse(&source),
-                    FindingSource::default(),
+                    FindingSource::Reviewer,
                     "finding source",
                     &source,
                 )
@@ -980,7 +956,7 @@ impl Db {
         {
             let mut conn = self.conn.lock().unwrap_or_else(PoisonError::into_inner);
             let tx = conn.transaction()?;
-            let ranked: Vec<(u32, u8)> = {
+            let ranked: Vec<(u32, Severity)> = {
                 let mut stmt = tx.prepare(
                     "SELECT position, severity FROM findings WHERE review_id = ?1 ORDER BY position",
                 )?;
@@ -993,15 +969,14 @@ impl Db {
                             Severity::Low,
                             "severity",
                             &severity,
-                        )
-                        .rank(),
+                        ),
                     ))
                 })?
                 .collect::<rusqlite::Result<_>>()?
             };
             let position = ranked
                 .iter()
-                .filter(|(_, rank)| *rank <= f.severity.rank())
+                .filter(|(_, severity)| *severity <= f.severity)
                 .map(|(p, _)| p + 1)
                 .max()
                 .unwrap_or(0);
@@ -1025,11 +1000,7 @@ impl Db {
                     f.file,
                     f.line_start,
                     f.line_end,
-                    if f.side == Side::Left {
-                        "left"
-                    } else {
-                        "right"
-                    },
+                    f.side.as_str(),
                     f.proposed_comment,
                     f.in_diff,
                     f.selected,
@@ -1096,6 +1067,11 @@ fn parsed_or<T>(parsed: Option<T>, fallback: T, what: &str, raw: &str) -> T {
 
 fn json_col<T: serde::Serialize>(value: &T) -> rusqlite::Result<String> {
     serde_json::to_string(value).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
+}
+
+/// Trims optional user input; blank counts as unset.
+pub fn non_empty(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|s| !s.is_empty())
 }
 
 pub fn normalize_base_url(url: &str) -> String {
@@ -1343,7 +1319,7 @@ mod tests {
             selected: true,
             posted_at: None,
             posted_ref: None,
-            source: Default::default(),
+            source: FindingSource::Reviewer,
         };
         db.complete_review(
             &review.id,

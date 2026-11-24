@@ -14,9 +14,11 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    MAX_COMMENTS, Ticket, TicketComment, TicketTextFormat, browse_url, is_valid_key, truncate,
+    MAX_COMMENT, MAX_COMMENTS, MAX_DESCRIPTION, MAX_FIELD, Ticket, TicketComment, TicketTextFormat,
+    browse_url, is_valid_key, truncate,
 };
 use crate::db::models::TicketSource;
+use crate::db::non_empty;
 use crate::error::{AppError, AppResult};
 use crate::review::runner::{self, RunRequest, ToolPolicy};
 
@@ -211,11 +213,7 @@ pub async fn fetch(
         schema: schema(),
         session_id: uuid::Uuid::new_v4().to_string(),
         model: Some(
-            source
-                .model
-                .as_deref()
-                .map(str::trim)
-                .filter(|m| !m.is_empty())
+            non_empty(source.model.as_deref())
                 .unwrap_or(DEFAULT_MODEL)
                 .to_owned(),
         ),
@@ -243,7 +241,7 @@ fn to_ticket(raw: RawTicket, key: &str, base_url: &str) -> AppResult<Ticket> {
         summary: truncate(&raw.summary, 500),
         issue_type: truncate(&raw.issue_type, 100),
         status: truncate(&raw.status, 100),
-        description: truncate(&raw.description, 8_000),
+        description: truncate(&raw.description, MAX_DESCRIPTION),
         parent: raw
             .parent
             .map(|p| truncate(&p, 500))
@@ -252,7 +250,7 @@ fn to_ticket(raw: RawTicket, key: &str, base_url: &str) -> AppResult<Ticket> {
             .fields
             .into_iter()
             .filter(|f| !f.value.trim().is_empty())
-            .map(|f| (truncate(&f.name, 100), truncate(&f.value, 4_000)))
+            .map(|f| (truncate(&f.name, 100), truncate(&f.value, MAX_FIELD)))
             .collect(),
         comments: raw
             .comments
@@ -261,7 +259,7 @@ fn to_ticket(raw: RawTicket, key: &str, base_url: &str) -> AppResult<Ticket> {
             .map(|c| TicketComment {
                 author: truncate(&c.author, 100),
                 created: truncate(&c.created, 40),
-                body: truncate(&c.body, 1_500),
+                body: truncate(&c.body, MAX_COMMENT),
             })
             .collect(),
         comment_total: raw.comment_total.max(n),

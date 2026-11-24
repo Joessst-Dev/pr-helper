@@ -40,11 +40,13 @@ pub fn login_path() -> &'static str {
 }
 
 fn shell_path() -> Option<String> {
+    const MARKER: &str = "__PRH__";
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
     // `-i` loads rc files where tools like nvm add themselves; the marker isolates PATH
     // from anything those files print.
     let mut child = std::process::Command::new(shell)
-        .args(["-ilc", "printf '__PRH__%s__PRH__' \"$PATH\""])
+        .arg("-ilc")
+        .arg(format!("printf '{MARKER}%s{MARKER}' \"$PATH\""))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -76,11 +78,14 @@ fn shell_path() -> Option<String> {
         }
     }
     // A daemon started by an rc file can keep the pipe open after the shell exits.
-    let stdout = rx.recv_timeout(std::time::Duration::from_secs(1)).ok()?;
+    let stdout = rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .inspect_err(|_| tracing::warn!("login shell kept its output open; using defaults"))
+        .ok()?;
     let text = String::from_utf8_lossy(&stdout);
-    let start = text.find("__PRH__")? + 7;
-    let end = text[start..].find("__PRH__")? + start;
-    Some(text[start..end].to_string())
+    let (_, rest) = text.split_once(MARKER)?;
+    let (path, _) = rest.split_once(MARKER)?;
+    Some(path.to_string())
 }
 
 fn which_in(name: &str, path: &str) -> Option<PathBuf> {

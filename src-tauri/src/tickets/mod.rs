@@ -21,6 +21,10 @@ use ts_rs::TS;
 pub const MAX_TICKETS: usize = 3;
 /// The last N comments of a ticket are included.
 pub const MAX_COMMENTS: usize = 10;
+/// Ticket text is cut to these many characters, whichever fetcher loaded it.
+pub const MAX_DESCRIPTION: usize = 8_000;
+pub const MAX_FIELD: usize = 4_000;
+pub const MAX_COMMENT: usize = 1_500;
 
 static KEY_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^[A-Z][A-Z0-9_]{0,49}-[1-9][0-9]{0,9}$").expect("hard-coded regex is valid")

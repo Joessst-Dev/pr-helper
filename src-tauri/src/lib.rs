@@ -70,7 +70,7 @@ fn update_tray(app: &AppHandle) {
     };
     let new_changes = svc
         .db
-        .list_tracked(true)
+        .list_tracked()
         .map_or(0, |t| t.iter().filter(|t| t.has_new_changes).count());
     let running = svc.queue.active_count();
     let mut tooltip = String::from("PR Helper");

@@ -11,7 +11,7 @@ use crate::env;
 use crate::error::{AppError, AppResult};
 use crate::providers::PrFilter;
 use crate::review::post::{self, PostOutcome, PostRequest};
-use crate::review::postprocess::{CommentCheck, check_comment};
+use crate::review::postprocess::{Attribution, CommentCheck, check_comment};
 use crate::review::queue;
 use crate::review::skills::validate_skill_dir;
 use crate::review::user_comment::{self, CommentAdvice, UserCommentInput};
@@ -335,7 +335,7 @@ pub fn check_comment_text(
     text: String,
 ) -> AppResult<CommentCheck> {
     let settings = svc.effective_settings(&server_id, Some(&repo))?;
-    Ok(check_comment(&text, settings.forbid_ai_attribution.value))
+    Ok(check_comment(&text, Attribution::from_settings(&settings)))
 }
 
 #[tauri::command]
@@ -368,7 +368,7 @@ pub fn resume_command(svc: Svc<'_>, review_id: String) -> AppResult<String> {
 
 #[tauri::command]
 pub fn list_tracked(svc: Svc<'_>) -> AppResult<Vec<TrackedPr>> {
-    svc.db.list_tracked(true)
+    svc.db.list_tracked()
 }
 
 #[tauri::command]

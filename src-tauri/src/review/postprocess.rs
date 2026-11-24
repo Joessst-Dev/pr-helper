@@ -14,7 +14,7 @@ use std::sync::LazyLock;
 
 use regex::{Captures, Regex};
 
-use crate::db::models::{CriticalFile, Finding, LineRange, Severity, Side, Verdict};
+use crate::db::models::{CriticalFile, Finding, FindingSource, LineRange, Severity, Side, Verdict};
 use crate::db::new_id;
 use crate::error::{AppError, AppResult};
 use crate::git::diff::DiffIndex;
@@ -397,13 +397,29 @@ pub fn attribution_violations(text: &str) -> Vec<String> {
 static BLANK_RUN_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\n{3,}").expect("hard-coded regex is valid"));
 
+/// Whether AI attribution is stripped from comments (`forbid_ai_attribution`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Attribution {
+    Allowed,
+    Forbidden,
+}
+
+impl Attribution {
+    pub fn from_settings(settings: &EffectiveSettings) -> Self {
+        if settings.forbid_ai_attribution.value {
+            Self::Forbidden
+        } else {
+            Self::Allowed
+        }
+    }
+}
+
 /// Sanitize text that will be posted.
-pub fn sanitize_comment(text: &str, forbid_attribution: bool) -> String {
+pub fn sanitize_comment(text: &str, attribution: Attribution) -> String {
     let text = text.replace("\r\n", "\n");
-    let text = if forbid_attribution {
-        strip_attribution(&text)
-    } else {
-        text
+    let text = match attribution {
+        Attribution::Forbidden => strip_attribution(&text),
+        Attribution::Allowed => text,
     };
     let text = sanitize_dashes(&text);
     BLANK_RUN_RE.replace_all(&text, "\n\n").trim().to_string()
@@ -419,25 +435,24 @@ pub struct CommentCheck {
     pub sanitized: String,
 }
 
-pub fn check_comment(text: &str, forbid_attribution: bool) -> CommentCheck {
+pub fn check_comment(text: &str, attribution: Attribution) -> CommentCheck {
     CommentCheck {
         dash_violations: dash_violations(text),
-        attribution_violations: if forbid_attribution {
-            attribution_violations(text)
-        } else {
-            Vec::new()
+        attribution_violations: match attribution {
+            Attribution::Forbidden => attribution_violations(text),
+            Attribution::Allowed => Vec::new(),
         },
-        sanitized: sanitize_comment(text, forbid_attribution),
+        sanitized: sanitize_comment(text, attribution),
     }
 }
 
 /// Final gate before posting: sanitize, append the optional footer, and refuse if anything
 /// forbidden survives.
 pub fn finalize_body(text: &str, settings: &EffectiveSettings) -> AppResult<String> {
-    let forbid = settings.forbid_ai_attribution.value;
-    let mut body = sanitize_comment(text, forbid);
+    let attribution = Attribution::from_settings(settings);
+    let mut body = sanitize_comment(text, attribution);
     let footer = settings.attribution_footer.value.trim();
-    if !forbid && !footer.is_empty() && !body.is_empty() {
+    if attribution == Attribution::Allowed && !footer.is_empty() && !body.is_empty() {
         body = format!("{body}\n\n{}", sanitize_dashes(footer));
     }
     let dashes = dash_violations(&body);
@@ -447,12 +462,12 @@ pub fn finalize_body(text: &str, settings: &EffectiveSettings) -> AppResult<Stri
             dashes.join(" | ")
         )));
     }
-    if forbid {
-        let attribution = attribution_violations(&body);
-        if !attribution.is_empty() {
+    if attribution == Attribution::Forbidden {
+        let remaining = attribution_violations(&body);
+        if !remaining.is_empty() {
             return Err(AppError::invalid(format!(
                 "refusing to post: AI attribution remains in: {}",
-                attribution.join(" | ")
+                remaining.join(" | ")
             )));
         }
     }
@@ -462,8 +477,7 @@ pub fn finalize_body(text: &str, settings: &EffectiveSettings) -> AppResult<Stri
 pub fn sort_findings(findings: &mut [Finding]) {
     findings.sort_by(|a, b| {
         a.severity
-            .rank()
-            .cmp(&b.severity.rank())
+            .cmp(&b.severity)
             .then_with(|| a.file.is_none().cmp(&b.file.is_none()))
             .then_with(|| a.file.cmp(&b.file))
             .then_with(|| a.line_start.cmp(&b.line_start))
@@ -491,18 +505,18 @@ pub fn process(
     diff: &DiffIndex,
     has_tickets: bool,
 ) -> Processed {
-    let forbid = settings.forbid_ai_attribution.value;
+    let attribution = Attribution::from_settings(settings);
     let min_selected = settings.default_selected_min_severity.value;
     let scope_allowed = has_tickets && settings.ticket_scope_check.value;
 
     let mut findings: Vec<Finding> = raw
         .findings
         .into_iter()
-        .filter_map(|f| to_finding(f, review_id, forbid, diff))
+        .filter_map(|f| to_finding(f, review_id, attribution, diff))
         .filter(|f| !(settings.skip_nits.value && f.severity == Severity::Nit))
         .filter(|f| scope_allowed || f.category != SCOPE_CATEGORY)
         .map(|mut f| {
-            if f.category == SCOPE_CATEGORY && f.severity.rank() < Severity::Medium.rank() {
+            if f.category == SCOPE_CATEGORY && f.severity < Severity::Medium {
                 f.severity = Severity::Medium;
             }
             f
@@ -510,20 +524,13 @@ pub fn process(
         .collect();
     sort_findings(&mut findings);
     for f in &mut findings {
-        f.selected = f.severity.rank() <= min_selected.rank() && !f.proposed_comment.is_empty();
+        f.selected = f.severity <= min_selected && !f.proposed_comment.is_empty();
     }
 
     let mut verdict = Verdict::parse(raw.verdict.trim()).unwrap_or(Verdict::Comment);
     // Never let an approve verdict through with blocking findings.
-    if verdict == Verdict::Approve
-        && findings
-            .iter()
-            .any(|f| f.severity.rank() <= Severity::Medium.rank())
-    {
-        verdict = if findings
-            .iter()
-            .any(|f| f.severity.rank() <= Severity::High.rank())
-        {
+    if verdict == Verdict::Approve && findings.iter().any(|f| f.severity <= Severity::Medium) {
+        verdict = if findings.iter().any(|f| f.severity <= Severity::High) {
             Verdict::RequestChanges
         } else {
             Verdict::Comment
@@ -532,7 +539,7 @@ pub fn process(
 
     Processed {
         verdict,
-        summary: sanitize_comment(&raw.summary, forbid),
+        summary: sanitize_comment(&raw.summary, attribution),
         findings,
         critical_files: critical_files(raw.critical_files, diff),
     }
@@ -601,7 +608,12 @@ fn normalize_path(p: &str, diff: &DiffIndex) -> String {
         .to_string()
 }
 
-fn to_finding(f: RawFinding, review_id: &str, forbid: bool, diff: &DiffIndex) -> Option<Finding> {
+fn to_finding(
+    f: RawFinding,
+    review_id: &str,
+    attribution: Attribution,
+    diff: &DiffIndex,
+) -> Option<Finding> {
     let severity = Severity::parse(&f.severity).unwrap_or(Severity::Low);
     let side = match f.side.as_deref() {
         Some("left") => Side::Left,
@@ -626,8 +638,8 @@ fn to_finding(f: RawFinding, review_id: &str, forbid: bool, diff: &DiffIndex) ->
         _ => None,
     };
 
-    let proposed_comment = sanitize_comment(&f.proposed_comment, forbid);
-    let title = sanitize_comment(&f.title, forbid);
+    let proposed_comment = sanitize_comment(&f.proposed_comment, attribution);
+    let title = sanitize_comment(&f.title, attribution);
     if title.is_empty() && proposed_comment.is_empty() {
         return None;
     }
@@ -646,7 +658,7 @@ fn to_finding(f: RawFinding, review_id: &str, forbid: bool, diff: &DiffIndex) ->
         line_start,
         line_end,
         side: anchor.as_ref().map_or(side, |a| a.side),
-        explanation: sanitize_comment(&f.explanation, forbid),
+        explanation: sanitize_comment(&f.explanation, attribution),
         proposed_comment,
         suggestion: f.suggestion.filter(|s| !s.trim().is_empty()),
         in_diff: anchor.is_some(),
@@ -654,7 +666,7 @@ fn to_finding(f: RawFinding, review_id: &str, forbid: bool, diff: &DiffIndex) ->
         selected: false,
         posted_at: None,
         posted_ref: None,
-        source: Default::default(),
+        source: FindingSource::Reviewer,
     })
 }
 
@@ -716,32 +728,35 @@ mod tests {
     fn strips_attribution() {
         let text = "Please handle the error here.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nCo-Authored-By: Claude <noreply@anthropic.com>";
         assert_eq!(
-            sanitize_comment(text, true),
+            sanitize_comment(text, Attribution::Forbidden),
             "Please handle the error here."
         );
 
         let text =
             "This leaks a handle. This review was generated by an AI assistant. Close it in Drop.";
         assert_eq!(
-            sanitize_comment(text, true),
+            sanitize_comment(text, Attribution::Forbidden),
             "This leaks a handle. Close it in Drop."
         );
 
         let text = "As an AI, I think this is fine. The loop is O(n^2).";
-        assert_eq!(sanitize_comment(text, true), "The loop is O(n^2).");
+        assert_eq!(
+            sanitize_comment(text, Attribution::Forbidden),
+            "The loop is O(n^2)."
+        );
     }
 
     #[test]
     fn keeps_legitimate_mentions_in_code() {
         let text = "Rename `ClaudeClient::send` to match the other clients.";
-        assert_eq!(sanitize_comment(text, true), text);
+        assert_eq!(sanitize_comment(text, Attribution::Forbidden), text);
         assert!(attribution_violations(text).is_empty());
     }
 
     #[test]
     fn attribution_allowed_keeps_text() {
         let text = "Generated with Claude.";
-        assert_eq!(sanitize_comment(text, false), text);
+        assert_eq!(sanitize_comment(text, Attribution::Allowed), text);
     }
 
     fn settings(over: SettingsOverrides) -> EffectiveSettings {
@@ -960,30 +975,40 @@ mod tests {
             "Errors produced by the Claude CLI are swallowed here. Return them.",
             "The token is created by the OpenAI client but never closed.",
         ] {
-            assert_eq!(sanitize_comment(text, true), text);
+            assert_eq!(sanitize_comment(text, Attribution::Forbidden), text);
             assert!(attribution_violations(text).is_empty(), "{text}");
         }
         assert_eq!(
-            sanitize_comment("Looks good. Generated with Claude Code.", true),
+            sanitize_comment(
+                "Looks good. Generated with Claude Code.",
+                Attribution::Forbidden
+            ),
             "Looks good."
         );
         assert_eq!(
-            sanitize_comment("Fine. This review was written by an AI.", true),
+            sanitize_comment(
+                "Fine. This review was written by an AI.",
+                Attribution::Forbidden
+            ),
             "Fine."
         );
     }
 
     #[test]
     fn em_dash_signatures_are_stripped_not_blocked() {
-        let out = sanitize_comment("Thanks!\n\n— Claude", true);
+        let out = sanitize_comment("Thanks!\n\n— Claude", Attribution::Forbidden);
         assert_eq!(out, "Thanks!");
-        assert!(check_comment(&out, true).attribution_violations.is_empty());
+        assert!(
+            check_comment(&out, Attribution::Forbidden)
+                .attribution_violations
+                .is_empty()
+        );
     }
 
     #[test]
     fn indented_code_blocks_keep_their_dashes() {
         let text = "Run the tests with output:\n\n    cargo test -- --nocapture\n\nThen check -- carefully.";
-        let out = sanitize_comment(text, true);
+        let out = sanitize_comment(text, Attribution::Forbidden);
         assert!(out.contains("    cargo test -- --nocapture"), "{out}");
         assert!(!out.contains("check --"), "{out}");
         assert!(dash_violations(&out).is_empty());
