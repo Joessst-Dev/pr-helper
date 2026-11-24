@@ -73,50 +73,45 @@ pub fn build_inline(
                 .filter(|a| f.source != FindingSource::User || a.side == f.side),
             _ => None,
         };
-        match anchor {
-            Some(a) => {
-                let line = if a.side == Side::Left {
-                    a.old_line
-                } else {
-                    a.new_line
+        let Some(a) = anchor else {
+            let heading = match (&f.file, f.line_start, f.line_end) {
+                (Some(path), Some(start), Some(end)) if end != start => {
+                    format!("**{path}:{start}-{end}**\n\n")
                 }
-                .unwrap_or_default();
-                // Multi-line ranges need the start on the same side and in the same hunk;
-                // otherwise the comment goes on its last line only.
-                let start_line = match (f.line_start, f.line_end) {
-                    (Some(start), Some(_)) if start < line => index
-                        .locate(&a.new_path, start, a.side)
-                        .filter(|s| {
-                            s.side == a.side && index.same_hunk(&a.new_path, start, line, a.side)
-                        })
-                        .map(|_| start),
-                    _ => None,
-                };
-                inline.push(InlineComment {
-                    finding_id: f.id.clone(),
-                    path: a.new_path,
-                    old_path: a.old_path,
-                    line,
-                    start_line,
-                    side: a.side,
-                    new_line: a.new_line,
-                    old_line: a.old_line,
-                    body,
-                    suggestion: f.suggestion.clone(),
-                });
-            }
-            None => {
-                let heading = match (&f.file, f.line_start, f.line_end) {
-                    (Some(path), Some(start), Some(end)) if end != start => {
-                        format!("**{path}:{start}-{end}**\n\n")
-                    }
-                    (Some(path), Some(line), _) => format!("**{path}:{line}**\n\n"),
-                    (Some(path), None, _) => format!("**{path}**\n\n"),
-                    _ => String::new(),
-                };
-                general.push((f.id.clone(), format!("{heading}{body}")));
-            }
+                (Some(path), Some(line), _) => format!("**{path}:{line}**\n\n"),
+                (Some(path), None, _) => format!("**{path}**\n\n"),
+                _ => String::new(),
+            };
+            general.push((f.id.clone(), format!("{heading}{body}")));
+            continue;
+        };
+        let line = if a.side == Side::Left {
+            a.old_line
+        } else {
+            a.new_line
         }
+        .unwrap_or_default();
+        // Multi-line ranges need the start on the same side and in the same hunk;
+        // otherwise the comment goes on its last line only.
+        let start_line = match (f.line_start, f.line_end) {
+            (Some(start), Some(_)) if start < line => index
+                .locate(&a.new_path, start, a.side)
+                .filter(|s| s.side == a.side && index.same_hunk(&a.new_path, start, line, a.side))
+                .map(|_| start),
+            _ => None,
+        };
+        inline.push(InlineComment {
+            finding_id: f.id.clone(),
+            path: a.new_path,
+            old_path: a.old_path,
+            line,
+            start_line,
+            side: a.side,
+            new_line: a.new_line,
+            old_line: a.old_line,
+            body,
+            suggestion: f.suggestion.clone(),
+        });
     }
     Ok((inline, general))
 }
@@ -149,7 +144,7 @@ async fn reviewed_index(
         .ok_or_else(|| AppError::invalid("the provider returned no clone URL"))?;
     let auth = provider.git_auth_header();
     let pr_ref = provider.pr_fetch_ref(pr.number);
-    let bare = svc
+    let bare_repo = svc
         .cache
         .ensure_pr(&FetchSpec {
             server_id: &review.server_id,
@@ -164,7 +159,7 @@ async fn reviewed_index(
         })
         .await?;
     Ok(DiffIndex::parse(
-        &svc.cache.diff(&bare, base, &review.head_sha).await?,
+        &svc.cache.diff(&bare_repo, base, &review.head_sha).await?,
     ))
 }
 

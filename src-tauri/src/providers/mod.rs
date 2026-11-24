@@ -100,6 +100,9 @@ pub fn basic_auth_header(user: &str, token: &str) -> String {
 ///
 /// Deliberately not a shared static: a pooled connection is bound to the tokio runtime that
 /// opened it, and tests run each case on its own runtime.
+///
+/// # Panics
+/// If the TLS backend can't initialise.
 pub fn http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .user_agent(concat!("pr-helper/", env!("CARGO_PKG_VERSION")))

@@ -124,9 +124,9 @@ impl RepoCache {
         }
     }
 
-    async fn has_commit(&self, bare: &Path, sha: &str) -> bool {
+    async fn has_commit(&self, bare_repo: &Path, sha: &str) -> bool {
         self.run(
-            Some(bare),
+            Some(bare_repo),
             &["cat-file", "-e", &format!("{sha}^{{commit}}")],
             None,
         )
@@ -136,19 +136,19 @@ impl RepoCache {
 
     /// Make sure the bare clone has the PR head and base commits. Returns the bare repo path.
     pub async fn ensure_pr(&self, spec: &FetchSpec<'_>) -> AppResult<PathBuf> {
-        let bare = self.bare_path(spec.server_id, spec.repo);
-        let lock = self.lock_for(&bare).await;
+        let bare_repo = self.bare_path(spec.server_id, spec.repo);
+        let lock = self.lock_for(&bare_repo).await;
         let _guard = lock.lock().await;
 
-        if !bare.join("HEAD").exists() {
-            tokio::fs::create_dir_all(&bare).await?;
-            self.run(Some(&bare), &["init", "--bare", "--quiet"], None)
+        if !bare_repo.join("HEAD").exists() {
+            tokio::fs::create_dir_all(&bare_repo).await?;
+            self.run(Some(&bare_repo), &["init", "--bare", "--quiet"], None)
                 .await?;
         }
         // `set-url` fails when an earlier run died between `init` and `remote add`.
         if self
             .run(
-                Some(&bare),
+                Some(&bare_repo),
                 &["remote", "set-url", "origin", spec.clone_url],
                 None,
             )
@@ -156,7 +156,7 @@ impl RepoCache {
             .is_err()
         {
             self.run(
-                Some(&bare),
+                Some(&bare_repo),
                 &["remote", "add", "origin", spec.clone_url],
                 None,
             )
@@ -166,7 +166,7 @@ impl RepoCache {
         let head_target = format!("+{}:refs/pr/{}", spec.pr_ref, spec.number);
         let base_target = format!("+refs/heads/{0}:refs/remotes/origin/{0}", spec.base_ref);
         self.run(
-            Some(&bare),
+            Some(&bare_repo),
             &[
                 "fetch",
                 "--no-tags",
@@ -181,10 +181,10 @@ impl RepoCache {
         .await?;
 
         for sha in std::iter::once(spec.head_sha).chain(spec.base_sha) {
-            if !self.has_commit(&bare, sha).await {
+            if !self.has_commit(&bare_repo, sha).await {
                 // The base branch may have moved; GitHub and GitLab both allow fetching by SHA.
                 self.run(
-                    Some(&bare),
+                    Some(&bare_repo),
                     &["fetch", "--no-tags", "--quiet", "origin", sha],
                     spec.auth_header,
                 )
@@ -192,12 +192,12 @@ impl RepoCache {
                 .map_err(|e| AppError::Git(format!("commit {sha} is not available: {e}")))?;
             }
         }
-        Ok(bare)
+        Ok(bare_repo)
     }
 
-    pub async fn merge_base(&self, bare: &Path, base: &str, head: &str) -> AppResult<String> {
+    pub async fn merge_base(&self, bare_repo: &Path, base: &str, head: &str) -> AppResult<String> {
         Ok(self
-            .run(Some(bare), &["merge-base", base, head], None)
+            .run(Some(bare_repo), &["merge-base", base, head], None)
             .await?
             .trim()
             .to_string())
@@ -206,7 +206,7 @@ impl RepoCache {
     /// Resolve the base to diff against: an explicit SHA, or the fetched base branch tip.
     pub async fn base_commit(
         &self,
-        bare: &Path,
+        bare_repo: &Path,
         base_sha: Option<&str>,
         base_ref: &str,
     ) -> AppResult<String> {
@@ -214,7 +214,7 @@ impl RepoCache {
             Some(sha) => Ok(sha.to_string()),
             None => Ok(self
                 .run(
-                    Some(bare),
+                    Some(bare_repo),
                     &["rev-parse", &format!("refs/remotes/origin/{base_ref}")],
                     None,
                 )
@@ -225,19 +225,20 @@ impl RepoCache {
     }
 
     /// Three-dot diff (from the merge base), which is what GitHub and GitLab show.
-    pub async fn diff(&self, bare: &Path, base: &str, head: &str) -> AppResult<String> {
-        self.git_diff(bare, &[&format!("{base}...{head}")]).await
+    pub async fn diff(&self, bare_repo: &Path, base: &str, head: &str) -> AppResult<String> {
+        self.git_diff(bare_repo, &[&format!("{base}...{head}")])
+            .await
     }
 
     /// Two-dot diff between two reviewed heads, for incremental re-reviews.
-    pub async fn diff_between(&self, bare: &Path, from: &str, to: &str) -> AppResult<String> {
-        self.git_diff(bare, &[from, to]).await
+    pub async fn diff_between(&self, bare_repo: &Path, from: &str, to: &str) -> AppResult<String> {
+        self.git_diff(bare_repo, &[from, to]).await
     }
 
     /// Every diff the reviewer sees is made the same way, so their line numbers agree with the
     /// index that anchors comments. No external diff drivers or textconv filters from the
     /// repository run.
-    async fn git_diff(&self, bare: &Path, revs: &[&str]) -> AppResult<String> {
+    async fn git_diff(&self, bare_repo: &Path, revs: &[&str]) -> AppResult<String> {
         const FLAGS: [&str; 8] = [
             "diff",
             "--no-color",
@@ -249,12 +250,12 @@ impl RepoCache {
             "-M",
         ];
         let args: Vec<&str> = FLAGS.iter().chain(revs).copied().collect();
-        self.run(Some(bare), &args, None).await
+        self.run(Some(bare_repo), &args, None).await
     }
 
-    pub async fn commit_log(&self, bare: &Path, base: &str, head: &str) -> AppResult<String> {
+    pub async fn commit_log(&self, bare_repo: &Path, base: &str, head: &str) -> AppResult<String> {
         self.run(
-            Some(bare),
+            Some(bare_repo),
             &[
                 "log",
                 "--no-color",
@@ -269,12 +270,17 @@ impl RepoCache {
     /// What `path` is at commit `sha`. Reads the object database, never a checkout, so symlinks
     /// in the PR can't point it at files outside the repository. Git failures are errors; only
     /// a path that really isn't in the commit is `Missing`.
-    pub async fn tree_entry(&self, bare: &Path, sha: &str, path: &str) -> AppResult<TreeEntry> {
+    pub async fn tree_entry(
+        &self,
+        bare_repo: &Path,
+        sha: &str,
+        path: &str,
+    ) -> AppResult<TreeEntry> {
         object_spec(sha, path)?;
         // `--literal-pathspecs`: the path is matched as is, not as a glob.
         let out = self
             .run(
-                Some(bare),
+                Some(bare_repo),
                 &[
                     "--literal-pathspecs",
                     "ls-tree",
@@ -291,21 +297,21 @@ impl RepoCache {
     }
 
     /// The blob at `sha:path` as lossy UTF-8. Check the size with `tree_entry` first.
-    pub async fn show_blob(&self, bare: &Path, sha: &str, path: &str) -> AppResult<String> {
+    pub async fn show_blob(&self, bare_repo: &Path, sha: &str, path: &str) -> AppResult<String> {
         let spec = object_spec(sha, path)?;
-        self.run(Some(bare), &["cat-file", "blob", &spec], None)
+        self.run(Some(bare_repo), &["cat-file", "blob", &spec], None)
             .await
     }
 
-    pub async fn add_worktree(&self, bare: &Path, dest: &Path, sha: &str) -> AppResult<()> {
-        let lock = self.lock_for(bare).await;
+    pub async fn add_worktree(&self, bare_repo: &Path, dest: &Path, sha: &str) -> AppResult<()> {
+        let lock = self.lock_for(bare_repo).await;
         let _guard = lock.lock().await;
         if let Some(parent) = dest.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
         let dest_s = dest.to_string_lossy();
         self.run(
-            Some(bare),
+            Some(bare_repo),
             &["worktree", "add", "--detach", "--force", &dest_s, sha],
             None,
         )
@@ -313,13 +319,13 @@ impl RepoCache {
         Ok(())
     }
 
-    pub async fn remove_worktree(&self, bare: &Path, dest: &Path) -> AppResult<()> {
-        let lock = self.lock_for(bare).await;
+    pub async fn remove_worktree(&self, bare_repo: &Path, dest: &Path) -> AppResult<()> {
+        let lock = self.lock_for(bare_repo).await;
         let _guard = lock.lock().await;
         let dest_s = dest.to_string_lossy();
         let removed = self
             .run(
-                Some(bare),
+                Some(bare_repo),
                 &["worktree", "remove", "--force", &dest_s],
                 None,
             )
@@ -331,7 +337,10 @@ impl RepoCache {
             }
         }
         // Best effort: a stale worktree entry only costs a little disk until the next prune.
-        if let Err(e) = self.run(Some(bare), &["worktree", "prune"], None).await {
+        if let Err(e) = self
+            .run(Some(bare_repo), &["worktree", "prune"], None)
+            .await
+        {
             tracing::debug!("git worktree prune failed: {e}");
         }
         Ok(())
@@ -478,50 +487,65 @@ mod tests {
             base_sha: None,
             auth_header: None,
         };
-        let bare = cache.ensure_pr(&spec).await.unwrap();
+        let bare_repo = cache.ensure_pr(&spec).await.unwrap();
         // Second call reuses the clone.
-        assert_eq!(cache.ensure_pr(&spec).await.unwrap(), bare);
+        assert_eq!(cache.ensure_pr(&spec).await.unwrap(), bare_repo);
 
-        let base_commit = cache.base_commit(&bare, None, "main").await.unwrap();
+        let base_commit = cache.base_commit(&bare_repo, None, "main").await.unwrap();
         assert_eq!(base_commit, base);
-        let diff = cache.diff(&bare, &base_commit, &head).await.unwrap();
+        let diff = cache.diff(&bare_repo, &base_commit, &head).await.unwrap();
         assert!(diff.contains("+two"));
-        let log = cache.commit_log(&bare, &base_commit, &head).await.unwrap();
+        let log = cache
+            .commit_log(&bare_repo, &base_commit, &head)
+            .await
+            .unwrap();
         assert!(log.contains("feature work"));
 
         assert_eq!(
-            cache.tree_entry(&bare, &head, "a.txt").await.unwrap(),
+            cache.tree_entry(&bare_repo, &head, "a.txt").await.unwrap(),
             TreeEntry::Blob { size: 8 }
         );
         assert_eq!(
-            cache.show_blob(&bare, &head, "a.txt").await.unwrap(),
+            cache.show_blob(&bare_repo, &head, "a.txt").await.unwrap(),
             "one\ntwo\n"
         );
         assert_eq!(
-            cache.tree_entry(&bare, &head, "missing.txt").await.unwrap(),
+            cache
+                .tree_entry(&bare_repo, &head, "missing.txt")
+                .await
+                .unwrap(),
             TreeEntry::Missing
         );
         // Matched literally, not as a glob.
         assert_eq!(
-            cache.tree_entry(&bare, &head, "*.txt").await.unwrap(),
+            cache.tree_entry(&bare_repo, &head, "*.txt").await.unwrap(),
             TreeEntry::Missing
         );
-        assert!(cache.tree_entry(&bare, "--help", "a.txt").await.is_err());
+        assert!(
+            cache
+                .tree_entry(&bare_repo, "--help", "a.txt")
+                .await
+                .is_err()
+        );
         // An unknown commit is a git error, not a missing file.
         assert!(
             cache
-                .tree_entry(&bare, "0123456789abcdef0123456789abcdef01234567", "a.txt")
+                .tree_entry(
+                    &bare_repo,
+                    "0123456789abcdef0123456789abcdef01234567",
+                    "a.txt"
+                )
                 .await
                 .is_err()
         );
 
         let wt = cache.review_dir("r1").join("worktree");
-        cache.add_worktree(&bare, &wt, &head).await.unwrap();
+        cache.add_worktree(&bare_repo, &wt, &head).await.unwrap();
         assert_eq!(
             std::fs::read_to_string(wt.join("a.txt")).unwrap(),
             "one\ntwo\n"
         );
-        cache.remove_worktree(&bare, &wt).await.unwrap();
+        cache.remove_worktree(&bare_repo, &wt).await.unwrap();
         assert!(!wt.exists());
     }
 }

@@ -6,8 +6,8 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use crate::db::models::{
-    CriticalFile, CriticalFileContent, FileNote, FindingSource, PrState, PullRequest, ReviewFile,
-    ReviewStatus, ReviewTrigger, TicketRef, Verdict,
+    CriticalFile, CriticalFileContent, FileNote, Finding, FindingSource, PrState, PullRequest,
+    Review, ReviewFile, ReviewStatus, ReviewTrigger, TicketRef, Verdict,
 };
 use crate::env;
 use crate::error::{AppError, AppResult};
@@ -15,7 +15,7 @@ use crate::git::diff::DiffIndex;
 use crate::git::repo_cache::{FetchSpec, TreeEntry};
 use crate::providers::GitProvider;
 use crate::review::guard::steering_attempt;
-use crate::review::postprocess::{finalize_body, process};
+use crate::review::postprocess::{Processed, finalize_body, process};
 use crate::review::prompt::SkillInfo;
 use crate::review::prompt::{PreviousReview, PromptInput, system_prompt, user_prompt};
 use crate::review::runner::{self, RunEvent, RunOutcome, RunRequest, ToolPolicy};
@@ -85,10 +85,10 @@ pub async fn run_review(
 }
 
 async fn cleanup(svc: &Service, pr: &PullRequest, review_dir: &Path) {
-    let bare = svc.cache.bare_path(&pr.server_id, &pr.repo);
+    let bare_repo = svc.cache.bare_path(&pr.server_id, &pr.repo);
     let worktree = review_dir.join("worktree");
     if worktree.exists()
-        && let Err(e) = svc.cache.remove_worktree(&bare, &worktree).await
+        && let Err(e) = svc.cache.remove_worktree(&bare_repo, &worktree).await
     {
         tracing::debug!("could not remove worktree {}: {e}", worktree.display());
     }
@@ -127,22 +127,11 @@ async fn execute(
     let has_tickets = !tickets.is_empty();
     write_context(svc, review_id, pr, &context_dir, &fetched, tickets).await?;
 
-    let previous = svc
-        .db
-        .last_done_review(&pr.server_id, &pr.repo, pr.number)?;
-    // The user's own comments are not the reviewer's to re-report.
-    let previous_findings: Vec<_> = match &previous {
-        Some(p) => svc
-            .db
-            .list_findings(&p.id)?
-            .into_iter()
-            .filter(|f| f.source == FindingSource::Reviewer)
-            .collect(),
-        None => Vec::new(),
-    };
-    let has_incremental = match previous.as_ref().filter(|p| p.head_sha != pr.head_sha) {
-        Some(prev) => {
-            write_incremental_diff(svc, &fetched.bare, &prev.head_sha, pr, &context_dir).await?
+    let previous = previous_review(svc, pr)?;
+    let has_incremental = match previous.as_ref().filter(|(p, _)| p.head_sha != pr.head_sha) {
+        Some((prev, _)) => {
+            write_incremental_diff(svc, &fetched.bare_repo, &prev.head_sha, pr, &context_dir)
+                .await?
         }
         None => false,
     };
@@ -150,7 +139,7 @@ async fn execute(
     svc.progress(review_id, ProgressKind::Status, "Checking out PR head");
     let worktree = review_dir.join("worktree");
     svc.cache
-        .add_worktree(&fetched.bare, &worktree, &pr.head_sha)
+        .add_worktree(&fetched.bare_repo, &worktree, &pr.head_sha)
         .await?;
     check_cancel(&cancel)?;
 
@@ -163,10 +152,10 @@ async fn execute(
         skills: &skill_infos,
         context_dir: &context_dir,
         changed_files: fetched.index.len(),
-        previous: previous.as_ref().map(|p| PreviousReview {
+        previous: previous.as_ref().map(|(p, findings)| PreviousReview {
             reviewed_sha: &p.head_sha,
             verdict: p.verdict,
-            findings: &previous_findings,
+            findings,
         }),
         has_incremental_diff: has_incremental,
         has_tickets,
@@ -188,31 +177,44 @@ async fn execute(
         model: settings.model.value.clone(),
         effort: settings.effort.value.clone(),
         max_budget_usd: settings.max_budget_usd.value,
-        timeout: Duration::from_secs(u64::from(config.review_timeout_mins.max(1)) * 60),
+        timeout: Duration::from_mins(config.review_timeout_mins.max(1).into()),
     };
     let outcome = run_reviewer(svc, review_id, request, cancel.clone()).await?;
 
     let raw: RawReview = serde_json::from_value(outcome.output)
         .map_err(|e| AppError::Reviewer(format!("unexpected review format: {e}")))?;
-    let processed = process(raw, review_id, &settings, &fetched.index, has_tickets);
+    let mut processed = process(raw, review_id, &settings, &fetched.index, has_tickets);
     let files = snapshot_files(
         svc,
         review_id,
-        &fetched.bare,
+        &fetched.bare_repo,
         &pr.head_sha,
         &fetched.index,
-        processed.critical_files,
+        std::mem::take(&mut processed.critical_files),
         &cancel,
     )
     .await?;
     check_cancel(&cancel)?;
+    store_review(svc, review_id, pr, &processed, outcome.cost_usd, &files)?;
+    Ok((processed.verdict, steering))
+}
+
+/// Stores the finished review and records its head as reviewed for the PR's tracking.
+fn store_review(
+    svc: &Service,
+    review_id: &str,
+    pr: &PullRequest,
+    processed: &Processed,
+    cost_usd: Option<f64>,
+    files: &[ReviewFile],
+) -> AppResult<()> {
     svc.db.complete_review(
         review_id,
         processed.verdict,
         &processed.summary,
-        outcome.cost_usd,
+        cost_usd,
         &processed.findings,
-        &files,
+        files,
     )?;
     svc.db.set_tracked_reviewed(
         &pr.server_id,
@@ -220,13 +222,30 @@ async fn execute(
         pr.number,
         &pr.head_sha,
         Some(processed.verdict),
-    )?;
-    Ok((processed.verdict, steering))
+    )
+}
+
+/// The last finished review of the PR, with the findings the reviewer reported in it. The
+/// user's own comments are not the reviewer's to re-report.
+fn previous_review(svc: &Service, pr: &PullRequest) -> AppResult<Option<(Review, Vec<Finding>)>> {
+    let Some(previous) = svc
+        .db
+        .last_done_review(&pr.server_id, &pr.repo, pr.number)?
+    else {
+        return Ok(None);
+    };
+    let findings = svc
+        .db
+        .list_findings(&previous.id)?
+        .into_iter()
+        .filter(|f| f.source == FindingSource::Reviewer)
+        .collect();
+    Ok(Some((previous, findings)))
 }
 
 /// The PR's commits in the local cache, and what changed between base and head.
 struct Fetched {
-    bare: PathBuf,
+    bare_repo: PathBuf,
     base: String,
     diff: String,
     index: DiffIndex,
@@ -246,7 +265,7 @@ async fn fetch_and_diff(
     svc.progress(review_id, ProgressKind::Status, "Fetching repository");
     let auth = provider.git_auth_header();
     let pr_ref = provider.pr_fetch_ref(pr.number);
-    let bare = svc
+    let bare_repo = svc
         .cache
         .ensure_pr(&FetchSpec {
             server_id: &pr.server_id,
@@ -264,21 +283,25 @@ async fn fetch_and_diff(
 
     let base = svc
         .cache
-        .base_commit(&bare, pr.base_sha.as_deref(), &pr.base_ref)
+        .base_commit(&bare_repo, pr.base_sha.as_deref(), &pr.base_ref)
         .await?;
     svc.db.set_review_base(review_id, &base)?;
-    let diff = svc.cache.diff(&bare, &base, &pr.head_sha).await?;
+    let diff = svc.cache.diff(&bare_repo, &base, &pr.head_sha).await?;
     let index = DiffIndex::parse(&diff);
     // The commit list is context only: without a merge base, list from the base instead, and
     // without a list, review without one.
-    let merge_base = svc.cache.merge_base(&bare, &base, &pr.head_sha).await;
+    let merge_base = svc.cache.merge_base(&bare_repo, &base, &pr.head_sha).await;
     let commits = svc
         .cache
-        .commit_log(&bare, merge_base.as_deref().unwrap_or(&base), &pr.head_sha)
+        .commit_log(
+            &bare_repo,
+            merge_base.as_deref().unwrap_or(&base),
+            &pr.head_sha,
+        )
         .await
         .unwrap_or_default();
     Ok(Fetched {
-        bare,
+        bare_repo,
         base,
         diff,
         index,
@@ -322,14 +345,14 @@ async fn write_context(
 /// the file was written; without it the reviewer just reviews the whole diff.
 async fn write_incremental_diff(
     svc: &Service,
-    bare: &Path,
+    bare_repo: &Path,
     reviewed_sha: &str,
     pr: &PullRequest,
     context_dir: &Path,
 ) -> AppResult<bool> {
     match svc
         .cache
-        .diff_between(bare, reviewed_sha, &pr.head_sha)
+        .diff_between(bare_repo, reviewed_sha, &pr.head_sha)
         .await
     {
         Ok(inc) => {
@@ -405,7 +428,7 @@ const MAX_SNAPSHOT_DIFF_LINES: usize = 5000;
 async fn snapshot_files(
     svc: &Service,
     review_id: &str,
-    bare: &Path,
+    bare_repo: &Path,
     head: &str,
     index: &DiffIndex,
     files: Vec<CriticalFile>,
@@ -418,19 +441,23 @@ async fn snapshot_files(
             .file(&meta.path)
             .map_or_default(|f| f.view_lines(MAX_SNAPSHOT_DIFF_LINES));
         let read = async {
-            Ok::<_, AppError>(match svc.cache.tree_entry(bare, head, &meta.path).await? {
-                TreeEntry::Missing => Err(FileNote::Deleted),
-                TreeEntry::NotAFile => Err(FileNote::NotAFile),
-                TreeEntry::Blob { size } if size > MAX_SNAPSHOT_BYTES => Err(FileNote::TooLarge),
-                TreeEntry::Blob { .. } => {
-                    let text = svc.cache.show_blob(bare, head, &meta.path).await?;
-                    if text.contains('\0') {
-                        Err(FileNote::Binary)
-                    } else {
-                        Ok(text)
+            Ok::<_, AppError>(
+                match svc.cache.tree_entry(bare_repo, head, &meta.path).await? {
+                    TreeEntry::Missing => Err(FileNote::Deleted),
+                    TreeEntry::NotAFile => Err(FileNote::NotAFile),
+                    TreeEntry::Blob { size } if size > MAX_SNAPSHOT_BYTES => {
+                        Err(FileNote::TooLarge)
                     }
-                }
-            })
+                    TreeEntry::Blob { .. } => {
+                        let text = svc.cache.show_blob(bare_repo, head, &meta.path).await?;
+                        if text.contains('\0') {
+                            Err(FileNote::Binary)
+                        } else {
+                            Ok(text)
+                        }
+                    }
+                },
+            )
         };
         let content = match read.await {
             Ok(Ok(text)) => Some(text),

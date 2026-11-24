@@ -132,6 +132,46 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
     Ok(())
 }
 
+/// Opens the database, builds the service and starts the tray and the watcher.
+fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
+    let data_dir = app.path().app_data_dir()?;
+    let cache_dir = app.path().app_cache_dir()?;
+    std::fs::create_dir_all(&data_dir)?;
+    std::fs::create_dir_all(&cache_dir)?;
+
+    let db = Arc::new(db::Db::open(&data_dir.join("pr-helper.sqlite3"))?);
+    let interrupted = db.fail_interrupted_reviews()?;
+    if interrupted > 0 {
+        tracing::info!("marked {interrupted} interrupted review(s) as failed");
+    }
+    // Leftover worktrees from interrupted runs are useless; reviews are recreated on demand.
+    let keep = db.app_config().is_ok_and(|c| c.keep_worktrees);
+    if !keep {
+        let _ = std::fs::remove_dir_all(cache_dir.join("reviews"));
+    }
+
+    let sink = Arc::new(TauriSink {
+        app: app.handle().clone(),
+    });
+    let svc = Service::new(db, Arc::new(secrets::KeyringStore), cache_dir, sink, None)?;
+    app.manage(svc.clone());
+    setup_tray(app)?;
+    update_tray(app.handle());
+    watcher::spawn(svc);
+
+    if std::env::args().any(|a| a == "--hidden")
+        && let Some(w) = app.get_webview_window("main")
+    {
+        let _ = w.hide();
+    }
+    Ok(())
+}
+
+/// Starts the app and blocks until it quits.
+///
+/// # Panics
+/// If the Tauri application can't be built, e.g. when the bundled config is invalid. There is
+/// no window to report that in yet.
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tracing_subscriber::fmt()
@@ -143,7 +183,7 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            show_main_window(app)
+            show_main_window(app);
         }))
         .plugin(tauri_plugin_window_state::Builder::default().build())
         .plugin(tauri_plugin_opener::init())
@@ -153,39 +193,7 @@ pub fn run() {
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             Some(vec!["--hidden"]),
         ))
-        .setup(|app| {
-            let data_dir = app.path().app_data_dir()?;
-            let cache_dir = app.path().app_cache_dir()?;
-            std::fs::create_dir_all(&data_dir)?;
-            std::fs::create_dir_all(&cache_dir)?;
-
-            let db = Arc::new(db::Db::open(&data_dir.join("pr-helper.sqlite3"))?);
-            let interrupted = db.fail_interrupted_reviews()?;
-            if interrupted > 0 {
-                tracing::info!("marked {interrupted} interrupted review(s) as failed");
-            }
-            // Leftover worktrees from interrupted runs are useless; reviews are recreated on demand.
-            let keep = db.app_config().is_ok_and(|c| c.keep_worktrees);
-            if !keep {
-                let _ = std::fs::remove_dir_all(cache_dir.join("reviews"));
-            }
-
-            let sink = Arc::new(TauriSink {
-                app: app.handle().clone(),
-            });
-            let svc = Service::new(db, Arc::new(secrets::KeyringStore), cache_dir, sink, None)?;
-            app.manage(svc.clone());
-            setup_tray(app)?;
-            update_tray(app.handle());
-            watcher::spawn(svc);
-
-            if std::env::args().any(|a| a == "--hidden")
-                && let Some(w) = app.get_webview_window("main")
-            {
-                let _ = w.hide();
-            }
-            Ok(())
-        })
+        .setup(setup)
         .on_window_event(|window, event| {
             // Closing the window keeps the app (and the watcher) running in the tray.
             if let WindowEvent::CloseRequested { api, .. } = event
