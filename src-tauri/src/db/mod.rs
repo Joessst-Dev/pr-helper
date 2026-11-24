@@ -8,7 +8,11 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 
 use crate::error::{AppError, AppResult};
 use crate::settings::{AppConfig, SettingsOverrides};
-use models::*;
+use models::{
+    CriticalFile, CriticalFileContent, FileNote, Finding, FindingSource, ProviderKind, PullRequest,
+    Review, ReviewFile, ReviewStatus, ReviewTrigger, Server, ServerInput, Severity, Side, Skill,
+    SkillInput, TicketRef, TicketSource, TicketSourceInput, TicketSourceKind, TrackedPr, Verdict,
+};
 
 pub fn now() -> String {
     chrono::Utc::now().to_rfc3339()
@@ -1100,6 +1104,7 @@ pub fn normalize_base_url(url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::models::{DiffLineKind, FileDiffLine, LineRange, PrState};
 
     fn server_input() -> ServerInput {
         ServerInput {

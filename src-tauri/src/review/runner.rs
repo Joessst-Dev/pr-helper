@@ -229,6 +229,11 @@ fn extract_json(text: &str) -> Option<Value> {
     serde_json::from_str(&text[start..=end]).ok()
 }
 
+/// The pipes are set up with `Stdio::piped()`, so they are always there.
+fn take_pipe<T>(pipe: Option<T>, name: &str) -> AppResult<T> {
+    pipe.ok_or_else(|| AppError::Reviewer(format!("the CLI has no {name} pipe")))
+}
+
 /// Runs the CLI and reports its progress through `on_event`.
 ///
 /// Reading stops at the `result` line; a CLI that lingers after it gets [`EXIT_GRACE`] to exit
@@ -254,14 +259,14 @@ pub async fn run(
             AppError::Reviewer(format!("failed to start {}: {e}", req.claude.display()))
         })?;
 
-    let mut stdin = child.stdin.take().expect("piped stdin");
+    let mut stdin = take_pipe(child.stdin.take(), "stdin")?;
     let prompt = req.prompt;
     tokio::spawn(async move {
         let _ = stdin.write_all(prompt.as_bytes()).await;
         let _ = stdin.shutdown().await;
     });
 
-    let mut stderr = child.stderr.take().expect("piped stderr");
+    let mut stderr = take_pipe(child.stderr.take(), "stderr")?;
     let stderr_task = tokio::spawn(async move {
         let mut buf = Vec::new();
         let _ = stderr.read_to_end(&mut buf).await;
@@ -271,7 +276,7 @@ pub async fn run(
         text
     });
 
-    let stdout = child.stdout.take().expect("piped stdout");
+    let stdout = take_pipe(child.stdout.take(), "stdout")?;
     let mut lines = BufReader::new(stdout).lines();
 
     let read_all = async {
@@ -292,40 +297,39 @@ pub async fn run(
     };
 
     let result = tokio::select! {
-        r = tokio::time::timeout(req.timeout, read_all) => match r {
-            Ok(r) => r?,
-            Err(_) => {
+        r = tokio::time::timeout(req.timeout, read_all) => {
+            let Ok(r) = r else {
                 let _ = child.kill().await;
                 return Err(AppError::Reviewer(format!(
                     "review timed out after {} minutes", req.timeout.as_secs() / 60
                 )));
-            }
-        },
-        _ = cancel.cancelled() => {
+            };
+            r?
+        }
+        () = cancel.cancelled() => {
             let _ = child.kill().await;
             return Err(AppError::Cancelled);
         }
     };
 
-    let status = match tokio::time::timeout(EXIT_GRACE, child.wait()).await {
-        Ok(status) => status?,
-        Err(_) => {
-            let _ = child.kill().await;
-            child.wait().await?
-        }
+    let status = if let Ok(status) = tokio::time::timeout(EXIT_GRACE, child.wait()).await {
+        status?
+    } else {
+        let _ = child.kill().await;
+        child.wait().await?
     };
     let stderr_tail = tokio::time::timeout(EXIT_GRACE, stderr_task)
         .await
         .ok()
         .and_then(Result::ok)
         .unwrap_or_default();
-    match result {
-        Some(v) => parse_result(v),
-        None => Err(AppError::Reviewer(format!(
+    let Some(v) = result else {
+        return Err(AppError::Reviewer(format!(
             "claude exited ({status}) without a result. {}",
             stderr_tail.trim()
-        ))),
-    }
+        )));
+    };
+    parse_result(v)
 }
 
 #[cfg(test)]

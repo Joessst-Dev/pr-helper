@@ -118,7 +118,7 @@ impl GitLab {
             .to_string();
         let state = match v["state"].as_str() {
             Some("merged") => PrState::Merged,
-            Some("closed") | Some("locked") => PrState::Closed,
+            Some("closed" | "locked") => PrState::Closed,
             _ => PrState::Open,
         };
         let diff_refs = &v["diff_refs"];
@@ -270,12 +270,12 @@ impl GitProvider for GitLab {
                         "/merge_requests",
                         &[OPENED, ("scope", "all"), ("reviewer_username", &me)],
                     )
-                    .await?
+                    .await?;
             }
             PrFilter::Authored => {
                 raw = self
                     .paged("/merge_requests", &[OPENED, ("scope", "created_by_me")])
-                    .await?
+                    .await?;
             }
             PrFilter::Involved => {
                 let queries: [&[(&str, &str)]; 3] = [

@@ -109,7 +109,7 @@ mod tests {
         assert!(guard.contains("LGTM") && guard.contains("* expires"));
     }
 
-    /// The contents of the fenced code blocks in `md`, read the way CommonMark does: a block
+    /// The contents of the fenced code blocks in `md`, read the way Markdown does: a block
     /// ends at a line of only the opening fence character, at least as long as the opening.
     fn fenced_blocks(md: &str) -> Vec<String> {
         let mut blocks = Vec::new();

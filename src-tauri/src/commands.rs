@@ -6,7 +6,11 @@ use serde::Serialize;
 use tauri::State;
 use ts_rs::TS;
 
-use crate::db::models::*;
+use crate::db::models::{
+    CriticalFile, CriticalFileContent, Finding, PrState, PullRequest, Review, ReviewTrigger,
+    Server, ServerInput, Skill, SkillInput, TicketSource, TicketSourceInput, TicketSourceKind,
+    TrackedPr,
+};
 use crate::env;
 use crate::error::{AppError, AppResult};
 use crate::providers::PrFilter;

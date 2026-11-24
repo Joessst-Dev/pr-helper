@@ -28,7 +28,7 @@ use crate::settings::EffectiveSettings;
 pub const USER_CATEGORY: &str = "comment";
 const MAX_BODY_CHARS: usize = 20_000;
 const MAX_TITLE_CHARS: usize = 80;
-const CHECK_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const CHECK_TIMEOUT: Duration = Duration::from_mins(5);
 
 /// A comment the user wrote on lines of a critical file.
 #[derive(Debug, Clone, Deserialize, TS)]

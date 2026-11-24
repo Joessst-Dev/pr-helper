@@ -499,7 +499,7 @@ fn ticket_settings(extra: SettingsOverrides) -> SettingsOverrides {
 }
 
 #[cfg(unix)]
-async fn with_source(h: &Harness, jira: &wiremock::MockServer) {
+fn with_source(h: &Harness, jira: &wiremock::MockServer) {
     let source = add_jira_source(&h.svc, jira);
     h.svc
         .db
@@ -515,11 +515,15 @@ async fn with_source(h: &Harness, jira: &wiremock::MockServer) {
 async fn linked_tickets_are_given_to_the_reviewer() {
     let jira = wiremock::MockServer::start().await;
     mock_issue(&jira, "ABC-12", 200, "Speed up b without unsafe code.").await;
-    let h = harness_with("comment", ticket_settings(Default::default()), |pr| {
-        pr.head_ref = "feature/abc-12-faster-b".into();
-        pr.description = "Also touches OTHER-1.".into();
-    });
-    with_source(&h, &jira).await;
+    let h = harness_with(
+        "comment",
+        ticket_settings(SettingsOverrides::default()),
+        |pr| {
+            pr.head_ref = "feature/abc-12-faster-b".into();
+            pr.description = "Also touches OTHER-1.".into();
+        },
+    );
+    with_source(&h, &jira);
     let mut config = h.svc.db.app_config().unwrap();
     config.keep_worktrees = true;
     h.svc.db.set_app_config(&config).unwrap();
@@ -555,10 +559,14 @@ async fn linked_tickets_are_given_to_the_reviewer() {
 async fn a_failing_ticket_source_does_not_fail_the_review() {
     let jira = wiremock::MockServer::start().await;
     mock_issue(&jira, "ABC-12", 500, "").await;
-    let h = harness_with("comment", ticket_settings(Default::default()), |pr| {
-        pr.title = "ABC-12: make b faster".into();
-    });
-    with_source(&h, &jira).await;
+    let h = harness_with(
+        "comment",
+        ticket_settings(SettingsOverrides::default()),
+        |pr| {
+            pr.title = "ABC-12: make b faster".into();
+        },
+    );
+    with_source(&h, &jira);
     let review = queue::enqueue(&h.svc, h.pr.clone(), ReviewTrigger::Manual).unwrap();
     let review = wait_finished(&h.svc, &review.id).await;
     assert_eq!(review.status, ReviewStatus::Done, "{:?}", review.error);
@@ -592,7 +600,7 @@ async fn steering_text_in_a_ticket_blocks_auto_approve() {
         }),
         |pr| pr.head_ref = "ABC-12".into(),
     );
-    with_source(&h, &jira).await;
+    with_source(&h, &jira);
     let review = queue::enqueue(&h.svc, h.pr.clone(), ReviewTrigger::Auto).unwrap();
     let review = wait_finished(&h.svc, &review.id).await;
     assert_eq!(review.verdict, Some(Verdict::Approve), "{:?}", review.error);

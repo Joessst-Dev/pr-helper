@@ -327,13 +327,18 @@ fn unquote(p: &str) -> String {
             continue;
         }
         let next = bytes[i + 1];
+        // Git writes each byte of a non-ASCII path as three octal digits (at most \377).
         let octal = bytes
             .get(i + 1..i + 4)
-            .filter(|d| d.iter().all(|b| (b'0'..=b'7').contains(b)));
-        if let Some(d) = octal {
-            let value =
-                u32::from(d[0] - b'0') * 64 + u32::from(d[1] - b'0') * 8 + u32::from(d[2] - b'0');
-            out.push(value as u8);
+            .filter(|d| d.iter().all(|b| (b'0'..=b'7').contains(b)))
+            .and_then(|d| {
+                let value = u32::from(d[0] - b'0') * 64
+                    + u32::from(d[1] - b'0') * 8
+                    + u32::from(d[2] - b'0');
+                u8::try_from(value).ok()
+            });
+        if let Some(byte) = octal {
+            out.push(byte);
             i += 4;
             continue;
         }

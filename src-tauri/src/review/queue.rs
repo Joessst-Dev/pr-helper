@@ -151,22 +151,19 @@ pub fn enqueue(svc: &Arc<Service>, pr: PullRequest, trigger: ReviewTrigger) -> A
     tokio::spawn(async move {
         let permit = tokio::select! {
             p = semaphore.acquire_owned() => p.ok(),
-            _ = cancel.cancelled() => None,
+            () = cancel.cancelled() => None,
         };
-        match permit {
-            Some(permit) => {
-                pipeline::run_review(&svc2, &review_id, pr, trigger, cancel).await;
-                svc2.queue.release(permit);
-            }
-            None => {
-                svc2.record_review_status(
-                    &review_id,
-                    ReviewStatus::Cancelled,
-                    Some("Superseded before it started"),
-                );
-                svc2.progress(&review_id, ProgressKind::Status, "Cancelled");
-                svc2.publish_review(&review_id);
-            }
+        if let Some(permit) = permit {
+            pipeline::run_review(&svc2, &review_id, pr, trigger, cancel).await;
+            svc2.queue.release(permit);
+        } else {
+            svc2.record_review_status(
+                &review_id,
+                ReviewStatus::Cancelled,
+                Some("Superseded before it started"),
+            );
+            svc2.progress(&review_id, ProgressKind::Status, "Cancelled");
+            svc2.publish_review(&review_id);
         }
         let mut jobs = svc2.queue.jobs();
         if jobs.get(&k).is_some_and(|j| j.review_id == review_id) {

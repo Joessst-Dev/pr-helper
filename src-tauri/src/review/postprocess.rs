@@ -674,6 +674,8 @@ fn to_finding(
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write as _;
+
     use super::*;
     use crate::settings::{SettingsOverrides, resolve};
 
@@ -843,7 +845,7 @@ mod tests {
             out[1].focus_lines,
             vec![LineRange {
                 start: 1,
-                end: MAX_LINE as u32
+                end: u32::try_from(MAX_LINE).unwrap()
             }]
         );
 
@@ -862,9 +864,13 @@ mod tests {
         assert_eq!(normalize_path("./b/b/auth.rs", &real_b), "b/auth.rs");
         assert_eq!(normalize_path("b/x.rs", &real_b), "x.rs");
 
-        let wide: String = (0..8)
-            .map(|i| format!("diff --git a/f{i}.rs b/f{i}.rs\n--- a/f{i}.rs\n+++ b/f{i}.rs\n@@ -1 +1 @@\n-a\n+b\n"))
-            .collect();
+        let mut wide = String::new();
+        for i in 0..8 {
+            let _ = write!(
+                wide,
+                "diff --git a/f{i}.rs b/f{i}.rs\n--- a/f{i}.rs\n+++ b/f{i}.rs\n@@ -1 +1 @@\n-a\n+b\n"
+            );
+        }
         let many: Vec<_> = (0..8).map(|i| file(&format!("f{i}.rs"), &[])).collect();
         assert_eq!(
             critical_files(many, &DiffIndex::parse(&wide)).len(),

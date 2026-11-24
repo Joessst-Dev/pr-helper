@@ -234,23 +234,21 @@ impl Service {
             .current_user()
             .await?;
 
-        let server = match &existing {
-            Some(old) => self
-                .update_with_token(&old.id, new_token, || self.db.update_server(&old.id, input))?,
-            None => {
-                let server = self.db.insert_server(input)?;
-                if let Err(e) = self.secrets.set(&server.id, &token) {
-                    // Never keep a server whose token could not be stored securely.
-                    if let Err(undo) = self.db.delete_server(&server.id) {
-                        tracing::error!(
-                            "could not remove server {} after a keychain failure: {undo}",
-                            server.id
-                        );
-                    }
-                    return Err(e);
+        let server = if let Some(old) = &existing {
+            self.update_with_token(&old.id, new_token, || self.db.update_server(&old.id, input))?
+        } else {
+            let server = self.db.insert_server(input)?;
+            if let Err(e) = self.secrets.set(&server.id, &token) {
+                // Never keep a server whose token could not be stored securely.
+                if let Err(undo) = self.db.delete_server(&server.id) {
+                    tracing::error!(
+                        "could not remove server {} after a keychain failure: {undo}",
+                        server.id
+                    );
                 }
-                server
+                return Err(e);
             }
+            server
         };
         self.db.set_server_username(&server.id, &username)?;
         self.db.get_server(&server.id)
@@ -363,27 +361,24 @@ impl Service {
         };
         let username = Self::jira_client(&probe, token.clone())?.myself().await?;
 
-        match &existing {
-            Some(old) => {
-                self.update_with_token(&Self::ticket_secret_id(&old.id), new_token, || {
-                    self.db
-                        .upsert_ticket_source(Some(&old.id), input, Some(&username))
-                })
-            }
-            None => {
-                let saved = self.db.upsert_ticket_source(None, input, Some(&username))?;
-                if let Err(e) = self.secrets.set(&Self::ticket_secret_id(&saved.id), &token) {
-                    if let Err(undo) = self.db.delete_ticket_source(&saved.id) {
-                        tracing::error!(
-                            "could not remove ticket source {} after a keychain failure: {undo}",
-                            saved.id
-                        );
-                    }
-                    return Err(e);
-                }
-                Ok(saved)
-            }
+        if let Some(old) = &existing {
+            return self.update_with_token(&Self::ticket_secret_id(&old.id), new_token, || {
+                self.db
+                    .upsert_ticket_source(Some(&old.id), input, Some(&username))
+            });
         }
+        let saved = self.db.upsert_ticket_source(None, input, Some(&username))?;
+        if let Err(e) = self.secrets.set(&Self::ticket_secret_id(&saved.id), &token) {
+            // Never keep a source whose token could not be stored securely.
+            if let Err(undo) = self.db.delete_ticket_source(&saved.id) {
+                tracing::error!(
+                    "could not remove ticket source {} after a keychain failure: {undo}",
+                    saved.id
+                );
+            }
+            return Err(e);
+        }
+        Ok(saved)
     }
 
     pub fn delete_ticket_source(&self, id: &str) -> AppResult<()> {
@@ -421,12 +416,12 @@ impl Service {
                 )
                 .await
             }
-            _ => {
+            TicketSourceKind::JiraCloud | TicketSourceKind::JiraServer => {
                 let token = self.secrets.require(&Self::ticket_secret_id(&source.id))?;
                 let client = Self::jira_client(source, token)?;
                 tokio::select! {
                     t = client.issue(key, &extra) => t,
-                    _ = cancel.cancelled() => Err(AppError::Cancelled),
+                    () = cancel.cancelled() => Err(AppError::Cancelled),
                 }
             }
         }

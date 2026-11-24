@@ -124,8 +124,7 @@ pub fn extract_keys(
         let mut rest = text;
         // FIND_RE consumes one delimiter on each side, so step past each match manually to
         // also catch adjacent keys like "ABC-1,ABC-2".
-        while let Some(caps) = FIND_RE.captures(rest) {
-            let m = caps.get(1).expect("FIND_RE always captures group 1");
+        while let Some(m) = FIND_RE.captures(rest).and_then(|caps| caps.get(1)) {
             let key = m.as_str().to_ascii_uppercase();
             let project = key.rsplit_once('-').map_or("", |(p, _)| p);
             if is_valid_key(&key)
