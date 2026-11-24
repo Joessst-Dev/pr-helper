@@ -1,8 +1,10 @@
-import { CircleCheck, CircleX, LoaderCircle, MessageSquare } from "lucide-react";
+import { CircleCheck, CircleX, Eye, LoaderCircle, MessageSquare } from "lucide-react";
+import type { PrReviewer } from "../lib/bindings/PrReviewer";
+import type { PullRequest } from "../lib/bindings/PullRequest";
 import type { Review } from "../lib/bindings/Review";
 import type { Severity } from "../lib/bindings/Severity";
 import type { Verdict } from "../lib/bindings/Verdict";
-import { SEVERITY_LABEL, VERDICT_LABEL } from "../lib/format";
+import { REVIEWER_STATE_LABEL, SEVERITY_LABEL, VERDICT_LABEL } from "../lib/format";
 import { Badge } from "./ui";
 
 const SEVERITY_TONE = {
@@ -51,4 +53,43 @@ export function ReviewStatusBadge({ review }: { review: Review }) {
     case "done":
       return <VerdictBadge verdict={review.verdict} />;
   }
+}
+
+const IN_REVIEW_NAMES = 2;
+
+/** "In review: alice, bob +1" when anyone other than the user is reviewing. */
+export function InReviewBadge({ reviewers }: { reviewers: PrReviewer[] }) {
+  const others = reviewers.filter((r) => !r.isMe);
+  if (others.length === 0) return null;
+  const names = others.slice(0, IN_REVIEW_NAMES).map((r) => r.login);
+  const more = others.length - names.length;
+  return (
+    <Badge tone="info" title={others.map((r) => `${r.login}: ${REVIEWER_STATE_LABEL[r.state]}`).join("\n")}>
+      <Eye className="size-3" />
+      In review: {names.join(", ")}
+      {more > 0 && ` +${more}`}
+    </Badge>
+  );
+}
+
+/** Approval and other people's review state of a PR. */
+export function PrReviewBadges({ pr }: { pr: PullRequest }) {
+  const changesRequested = pr.reviewers.some((r) => !r.isMe && r.state === "changes_requested");
+  return (
+    <>
+      {pr.approved && (
+        <Badge tone="ok">
+          <CircleCheck className="size-3" />
+          Approved
+        </Badge>
+      )}
+      {changesRequested && (
+        <Badge tone="warn">
+          <CircleX className="size-3" />
+          Changes requested
+        </Badge>
+      )}
+      <InReviewBadge reviewers={pr.reviewers} />
+    </>
+  );
 }

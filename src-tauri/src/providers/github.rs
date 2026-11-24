@@ -6,15 +6,146 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use super::{
-    GitProvider, PostResult, PrFilter, ReviewEvent, ReviewSubmission, basic_auth_header, check,
-    fold_comment,
+    GitProvider, PostResult, PrFilter, PrReviewInfo, ReviewEvent, ReviewSubmission,
+    basic_auth_header, check, fold_comment,
 };
-use crate::db::models::{PrState, ProviderKind, PullRequest, Server, Side};
+use crate::db::models::{
+    PrComment, PrComments, PrState, PrThread, ProviderKind, PullRequest, ReviewerState, Server,
+    Side,
+};
 use crate::db::non_empty;
 use crate::error::{AppError, AppResult};
 
 const NAME: &str = "GitHub";
 const MAX_SEARCH_PAGES: usize = 10;
+
+/// The GraphQL fields [`review_info`] reads.
+macro_rules! review_fields {
+    () => {
+        "reviewDecision
+        reviewRequests(first: 20) { nodes { requestedReviewer { ... on User { login } } } }
+        latestReviews(first: 20) { nodes { state author { login } } }
+        latestOpinionatedReviews(first: 20) { nodes { state author { login } } }"
+    };
+}
+
+fn nodes(v: &Value) -> impl Iterator<Item = &Value> {
+    v["nodes"].as_array().into_iter().flatten()
+}
+
+fn reviewer_state(state: &str) -> Option<ReviewerState> {
+    match state {
+        "APPROVED" => Some(ReviewerState::Approved),
+        "CHANGES_REQUESTED" => Some(ReviewerState::ChangesRequested),
+        "COMMENTED" | "DISMISSED" => Some(ReviewerState::Commented),
+        // PENDING: an unsubmitted draft.
+        _ => None,
+    }
+}
+
+/// Reviewers and approval from a GraphQL pull request node with [`review_fields`].
+///
+/// `reviewDecision` is only set when branch protection requires reviews. Without it, the PR
+/// counts as approved once someone approved and nobody's latest verdict asks for changes.
+fn review_info(n: &Value, author: &str, me: &str) -> PrReviewInfo {
+    let login = |r: &Value| r["author"]["login"].as_str().map(str::to_string);
+    let opinionated: Vec<(String, ReviewerState)> = nodes(&n["latestOpinionatedReviews"])
+        .filter_map(|r| Some((login(r)?, reviewer_state(r["state"].as_str()?)?)))
+        .collect();
+    let approved = match n["reviewDecision"].as_str() {
+        Some(decision) => decision == "APPROVED",
+        None => {
+            opinionated
+                .iter()
+                .any(|(_, s)| *s == ReviewerState::Approved)
+                && !opinionated
+                    .iter()
+                    .any(|(_, s)| *s == ReviewerState::ChangesRequested)
+        }
+    };
+    let requested = nodes(&n["reviewRequests"]).filter_map(|r| {
+        r["requestedReviewer"]["login"]
+            .as_str()
+            .map(|l| (l.to_string(), ReviewerState::Requested))
+    });
+    let latest = nodes(&n["latestReviews"])
+        .filter_map(|r| Some((login(r)?, reviewer_state(r["state"].as_str()?)?)));
+    PrReviewInfo {
+        reviewers: super::merge_reviewers(author, me, requested.chain(opinionated).chain(latest)),
+        approved,
+    }
+}
+
+fn comment(c: &Value, me: &str, review_state: Option<ReviewerState>) -> PrComment {
+    let author = c["author"]["login"].as_str().unwrap_or("ghost").to_string();
+    PrComment {
+        id: c["id"].as_str().unwrap_or_default().into(),
+        is_me: !me.is_empty() && author.eq_ignore_ascii_case(me),
+        author,
+        body: c["body"].as_str().unwrap_or_default().into(),
+        created_at: c["createdAt"].as_str().unwrap_or_default().into(),
+        url: c["url"].as_str().map(str::to_string),
+        review_state,
+    }
+}
+
+fn more_than_loaded(v: &Value) -> bool {
+    let loaded = v["nodes"].as_array().map_or(0, Vec::len);
+    v["totalCount"]
+        .as_u64()
+        .and_then(|t| usize::try_from(t).ok())
+        .is_some_and(|t| t > loaded)
+}
+
+/// Threads from a `pullRequest` node of the comments query.
+fn map_comments(pr: &Value, me: &str) -> PrComments {
+    let mut threads = Vec::new();
+    let mut truncated = false;
+    let single = |c: PrComment| PrThread {
+        // Prefixed so it can't collide with a review thread's id.
+        id: format!("comment:{}", c.id),
+        file: None,
+        line: None,
+        resolved: None,
+        outdated: false,
+        comments: vec![c],
+    };
+    truncated |= more_than_loaded(&pr["comments"]);
+    threads.extend(nodes(&pr["comments"]).map(|c| single(comment(c, me, None))));
+    truncated |= more_than_loaded(&pr["reviews"]);
+    for r in nodes(&pr["reviews"]) {
+        let Some(state) = r["state"].as_str().and_then(reviewer_state) else {
+            continue;
+        };
+        // A plain "commented" review with no summary only carries inline comments, which show
+        // up in their threads.
+        let empty = r["body"].as_str().is_none_or(|b| b.trim().is_empty());
+        if empty && state == ReviewerState::Commented {
+            continue;
+        }
+        threads.push(single(comment(r, me, Some(state))));
+    }
+    truncated |= more_than_loaded(&pr["reviewThreads"]);
+    for t in nodes(&pr["reviewThreads"]) {
+        truncated |= more_than_loaded(&t["comments"]);
+        let comments: Vec<PrComment> = nodes(&t["comments"])
+            .map(|c| comment(c, me, None))
+            .collect();
+        if comments.is_empty() {
+            continue;
+        }
+        threads.push(PrThread {
+            id: t["id"].as_str().unwrap_or_default().into(),
+            file: t["path"].as_str().map(str::to_string),
+            line: t["line"].as_u64().or_else(|| t["originalLine"].as_u64()),
+            resolved: t["isResolved"].as_bool(),
+            outdated: t["isOutdated"].as_bool().unwrap_or(false),
+            comments,
+        });
+    }
+    threads.sort_by(|a, b| a.comments[0].created_at.cmp(&b.comments[0].created_at));
+    PrComments { threads, truncated }
+}
 
 pub struct GitHub {
     server_id: String,
@@ -153,11 +284,12 @@ impl GitHub {
     fn map_search_node(&self, n: &Value, me: &str) -> Option<PullRequest> {
         let repo = n["repository"]["nameWithOwner"].as_str()?.to_string();
         let author = n["author"]["login"].as_str().unwrap_or("ghost").to_string();
-        let review_requested = n["reviewRequests"]["nodes"]
-            .as_array()
-            .into_iter()
-            .flatten()
+        let review_requested = nodes(&n["reviewRequests"])
             .any(|r| r["requestedReviewer"]["login"].as_str() == Some(me));
+        let PrReviewInfo {
+            reviewers,
+            approved,
+        } = review_info(n, &author, me);
         Some(PullRequest {
             server_id: self.server_id.clone(),
             project_id: repo.clone(),
@@ -176,6 +308,8 @@ impl GitHub {
             updated_at: n["updatedAt"].as_str().unwrap_or_default().into(),
             review_requested,
             authored_by_me: author == me,
+            reviewers,
+            approved,
             author,
             repo,
         })
@@ -194,6 +328,13 @@ impl GitHub {
         } else {
             PrState::Open
         };
+        let requested = v["requested_reviewers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|r| r["login"].as_str())
+            .map(|l| (l.to_string(), ReviewerState::Requested));
+        let reviewers = super::merge_reviewers(&author, me, requested);
         Ok(PullRequest {
             server_id: self.server_id.clone(),
             project_id: repo.clone(),
@@ -216,9 +357,18 @@ impl GitHub {
                 .flatten()
                 .any(|r| r["login"].as_str() == Some(me)),
             authored_by_me: author == me,
+            reviewers,
+            // REST has no review decision; `review_status` asks GraphQL.
+            approved: false,
             author,
             repo,
         })
+    }
+
+    fn split_project(project_id: &str) -> AppResult<(&str, &str)> {
+        project_id
+            .split_once('/')
+            .ok_or_else(|| AppError::invalid(format!("not an owner/repo path: {project_id}")))
     }
 
     fn comment_json(c: &super::InlineComment) -> Value {
@@ -274,7 +424,8 @@ impl GitProvider for GitHub {
     }
 
     async fn list_open_prs(&self, filter: PrFilter) -> AppResult<Vec<PullRequest>> {
-        const QUERY: &str = r"
+        const QUERY: &str = concat!(
+            "
 query($q: String!, $cursor: String) {
   viewer { login }
   search(query: $q, type: ISSUE, first: 50, after: $cursor) {
@@ -284,11 +435,14 @@ query($q: String!, $cursor: String) {
         number title body url isDraft updatedAt headRefOid baseRefOid headRefName baseRefName
         author { login }
         repository { nameWithOwner url }
-        reviewRequests(first: 20) { nodes { requestedReviewer { ... on User { login } } } }
+        ",
+            review_fields!(),
+            "
       }
     }
   }
-}";
+}"
+        );
         let q = self.search_query(filter).await?;
         let mut out = Vec::new();
         let mut cursor: Option<String> = None;
@@ -380,6 +534,64 @@ query($q: String!, $cursor: String) {
         Ok(())
     }
 
+    async fn review_status(&self, pr: &PullRequest) -> AppResult<PrReviewInfo> {
+        const QUERY: &str = concat!(
+            "query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) { pullRequest(number: $number) { ",
+            review_fields!(),
+            " } } }"
+        );
+        let (owner, name) = Self::split_project(&pr.project_id)?;
+        let data = self
+            .graphql(
+                QUERY,
+                json!({ "owner": owner, "name": name, "number": pr.number }),
+            )
+            .await?;
+        let node = &data["repository"]["pullRequest"];
+        if node.is_null() {
+            return Err(AppError::invalid("GitHub returned no pull request"));
+        }
+        // Only decides which entry is the user's.
+        let me = self.login().await.unwrap_or_default();
+        Ok(review_info(node, &pr.author, &me))
+    }
+
+    async fn list_comments(&self, project_id: &str, number: u64) -> AppResult<PrComments> {
+        // `last`: when a PR has more than fits, the newest discussion matters most. Threads keep
+        // their first comments, which start the conversation.
+        const QUERY: &str = r"
+query($owner: String!, $name: String!, $number: Int!) {
+  viewer { login }
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      comments(last: 100) { totalCount nodes { id body createdAt url author { login } } }
+      reviews(last: 100) { totalCount nodes { id body state createdAt url author { login } } }
+      reviewThreads(last: 100) {
+        totalCount
+        nodes {
+          id isResolved isOutdated path line originalLine
+          comments(first: 50) { totalCount nodes { id body createdAt url author { login } } }
+        }
+      }
+    }
+  }
+}";
+        let (owner, name) = Self::split_project(project_id)?;
+        let data = self
+            .graphql(
+                QUERY,
+                json!({ "owner": owner, "name": name, "number": number }),
+            )
+            .await?;
+        let pr = &data["repository"]["pullRequest"];
+        if pr.is_null() {
+            return Err(AppError::invalid("GitHub returned no pull request"));
+        }
+        let me = data["viewer"]["login"].as_str().unwrap_or_default();
+        Ok(map_comments(pr, me))
+    }
+
     fn git_auth_header(&self) -> String {
         basic_auth_header("x-access-token", &self.token)
     }
@@ -392,6 +604,7 @@ query($q: String!, $cursor: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::models::PrReviewer;
     use crate::providers::{InlineComment, http_client};
     use crate::settings::SettingsOverrides;
     use wiremock::matchers::{body_partial_json, header, method, path};
@@ -475,6 +688,8 @@ mod tests {
         assert_eq!(pr.repo, "acme/app");
         assert_eq!(pr.clone_url.as_deref(), Some("https://gh/acme/app.git"));
         assert!(pr.draft && pr.review_requested && pr.authored_by_me);
+        // The author is no reviewer of their own PR.
+        assert!(pr.reviewers.is_empty() && !pr.approved);
     }
 
     #[tokio::test]
@@ -593,6 +808,199 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.folded, vec!["f1".to_string()]);
+    }
+
+    fn rv(login: &str, state: ReviewerState, is_me: bool) -> PrReviewer {
+        PrReviewer {
+            login: login.into(),
+            state,
+            is_me,
+        }
+    }
+
+    #[test]
+    fn review_info_merges_requests_and_reviews() {
+        let node = json!({
+            "reviewDecision": null,
+            "reviewRequests": { "nodes": [
+                { "requestedReviewer": { "login": "me" } },
+                { "requestedReviewer": {} }
+            ] },
+            "latestReviews": { "nodes": [
+                { "state": "COMMENTED", "author": { "login": "bob" } },
+                { "state": "COMMENTED", "author": { "login": "carol" } },
+                { "state": "COMMENTED", "author": { "login": "alice" } }
+            ] },
+            "latestOpinionatedReviews": { "nodes": [
+                { "state": "APPROVED", "author": { "login": "bob" } }
+            ] }
+        });
+        let status = review_info(&node, "alice", "me");
+        assert_eq!(
+            status.reviewers,
+            vec![
+                rv("me", ReviewerState::Requested, true),
+                rv("bob", ReviewerState::Approved, false),
+                rv("carol", ReviewerState::Commented, false),
+            ]
+        );
+        assert!(
+            status.approved,
+            "approved without a required-review decision"
+        );
+    }
+
+    #[test]
+    fn review_info_approval_rules() {
+        let opinionated = |states: &[&str]| {
+            json!({ "nodes": states.iter().enumerate().map(|(i, s)| json!({
+                "state": s, "author": { "login": format!("u{i}") }
+            })).collect::<Vec<_>>() })
+        };
+        let approved = |decision: Value, states: &[&str]| {
+            review_info(
+                &json!({ "reviewDecision": decision, "latestOpinionatedReviews": opinionated(states) }),
+                "a",
+                "me",
+            )
+            .approved
+        };
+        assert!(approved(json!("APPROVED"), &[]));
+        // Branch protection wants more approvals than there are.
+        assert!(!approved(json!("REVIEW_REQUIRED"), &["APPROVED"]));
+        assert!(!approved(Value::Null, &["APPROVED", "CHANGES_REQUESTED"]));
+        assert!(!approved(Value::Null, &["DISMISSED"]));
+        assert!(!approved(Value::Null, &[]));
+    }
+
+    #[test]
+    fn maps_comment_threads() {
+        let c = |id: &str, who: &str, at: &str, body: &str| json!({ "id": id, "body": body, "createdAt": at, "url": format!("u/{id}"), "author": { "login": who } });
+        let pr = json!({
+            "comments": { "totalCount": 1, "nodes": [c("c1", "bob", "2026-01-03", "General")] },
+            "reviews": { "totalCount": 4, "nodes": [
+                { "id": "r1", "body": "", "state": "COMMENTED", "createdAt": "2026-01-01", "author": { "login": "bob" } },
+                { "id": "r2", "body": "", "state": "APPROVED", "createdAt": "2026-01-05", "author": { "login": "me" } },
+                { "id": "r3", "body": "Draft", "state": "PENDING", "createdAt": "2026-01-06", "author": { "login": "me" } },
+                { "id": "r4", "body": "Please fix", "state": "CHANGES_REQUESTED", "createdAt": "2026-01-02", "author": null }
+            ] },
+            "reviewThreads": { "totalCount": 2, "nodes": [{
+                "id": "t1", "isResolved": true, "isOutdated": true, "path": "src/a.rs", "line": null, "originalLine": 7,
+                "comments": { "totalCount": 3, "nodes": [c("t1c1", "bob", "2026-01-01", "Inline"), c("t1c2", "me", "2026-01-04", "Done")] }
+            }] }
+        });
+        let out = map_comments(&pr, "me");
+        assert!(
+            out.truncated,
+            "a thread and the thread list have more than loaded"
+        );
+        let ids: Vec<&str> = out.threads.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, vec!["t1", "comment:r4", "comment:c1", "comment:r2"]);
+        let inline = &out.threads[0];
+        assert_eq!(inline.file.as_deref(), Some("src/a.rs"));
+        assert_eq!(inline.line, Some(7));
+        assert_eq!(inline.resolved, Some(true));
+        assert!(inline.outdated);
+        assert!(inline.comments[1].is_me && !inline.comments[0].is_me);
+        assert_eq!(out.threads[1].comments[0].author, "ghost");
+        assert_eq!(
+            out.threads[1].comments[0].review_state,
+            Some(ReviewerState::ChangesRequested)
+        );
+        assert_eq!(
+            out.threads[3].comments[0].review_state,
+            Some(ReviewerState::Approved)
+        );
+        assert!(out.threads[2].resolved.is_none() && out.threads[2].file.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_pr_skips_reviews_which_review_status_loads() {
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v3/repos/x/y/pulls/12"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(pr_fixture()))
+            .mount(&mock)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/graphql"))
+            .and(body_partial_json(
+                json!({ "variables": { "owner": "x", "name": "y", "number": 12 } }),
+            ))
+            .and(wiremock::matchers::body_string_contains(
+                "latestOpinionatedReviews",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "data": {
+                "repository": { "pullRequest": {
+                    "reviewDecision": "APPROVED",
+                    "reviewRequests": { "nodes": [{ "requestedReviewer": { "login": "me" } }] },
+                    "latestReviews": { "nodes": [] },
+                    "latestOpinionatedReviews": { "nodes": [{ "state": "APPROVED", "author": { "login": "bob" } }] }
+                } }
+            }})))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let gh = GitHub::new(
+            &server(&format!("{}/api/v3", mock.uri()), None),
+            "tok".into(),
+            Some("me".into()),
+            http_client(),
+        );
+        // Only the requested reviewers, and no GraphQL call: pollers and posting don't need more.
+        let mut pr = gh.get_pr("x/y", 12).await.unwrap();
+        assert!(!pr.approved);
+        assert_eq!(pr.reviewers, vec![rv("me", ReviewerState::Requested, true)]);
+
+        gh.review_status(&pr).await.unwrap().apply_to(&mut pr);
+        assert!(pr.approved && pr.review_requested);
+        assert_eq!(
+            pr.reviewers,
+            vec![
+                rv("me", ReviewerState::Requested, true),
+                rv("bob", ReviewerState::Approved, false),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn lists_the_newest_comments() {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/graphql"))
+            .and(wiremock::matchers::body_string_contains("comments(last: 100)"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "data": {
+                "viewer": { "login": "me" },
+                "repository": { "pullRequest": {
+                    "comments": { "totalCount": 1, "nodes": [{ "id": "c1", "body": "Hi", "createdAt": "2026-01-01", "author": { "login": "bob" } }] },
+                    "reviews": { "totalCount": 0, "nodes": [] },
+                    "reviewThreads": { "totalCount": 0, "nodes": [] }
+                } }
+            }})))
+            .mount(&mock)
+            .await;
+        let gh = GitHub::new(
+            &server(&format!("{}/api/v3", mock.uri()), None),
+            "tok".into(),
+            Some("me".into()),
+            http_client(),
+        );
+        let comments = gh.list_comments("x/y", 12).await.unwrap();
+        assert_eq!(comments.threads.len(), 1);
+        assert_eq!(comments.threads[0].comments[0].body, "Hi");
+        assert!(!comments.truncated);
+    }
+
+    #[tokio::test]
+    async fn list_comments_rejects_a_project_without_owner() {
+        let gh = GitHub::new(
+            &server("https://github.com", None),
+            "tok".into(),
+            Some("me".into()),
+            http_client(),
+        );
+        assert!(gh.list_comments("nope", 1).await.is_err());
     }
 
     #[test]

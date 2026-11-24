@@ -1,19 +1,21 @@
 import { type ReactNode, useCallback, useState } from "react";
 import { Link, useParams } from "react-router";
 import { useQuery } from "@tanstack/react-query";
-import { ArrowLeft, ExternalLink, FileText, Play, RefreshCw, Ticket as TicketIcon } from "lucide-react";
+import { ArrowLeft, ExternalLink, FileText, MessagesSquare, Play, RefreshCw, Ticket as TicketIcon } from "lucide-react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { api, errorMessage } from "../lib/api";
+import type { PrReviewer } from "../lib/bindings/PrReviewer";
 import type { PrTicketInfo } from "../lib/bindings/PrTicketInfo";
 import type { Review } from "../lib/bindings/Review";
 import type { Ticket } from "../lib/bindings/Ticket";
 import type { TicketAttachment } from "../lib/bindings/TicketAttachment";
 import type { TicketLoad } from "../lib/bindings/TicketLoad";
-import { relativeTime } from "../lib/format";
+import { relativeTime, REVIEWER_STATE_LABEL } from "../lib/format";
 import { jiraToMarkdown } from "../lib/jiraMarkup";
 import { useStartReview } from "../lib/useStartReview";
 import { Markdown } from "../components/Markdown";
-import { ReviewStatusBadge } from "../components/badges";
+import { ExistingComments } from "../components/ExistingComments";
+import { PrReviewBadges, ReviewStatusBadge } from "../components/badges";
 import { Badge, Button, Card, ErrorBanner, PageHeader, Spinner } from "../components/ui";
 
 export function PrDetailPage() {
@@ -62,6 +64,7 @@ export function PrDetailPage() {
             {pr.draft && <Badge>Draft</Badge>}
             {pr.reviewRequested && <Badge tone="accent">Review requested</Badge>}
             {tracked?.hasNewChanges && <Badge tone="warn">New changes</Badge>}
+            <PrReviewBadges pr={pr} />
             <span>{pr.author}</span>
             <span>·</span>
             <span className="font-mono">
@@ -117,9 +120,15 @@ export function PrDetailPage() {
               info={tickets}
             />
           )}
+          <section>
+            <SectionTitle icon={<MessagesSquare className="size-3.5" />}>Comments</SectionTitle>
+            <ExistingComments serverId={serverId} projectId={projectId} number={number} webUrl={pr.webUrl} />
+          </section>
         </div>
 
         <aside className="space-y-2">
+          <SectionTitle>Reviewers</SectionTitle>
+          <ReviewerList reviewers={pr.reviewers} />
           <SectionTitle>Reviews</SectionTitle>
           {reviews.length === 0 ? (
             <p className="text-[13px] text-muted">Not reviewed yet.</p>
@@ -142,6 +151,25 @@ function SectionTitle({ icon, children }: { icon?: ReactNode; children: ReactNod
       {icon}
       {children}
     </h2>
+  );
+}
+
+function ReviewerList({ reviewers }: { reviewers: PrReviewer[] }) {
+  if (reviewers.length === 0) return <p className="pb-2 text-[13px] text-muted">Nobody yet.</p>;
+  return (
+    <ul className="space-y-1 pb-2">
+      {reviewers.map((r) => (
+        <li key={r.login} className="flex items-center justify-between gap-2 px-2 py-1 text-[13px]">
+          <span className="truncate">
+            {r.login}
+            {r.isMe && <span className="text-muted"> (you)</span>}
+          </span>
+          <Badge tone={r.state === "approved" ? "ok" : r.state === "changes_requested" ? "warn" : "neutral"}>
+            {REVIEWER_STATE_LABEL[r.state]}
+          </Badge>
+        </li>
+      ))}
+    </ul>
   );
 }
 

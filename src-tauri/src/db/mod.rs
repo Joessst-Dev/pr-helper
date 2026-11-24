@@ -1137,6 +1137,8 @@ mod tests {
             updated_at: now(),
             review_requested: true,
             authored_by_me: false,
+            reviewers: Vec::new(),
+            approved: false,
         }
     }
 

@@ -8,6 +8,7 @@ import type { EnvironmentStatus } from "./bindings/EnvironmentStatus";
 import type { Finding } from "./bindings/Finding";
 import type { PostOutcome } from "./bindings/PostOutcome";
 import type { PostRequest } from "./bindings/PostRequest";
+import type { PrComments } from "./bindings/PrComments";
 import type { PrDetail } from "./bindings/PrDetail";
 import type { PrFilter } from "./bindings/PrFilter";
 import type { PrListItem } from "./bindings/PrListItem";
@@ -42,6 +43,8 @@ export const api = {
   listPrs: (serverId: string, filter: PrFilter) => invoke<PrListItem[]>("list_prs", { serverId, filter }),
   getPrDetail: (serverId: string, projectId: string, number: number) =>
     invoke<PrDetail>("get_pr_detail", { serverId, projectId, number }),
+  listPrComments: (serverId: string, projectId: string, number: number) =>
+    invoke<PrComments>("list_pr_comments", { serverId, projectId, number }),
   loadPrTickets: (serverId: string, repo: string, keys: string[], requestId: string) =>
     invoke<TicketLoad[]>("load_pr_tickets", { serverId, repo, keys, requestId }),
   loadTicketImage: (serverId: string, repo: string, key: string, attachmentId: string) =>

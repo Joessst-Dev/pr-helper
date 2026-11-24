@@ -14,6 +14,8 @@ export function useBackendEvents() {
         qc.invalidateQueries({ queryKey: ["reviews"] });
         qc.invalidateQueries({ queryKey: ["prs"] });
         qc.invalidateQueries({ queryKey: ["pr"] });
+        // Posting a review adds comments.
+        qc.invalidateQueries({ queryKey: ["pr-comments"] });
       }),
       listen("tracked-updated", () => {
         qc.invalidateQueries({ queryKey: ["tracked"] });

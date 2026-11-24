@@ -291,6 +291,8 @@ mod tests {
             updated_at: String::new(),
             review_requested: false,
             authored_by_me: false,
+            reviewers: Vec::new(),
+            approved: false,
         }
     }
 

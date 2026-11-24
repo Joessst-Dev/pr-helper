@@ -1,3 +1,4 @@
+import type { ReviewerState } from "./bindings/ReviewerState";
 import type { Severity } from "./bindings/Severity";
 import type { Verdict } from "./bindings/Verdict";
 import type { SettingSource } from "./bindings/SettingSource";
@@ -18,6 +19,13 @@ export const VERDICT_LABEL: Record<Verdict, string> = {
   approve: "Approve",
   request_changes: "Changes requested",
   comment: "Comment",
+};
+
+export const REVIEWER_STATE_LABEL: Record<ReviewerState, string> = {
+  requested: "Requested",
+  commented: "Commented",
+  changes_requested: "Changes requested",
+  approved: "Approved",
 };
 
 export const SOURCE_LABEL: Record<SettingSource, string> = {

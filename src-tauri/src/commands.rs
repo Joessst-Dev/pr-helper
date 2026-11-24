@@ -7,9 +7,9 @@ use tauri::State;
 use ts_rs::TS;
 
 use crate::db::models::{
-    CriticalFile, CriticalFileContent, Finding, PrState, PullRequest, Review, ReviewTrigger,
-    Server, ServerInput, Skill, SkillInput, TicketSource, TicketSourceInput, TicketSourceKind,
-    TrackedPr,
+    CriticalFile, CriticalFileContent, Finding, PrComments, PrState, PullRequest, Review,
+    ReviewTrigger, Server, ServerInput, Skill, SkillInput, TicketSource, TicketSourceInput,
+    TicketSourceKind, TrackedPr,
 };
 use crate::env;
 use crate::error::{AppError, AppResult};
@@ -155,7 +155,16 @@ pub async fn get_pr_detail(
     number: u64,
 ) -> AppResult<PrDetail> {
     let (_server, provider) = svc.provider_for(&server_id)?;
-    let pr = provider.get_pr(&project_id, number).await?;
+    let mut pr = provider.get_pr(&project_id, number).await?;
+    // Display only: without it the PR keeps its requested reviewers.
+    match provider.review_status(&pr).await {
+        Ok(status) => status.apply_to(&mut pr),
+        Err(e) => tracing::warn!(
+            "could not load the reviews of {}#{}: {e}",
+            pr.repo,
+            pr.number
+        ),
+    }
     let settings = svc.effective_settings(&server_id, Some(&pr.repo))?;
     let tickets = match svc.ticket_plan(&settings, &pr) {
         TicketPlan::NotConfigured => None,
@@ -182,6 +191,18 @@ pub async fn get_pr_detail(
         tickets,
         pr,
     })
+}
+
+/// Everyone's comments on a PR. Display only: they never reach the reviewer.
+#[tauri::command]
+pub async fn list_pr_comments(
+    svc: Svc<'_>,
+    server_id: String,
+    project_id: String,
+    number: u64,
+) -> AppResult<PrComments> {
+    let (_server, provider) = svc.provider_for(&server_id)?;
+    provider.list_comments(&project_id, number).await
 }
 
 #[tauri::command]

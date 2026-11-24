@@ -1,6 +1,34 @@
 import type { Finding } from "../lib/bindings/Finding";
+import type { PullRequest } from "../lib/bindings/PullRequest";
 import type { EffectiveSettings } from "../lib/bindings/EffectiveSettings";
 import type { TicketSource } from "../lib/bindings/TicketSource";
+
+export function pr(overrides: Partial<PullRequest> = {}): PullRequest {
+  return {
+    serverId: "s1",
+    repo: "acme/app",
+    projectId: "acme/app",
+    number: 42,
+    title: "Add login",
+    description: "Implements **login**.",
+    author: "dev",
+    webUrl: "https://github.com/acme/app/pull/42",
+    cloneUrl: null,
+    headSha: "abc",
+    baseSha: null,
+    startSha: null,
+    headRef: "feature/login",
+    baseRef: "main",
+    draft: false,
+    state: "open",
+    updatedAt: new Date().toISOString(),
+    reviewRequested: true,
+    authoredByMe: false,
+    reviewers: [],
+    approved: false,
+    ...overrides,
+  };
+}
 
 export function finding(overrides: Partial<Finding> = {}): Finding {
   return {

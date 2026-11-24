@@ -158,6 +158,88 @@ pub struct PullRequest {
     pub updated_at: String,
     pub review_requested: bool,
     pub authored_by_me: bool,
+    /// People other than the author who were asked to review or already reviewed, one entry
+    /// per person. Includes the user (`is_me`).
+    #[serde(default)]
+    pub reviewers: Vec<PrReviewer>,
+    /// Approved by enough reviewers, as far as the forge tells.
+    #[serde(default)]
+    pub approved: bool,
+}
+
+/// Where a reviewer stands on a PR.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum ReviewerState {
+    Requested,
+    Commented,
+    ChangesRequested,
+    Approved,
+}
+
+impl ReviewerState {
+    /// Which state wins when one person shows up more than once: a verdict beats a comment,
+    /// which beats a pending request.
+    pub fn rank(self) -> u8 {
+        match self {
+            Self::Requested => 0,
+            Self::Commented => 1,
+            Self::ChangesRequested => 2,
+            Self::Approved => 3,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct PrReviewer {
+    pub login: String,
+    pub state: ReviewerState,
+    pub is_me: bool,
+}
+
+/// One comment someone left on a PR. Author-controlled text: display only.
+#[derive(Debug, Clone, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct PrComment {
+    pub id: String,
+    pub author: String,
+    pub is_me: bool,
+    pub body: String,
+    pub created_at: String,
+    pub url: Option<String>,
+    /// Set on the summary of a submitted review.
+    pub review_state: Option<ReviewerState>,
+}
+
+/// A conversation on a PR: a general comment, a review summary or an inline thread.
+#[derive(Debug, Clone, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct PrThread {
+    pub id: String,
+    /// Set for inline threads.
+    pub file: Option<String>,
+    #[ts(type = "number | null")]
+    pub line: Option<u64>,
+    /// `None` when the thread can't be resolved.
+    pub resolved: Option<bool>,
+    /// The code it points at has changed since (GitHub only).
+    pub outdated: bool,
+    pub comments: Vec<PrComment>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct PrComments {
+    /// Oldest first.
+    pub threads: Vec<PrThread>,
+    /// The forge has more than was loaded.
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
