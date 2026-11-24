@@ -38,15 +38,11 @@ impl GitLab {
         } else {
             format!("{base}/api/v4")
         };
-        let cell = tokio::sync::OnceCell::new();
-        if let Some(u) = username {
-            let _ = cell.set(u);
-        }
         Self {
             server_id: server.id.clone(),
             api,
             token,
-            username: cell,
+            username: tokio::sync::OnceCell::new_with(username),
             groups: server
                 .pr_scope
                 .as_deref()
@@ -84,16 +80,14 @@ impl GitLab {
     }
 
     /// Follows `x-next-page` pagination.
-    async fn paged(&self, path: &str, query: &[(&str, String)]) -> AppResult<Vec<Value>> {
+    async fn paged(&self, path: &str, query: &[(&str, &str)]) -> AppResult<Vec<Value>> {
         let mut out = Vec::new();
         let mut page = 1u32;
         loop {
-            let mut q: Vec<(&str, String)> = query.to_vec();
-            q.push(("per_page", "100".into()));
-            q.push(("page", page.to_string()));
             let resp = self
                 .req(reqwest::Method::GET, path)
-                .query(&q)
+                .query(query)
+                .query(&[("per_page", "100"), ("page", &page.to_string())])
                 .send()
                 .await?;
             let resp = check(NAME, resp).await?;
@@ -200,19 +194,14 @@ impl GitProvider for GitLab {
     }
 
     async fn list_open_prs(&self, filter: PrFilter) -> AppResult<Vec<PullRequest>> {
+        const OPENED: (&str, &str) = ("state", "opened");
         let me = self.me().await?;
-        let base = [("state", "opened".to_string())];
         let mut raw: Vec<Value> = Vec::new();
-        let with = |extra: &[(&'static str, String)]| {
-            let mut q = base.to_vec();
-            q.extend_from_slice(extra);
-            q
-        };
         match filter {
             PrFilter::All if !self.groups.is_empty() => {
                 for g in &self.groups {
                     let path = format!("/groups/{}/merge_requests", urlencoding::encode(g));
-                    raw.extend(self.paged(&path, &with(&[("scope", "all".into())])).await?);
+                    raw.extend(self.paged(&path, &[OPENED, ("scope", "all")]).await?);
                 }
             }
             // Without a group, `scope=all` means every merge request the token can see, which
@@ -226,25 +215,23 @@ impl GitProvider for GitLab {
                 raw = self
                     .paged(
                         "/merge_requests",
-                        &with(&[("scope", "all".into()), ("reviewer_username", me.clone())]),
+                        &[OPENED, ("scope", "all"), ("reviewer_username", &me)],
                     )
                     .await?
             }
             PrFilter::Authored => {
                 raw = self
-                    .paged(
-                        "/merge_requests",
-                        &with(&[("scope", "created_by_me".into())]),
-                    )
+                    .paged("/merge_requests", &[OPENED, ("scope", "created_by_me")])
                     .await?
             }
             PrFilter::Involved => {
-                for extra in [
-                    vec![("scope", "assigned_to_me".to_string())],
-                    vec![("scope", "all".into()), ("reviewer_username", me.clone())],
-                    vec![("scope", "created_by_me".into())],
-                ] {
-                    raw.extend(self.paged("/merge_requests", &with(&extra)).await?);
+                let queries: [&[(&str, &str)]; 3] = [
+                    &[OPENED, ("scope", "assigned_to_me")],
+                    &[OPENED, ("scope", "all"), ("reviewer_username", &me)],
+                    &[OPENED, ("scope", "created_by_me")],
+                ];
+                for query in queries {
+                    raw.extend(self.paged("/merge_requests", query).await?);
                 }
             }
         }

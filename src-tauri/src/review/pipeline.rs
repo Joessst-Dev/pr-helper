@@ -235,7 +235,7 @@ async fn execute(
         settings: &settings,
         skills: &skill_infos,
         context_dir: &context_dir,
-        changed_files: index.paths().count(),
+        changed_files: index.len(),
         previous: previous.as_ref().map(|p| PreviousReview {
             reviewed_sha: &p.head_sha,
             verdict: p.verdict,

@@ -1,7 +1,7 @@
 //! Shared application state used by commands, the review queue and the watcher.
 //! Everything UI-specific goes through [`UiSink`] so the logic is testable without Tauri.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -103,7 +103,7 @@ pub struct Service {
     pub sink: Arc<dyn UiSink>,
     pub queue: ReviewQueue,
     provider_factory: Box<ProviderFactory>,
-    logs: Mutex<HashMap<String, Vec<ProgressEvent>>>,
+    logs: Mutex<HashMap<String, VecDeque<ProgressEvent>>>,
     /// Running ticket loads of the PR view, by request id, so the UI can cancel them.
     ticket_loads: Mutex<HashMap<String, CancellationToken>>,
     /// Running AI checks of user comments, by request id, so the UI can cancel them.
@@ -654,9 +654,9 @@ impl Service {
             let mut logs = self.logs.lock().unwrap_or_else(PoisonError::into_inner);
             let log = logs.entry(review_id.to_string()).or_default();
             if log.len() >= MAX_LOG_LINES {
-                log.remove(0);
+                log.pop_front();
             }
-            log.push(event.clone());
+            log.push_back(event.clone());
         }
         self.sink.review_progress(&event);
     }
@@ -666,8 +666,7 @@ impl Service {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .get(review_id)
-            .cloned()
-            .unwrap_or_default()
+            .map_or_default(|log| log.iter().cloned().collect())
     }
 
     pub fn publish_review(&self, review_id: &str) {

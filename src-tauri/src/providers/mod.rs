@@ -131,11 +131,8 @@ pub async fn check(
     let message = serde_json::from_str::<serde_json::Value>(&body)
         .ok()
         .and_then(|v| {
-            let m = v.get("message").or_else(|| v.get("error")).cloned()?;
-            let mut text = match m {
-                serde_json::Value::String(s) => s,
-                other => other.to_string(),
-            };
+            let m = v.get("message").or_else(|| v.get("error"))?;
+            let mut text = m.as_str().map_or_else(|| m.to_string(), str::to_owned);
             if let Some(errors) = v.get("errors") {
                 let _ = write!(text, " {errors}");
             }

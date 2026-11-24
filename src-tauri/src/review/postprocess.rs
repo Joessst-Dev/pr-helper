@@ -365,15 +365,15 @@ fn strip_attribution_line(line: &str, stash: &[String]) -> Option<String> {
     if !attribution_hit(line, stash) {
         return Some(line.to_string());
     }
-    let kept: Vec<&str> = split_sentences(line)
+    let kept: String = split_sentences(line)
         .into_iter()
         .filter(|s| !attribution_hit(s, stash))
         .collect();
-    let joined = kept.concat().trim().to_string();
+    let joined = kept.trim().to_string();
     if joined.is_empty() {
         None
     } else {
-        let indent: String = line.chars().take_while(|c| c.is_whitespace()).collect();
+        let indent = &line[..line.len() - line.trim_start().len()];
         Some(format!("{indent}{joined}"))
     }
 }

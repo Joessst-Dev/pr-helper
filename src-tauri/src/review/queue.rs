@@ -59,18 +59,16 @@ impl ReviewQueue {
 
     pub fn is_active(&self, server_id: &str, repo: &str, number: u64) -> bool {
         self.jobs()
-            .contains_key(&(server_id.to_string(), repo.to_string(), number))
+            .keys()
+            .any(|(s, r, n)| s == server_id && r == repo && *n == number)
     }
 
     pub fn cancel(&self, review_id: &str) -> bool {
-        let jobs = self.jobs();
-        match jobs.values().find(|j| j.review_id == review_id) {
-            Some(job) => {
-                job.cancel.cancel();
-                true
-            }
-            None => false,
-        }
+        self.jobs()
+            .values()
+            .find(|j| j.review_id == review_id)
+            .map(|job| job.cancel.cancel())
+            .is_some()
     }
 
     /// Changes how many reviews may run at once. Lowering the limit lets running reviews

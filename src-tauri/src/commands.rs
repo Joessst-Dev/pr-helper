@@ -162,8 +162,8 @@ pub async fn get_pr_detail(
         TicketPlan::Skipped {
             source, message, ..
         } => Some(PrTicketInfo {
-            source_name: source.as_ref().map_or_default(|s| s.name.clone()),
-            source_kind: source.map(|s| s.kind),
+            source_kind: source.as_ref().map(|s| s.kind),
+            source_name: source.map_or_default(|s| s.name),
             keys: Vec::new(),
             message: Some(message),
         }),
@@ -406,10 +406,11 @@ pub fn save_repo_settings(
     repo: String,
     settings: SettingsOverrides,
 ) -> AppResult<()> {
-    if repo.trim().is_empty() {
+    let repo = repo.trim();
+    if repo.is_empty() {
         return Err(AppError::invalid("repository path is required"));
     }
-    svc.db.set_repo_settings(&server_id, repo.trim(), &settings)
+    svc.db.set_repo_settings(&server_id, repo, &settings)
 }
 
 #[derive(Debug, Clone, Serialize, TS)]
@@ -537,19 +538,20 @@ async fn tool_status(name: &str, override_path: Option<&str>) -> ToolStatus {
                 .env("PATH", env::login_path())
                 .output()
                 .await;
+            let path = Some(path.to_string_lossy().into_owned());
             match out {
                 Ok(o) if o.status.success() => ToolStatus {
-                    path: Some(path.to_string_lossy().into()),
+                    path,
                     version: Some(String::from_utf8_lossy(&o.stdout).trim().to_string()),
                     error: None,
                 },
                 Ok(o) => ToolStatus {
-                    path: Some(path.to_string_lossy().into()),
+                    path,
                     version: None,
                     error: Some(String::from_utf8_lossy(&o.stderr).trim().to_string()),
                 },
                 Err(e) => ToolStatus {
-                    path: Some(path.to_string_lossy().into()),
+                    path,
                     version: None,
                     error: Some(e.to_string()),
                 },
@@ -566,8 +568,9 @@ async fn tool_status(name: &str, override_path: Option<&str>) -> ToolStatus {
 #[tauri::command]
 pub async fn check_environment(svc: Svc<'_>) -> AppResult<EnvironmentStatus> {
     let config = svc.db.app_config()?;
-    Ok(EnvironmentStatus {
-        claude: tool_status("claude", config.claude_path.as_deref()).await,
-        git: tool_status("git", config.git_path.as_deref()).await,
-    })
+    let (claude, git) = tokio::join!(
+        tool_status("claude", config.claude_path.as_deref()),
+        tool_status("git", config.git_path.as_deref()),
+    );
+    Ok(EnvironmentStatus { claude, git })
 }

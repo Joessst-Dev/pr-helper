@@ -4,6 +4,7 @@
 //! Right side = new file (added or context lines), left side = old file (removed lines).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fmt::Write as _;
 
 use crate::db::models::{DiffLineKind, FileDiffLine, Side};
 
@@ -43,17 +44,23 @@ impl FileDiff {
             .iter()
             .take(max)
             .map(|l| FileDiffLine {
-                kind: match l.kind {
-                    LineKind::Context => DiffLineKind::Context,
-                    LineKind::Added => DiffLineKind::Added,
-                    LineKind::Removed => DiffLineKind::Removed,
-                },
+                kind: l.kind.into(),
                 old: l.old,
                 new: l.new,
                 text: l.text.clone(),
             })
             .collect();
         (lines, self.lines.len() > max)
+    }
+}
+
+impl From<LineKind> for DiffLineKind {
+    fn from(kind: LineKind) -> Self {
+        match kind {
+            LineKind::Context => Self::Context,
+            LineKind::Added => Self::Added,
+            LineKind::Removed => Self::Removed,
+        }
     }
 }
 
@@ -183,8 +190,9 @@ impl DiffIndex {
             .or_else(|| self.files.values().find(|f| f.old_path == path))
     }
 
-    pub fn paths(&self) -> impl Iterator<Item = &String> {
-        self.files.keys()
+    /// Number of changed files.
+    pub fn len(&self) -> usize {
+        self.files.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -247,21 +255,20 @@ impl DiffIndex {
         })?;
         let start = idx.saturating_sub(context);
         let end = (idx + context + 1).min(f.lines.len());
-        Some(
-            f.lines[start..end]
-                .iter()
-                .map(|l| {
-                    let mark = match l.kind {
-                        LineKind::Context => ' ',
-                        LineKind::Added => '+',
-                        LineKind::Removed => '-',
-                    };
-                    let no = l.new.or(l.old).unwrap_or(0);
-                    format!("{mark}{no:>5} {}", l.text)
-                })
-                .collect::<Vec<_>>()
-                .join("\n"),
-        )
+        let mut out = String::new();
+        for l in &f.lines[start..end] {
+            let mark = match l.kind {
+                LineKind::Context => ' ',
+                LineKind::Added => '+',
+                LineKind::Removed => '-',
+            };
+            let no = l.new.or(l.old).unwrap_or(0);
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            let _ = write!(out, "{mark}{no:>5} {}", l.text);
+        }
+        Some(out)
     }
 }
 
@@ -270,8 +277,11 @@ fn strip_prefix_path(p: &str, prefix: &str) -> Option<String> {
     if p == "/dev/null" {
         return None;
     }
-    let p = unquote(p);
-    Some(p.strip_prefix(prefix).unwrap_or(&p).to_string())
+    let mut p = unquote(p);
+    if p.starts_with(prefix) {
+        p.drain(..prefix.len());
+    }
+    Some(p)
 }
 
 /// Undoes git's C-style path quoting (`"caf\303\251.rs"`, `"a\tb"`), which it applies to

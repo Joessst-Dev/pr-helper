@@ -102,7 +102,7 @@ impl JiraClient {
         if !is_valid_key(key) {
             return Err(AppError::invalid(format!("invalid ticket key {key:?}")));
         }
-        let mut fields = vec![
+        let fields: Vec<&str> = [
             "summary",
             "issuetype",
             "status",
@@ -112,9 +112,8 @@ impl JiraClient {
             "attachment",
         ]
         .into_iter()
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-        fields.extend(extra_fields.iter().cloned());
+        .chain(extra_fields.iter().map(String::as_str))
+        .collect();
         let req = self.get(&format!("/issue/{key}")).query(&[
             ("fields", fields.join(",")),
             ("expand", "names".to_string()),
@@ -246,10 +245,9 @@ fn parse_issue(v: &Value, key: &str, extra_fields: &[String], base: &str) -> Tic
             })
         })
         .collect();
-    let all_comments = f["comment"]["comments"]
+    let all_comments: &[Value] = f["comment"]["comments"]
         .as_array()
-        .cloned()
-        .unwrap_or_default();
+        .map_or(&[], Vec::as_slice);
     let comment_total = f["comment"]["total"]
         .as_u64()
         .map_or(all_comments.len(), |t| {
@@ -288,7 +286,7 @@ fn parse_issue(v: &Value, key: &str, extra_fields: &[String], base: &str) -> Tic
 /// Image attachments in Jira's order (oldest first), as the text references them by file name.
 /// On tickets with very many images only the newest [`MAX_ATTACHMENTS`] are kept.
 fn parse_attachments(v: &Value) -> Vec<TicketAttachment> {
-    let images: Vec<TicketAttachment> = v
+    let mut images: Vec<TicketAttachment> = v
         .as_array()
         .into_iter()
         .flatten()
@@ -312,7 +310,8 @@ fn parse_attachments(v: &Value) -> Vec<TicketAttachment> {
         })
         .collect();
     let skip = images.len().saturating_sub(MAX_ATTACHMENTS);
-    images.into_iter().skip(skip).collect()
+    images.drain(..skip);
+    images
 }
 
 /// Best-effort plain text for any Jira field value.

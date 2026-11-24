@@ -96,8 +96,8 @@ pub fn build_inline(
                 };
                 inline.push(InlineComment {
                     finding_id: f.id.clone(),
-                    path: a.new_path.clone(),
-                    old_path: a.old_path.clone(),
+                    path: a.new_path,
+                    old_path: a.old_path,
                     line,
                     start_line,
                     side: a.side,
@@ -147,12 +147,12 @@ pub async fn post_findings(svc: &Arc<Service>, req: PostRequest) -> AppResult<Po
     // Rebuild the diff index for the reviewed commit to validate anchors.
     let base = review
         .base_sha
-        .clone()
-        .or_else(|| pr.base_sha.clone())
+        .as_deref()
+        .or(pr.base_sha.as_deref())
         .ok_or_else(|| AppError::invalid("unknown base commit for this review"))?;
     let clone_url = pr
         .clone_url
-        .clone()
+        .as_deref()
         .ok_or_else(|| AppError::invalid("the provider returned no clone URL"))?;
     let auth = provider.git_auth_header();
     let pr_ref = provider.pr_fetch_ref(pr.number);
@@ -161,19 +161,19 @@ pub async fn post_findings(svc: &Arc<Service>, req: PostRequest) -> AppResult<Po
         .ensure_pr(&FetchSpec {
             server_id: &review.server_id,
             repo: &review.repo,
-            clone_url: &clone_url,
+            clone_url,
             pr_ref: &pr_ref,
             number: review.number,
             base_ref: &pr.base_ref,
             head_sha: &review.head_sha,
-            base_sha: Some(&base),
+            base_sha: Some(base),
             auth_header: Some(&auth),
         })
         .await?;
-    let index = DiffIndex::parse(&svc.cache.diff(&bare, &base, &review.head_sha).await?);
+    let index = DiffIndex::parse(&svc.cache.diff(&bare, base, &review.head_sha).await?);
     let (mut inline, general) = build_inline(&findings, &index, &settings)?;
 
-    let mut folded_ids: Vec<String> = general.iter().map(|(id, _)| id.clone()).collect();
+    let mut folded_ids: Vec<String> = Vec::with_capacity(general.len());
     let mut body_parts: Vec<String> = Vec::new();
     if let Some(summary) = req.summary.as_deref() {
         let s = finalize_body(summary, &settings)?;
@@ -181,7 +181,10 @@ pub async fn post_findings(svc: &Arc<Service>, req: PostRequest) -> AppResult<Po
             body_parts.push(s);
         }
     }
-    body_parts.extend(general.into_iter().map(|(_, text)| text));
+    for (id, text) in general {
+        folded_ids.push(id);
+        body_parts.push(text);
+    }
 
     if head_moved {
         match server.kind {

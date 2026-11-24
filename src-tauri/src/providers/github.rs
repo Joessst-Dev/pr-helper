@@ -54,17 +54,18 @@ impl GitHub {
         client: reqwest::Client,
     ) -> Self {
         let (api, graphql) = api_urls(&server.base_url);
-        let cell = tokio::sync::OnceCell::new();
-        if let Some(u) = username {
-            let _ = cell.set(u);
-        }
         Self {
             server_id: server.id.clone(),
             api,
             graphql,
             token,
-            username: cell,
-            scope: server.pr_scope.clone().filter(|s| !s.trim().is_empty()),
+            username: tokio::sync::OnceCell::new_with(username),
+            scope: server
+                .pr_scope
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned),
             client,
         }
     }
@@ -139,7 +140,7 @@ impl GitHub {
         match (&self.scope, filter) {
             (Some(scope), _) => {
                 q.push(' ');
-                q.push_str(scope.trim());
+                q.push_str(scope);
             }
             (None, PrFilter::All) => {
                 // Multiple user:/org: qualifiers are ORed by GitHub search.
@@ -299,12 +300,9 @@ query($q: String!, $cursor: String) {
             let data = self
                 .graphql(QUERY, json!({ "q": q, "cursor": cursor }))
                 .await?;
-            let me = data["viewer"]["login"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string();
+            let me = data["viewer"]["login"].as_str().unwrap_or_default();
             for n in data["search"]["nodes"].as_array().into_iter().flatten() {
-                if let Some(pr) = self.map_search_node(n, &me) {
+                if let Some(pr) = self.map_search_node(n, me) {
                     out.push(pr);
                 }
             }

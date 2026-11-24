@@ -198,25 +198,26 @@ pub async fn fetch(
     }
     let tools = allowed_tools(source)?;
     tokio::fs::create_dir_all(env.work_dir).await?;
+    let prompt = prompt(source, key, &tools, extra_fields);
     let request = RunRequest {
-        policy: ToolPolicy::TicketFetcher {
-            allowed: tools.clone(),
-        },
+        policy: ToolPolicy::TicketFetcher { allowed: tools },
         claude: env.claude,
         path_env: env.path_env,
         cwd: env.work_dir.to_path_buf(),
         add_dirs: Vec::new(),
         plugin_dir: None,
         system_prompt: SYSTEM.into(),
-        prompt: prompt(source, key, &tools, extra_fields),
+        prompt,
         schema: schema(),
         session_id: uuid::Uuid::new_v4().to_string(),
         model: Some(
             source
                 .model
-                .clone()
-                .filter(|m| !m.trim().is_empty())
-                .unwrap_or_else(|| DEFAULT_MODEL.into()),
+                .as_deref()
+                .map(str::trim)
+                .filter(|m| !m.is_empty())
+                .unwrap_or(DEFAULT_MODEL)
+                .to_owned(),
         ),
         effort: None,
         max_budget_usd: None,

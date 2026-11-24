@@ -75,12 +75,7 @@ impl RepoCache {
     }
 
     fn cmd(&self, auth_header: Option<&str>) -> Command {
-        let git = self
-            .git
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone();
-        let mut c = Command::new(git);
+        let mut c = Command::new(&*self.git.read().unwrap_or_else(PoisonError::into_inner));
         c.env("PATH", &self.path_env)
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GIT_ASKPASS", "")

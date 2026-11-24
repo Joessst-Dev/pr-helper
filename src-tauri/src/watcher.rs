@@ -142,11 +142,9 @@ async fn tick(
         }
         let title = format!("New changes on {}#{}", t.repo, t.number);
         if d.auto_review {
-            match queue::enqueue(svc, fresh.clone(), ReviewTrigger::Auto) {
-                Ok(_) => svc.sink.notify(
-                    &title,
-                    &format!("\"{}\" changed. An auto-review has started.", fresh.title),
-                ),
+            let started = format!("\"{}\" changed. An auto-review has started.", fresh.title);
+            match queue::enqueue(svc, fresh, ReviewTrigger::Auto) {
+                Ok(_) => svc.sink.notify(&title, &started),
                 Err(e) => {
                     // Leave the stored head alone so the next poll tries again.
                     tracing::warn!(
