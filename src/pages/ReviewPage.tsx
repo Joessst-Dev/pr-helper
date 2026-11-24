@@ -24,6 +24,7 @@ import {
 import { ReviewStatusBadge, VerdictBadge } from "../components/badges";
 import type { CommentActions } from "../components/CommentComposer";
 import { CriticalFiles } from "../components/CriticalFiles";
+import { ExistingCommentsDisclosure } from "../components/ExistingComments";
 import { FindingCard, RulesWarning, useCommentCheck } from "../components/FindingCard";
 import { TicketChips } from "../components/TicketChips";
 import { Badge, Button, Card, EmptyState, ErrorBanner, PageHeader, Select, Spinner, TextArea } from "../components/ui";
@@ -107,6 +108,12 @@ export function ReviewPage() {
         <div className="min-w-0 space-y-4">
           {review.status === "failed" && <ErrorBanner error={review.error ?? "The review failed"} />}
           {cancel.error && <ErrorBanner error={errorMessage(cancel.error)} />}
+          <ExistingCommentsDisclosure
+            serverId={review.serverId}
+            projectId={review.projectId}
+            number={review.number}
+            webUrl={detail.data.webUrl}
+          />
           {review.status !== "done" && <ProgressLog key={reviewId} reviewId={reviewId} initial={detail.data.log} live={running} />}
           {review.status === "done" && (
             <ReviewResults

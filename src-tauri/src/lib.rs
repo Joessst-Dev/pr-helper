@@ -214,6 +214,7 @@ pub fn run() {
             commands::test_ticket_source,
             commands::list_prs,
             commands::get_pr_detail,
+            commands::list_pr_comments,
             commands::load_pr_tickets,
             commands::cancel_ticket_load,
             commands::load_ticket_image,

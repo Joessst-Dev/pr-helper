@@ -8,7 +8,7 @@ import type { PrFilter } from "../lib/bindings/PrFilter";
 import type { PrListItem } from "../lib/bindings/PrListItem";
 import { relativeTime } from "../lib/format";
 import { prDetailPath, useStartReview } from "../lib/useStartReview";
-import { ReviewStatusBadge } from "../components/badges";
+import { PrReviewBadges, ReviewStatusBadge } from "../components/badges";
 import { Badge, Button, EmptyState, ErrorBanner, Input, PageHeader, Segmented, Spinner } from "../components/ui";
 
 const FILTERS: { value: PrFilter; label: string }[] = [
@@ -106,6 +106,7 @@ function PrRow({ item, serverId }: { item: PrListItem; serverId: string }) {
           {pr.draft && <Badge>Draft</Badge>}
           {pr.reviewRequested && <Badge tone="accent">Review requested</Badge>}
           {tracked?.hasNewChanges && <Badge tone="warn">New changes</Badge>}
+          <PrReviewBadges pr={pr} />
         </div>
         <div className="mt-0.5 flex items-center gap-1.5 text-xs text-muted">
           <span className="font-mono">

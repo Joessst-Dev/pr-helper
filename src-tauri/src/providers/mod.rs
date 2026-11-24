@@ -9,7 +9,9 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
-use crate::db::models::{ProviderKind, PullRequest, Server, Side};
+use crate::db::models::{
+    PrComments, PrReviewer, ProviderKind, PullRequest, ReviewerState, Server, Side,
+};
 use crate::error::{AppError, AppResult};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -85,10 +87,60 @@ pub trait GitProvider: Send + Sync {
         submission: &ReviewSubmission,
     ) -> AppResult<PostResult>;
     async fn approve(&self, pr: &PullRequest, body: &str) -> AppResult<()>;
+    /// Who reviews a PR and whether it is approved. [`Self::get_pr`] leaves this out (it only
+    /// knows the requested reviewers) because most callers don't need it;
+    /// [`Self::list_open_prs`] includes it.
+    async fn review_status(&self, pr: &PullRequest) -> AppResult<PrReviewInfo>;
+    /// Everyone's comments on a PR, for display. The text is author-controlled.
+    async fn list_comments(&self, project_id: &str, number: u64) -> AppResult<PrComments>;
     /// `Authorization` header for git over HTTPS.
     fn git_auth_header(&self) -> String;
     /// The ref the forge publishes a PR's head under, so forks can be fetched from the base repo.
     fn pr_fetch_ref(&self, number: u64) -> String;
+}
+
+/// Reviewers and approval of a PR, from [`GitProvider::review_status`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrReviewInfo {
+    pub reviewers: Vec<PrReviewer>,
+    pub approved: bool,
+}
+
+impl PrReviewInfo {
+    pub fn apply_to(self, pr: &mut PullRequest) {
+        pr.reviewers = self.reviewers;
+        pr.approved = self.approved;
+    }
+}
+
+/// One entry per person, in first-seen order, keeping the strongest state (see
+/// [`ReviewerState::rank`]). The PR author is left out: their own comments are no review.
+pub fn merge_reviewers(
+    author: &str,
+    me: &str,
+    entries: impl IntoIterator<Item = (String, ReviewerState)>,
+) -> Vec<PrReviewer> {
+    let mut out: Vec<PrReviewer> = Vec::new();
+    for (login, state) in entries {
+        if login.is_empty() || login.eq_ignore_ascii_case(author) {
+            continue;
+        }
+        if let Some(r) = out
+            .iter_mut()
+            .find(|r| r.login.eq_ignore_ascii_case(&login))
+        {
+            if state.rank() > r.state.rank() {
+                r.state = state;
+            }
+        } else {
+            out.push(PrReviewer {
+                is_me: !me.is_empty() && login.eq_ignore_ascii_case(me),
+                login,
+                state,
+            });
+        }
+    }
+    out
 }
 
 pub fn basic_auth_header(user: &str, token: &str) -> String {
@@ -158,4 +210,47 @@ pub fn fold_comment(c: &InlineComment) -> String {
         let _ = write!(s, "\n\n{fence}\n{sugg}\n{fence}");
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merge_reviewers_dedupes_and_drops_the_author() {
+        let r = merge_reviewers(
+            "alice",
+            "me",
+            [
+                ("bob".to_string(), ReviewerState::Requested),
+                ("Alice".to_string(), ReviewerState::Approved),
+                ("me".to_string(), ReviewerState::Requested),
+                ("Bob".to_string(), ReviewerState::Approved),
+                ("carol".to_string(), ReviewerState::ChangesRequested),
+                ("carol".to_string(), ReviewerState::Commented),
+                (String::new(), ReviewerState::Commented),
+            ],
+        );
+        assert_eq!(
+            r,
+            vec![
+                PrReviewer {
+                    login: "bob".into(),
+                    state: ReviewerState::Approved,
+                    is_me: false
+                },
+                PrReviewer {
+                    login: "me".into(),
+                    state: ReviewerState::Requested,
+                    is_me: true
+                },
+                PrReviewer {
+                    login: "carol".into(),
+                    state: ReviewerState::ChangesRequested,
+                    is_me: false
+                },
+            ]
+        );
+        assert!(!merge_reviewers("a", "", [("b".to_string(), ReviewerState::Requested)])[0].is_me);
+    }
 }

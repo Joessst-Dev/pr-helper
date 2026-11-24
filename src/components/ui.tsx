@@ -40,9 +40,20 @@ export function Spinner({ className }: { className?: string }) {
 
 type Tone = "neutral" | "accent" | "ok" | "warn" | "danger" | "info";
 
-export function Badge({ tone = "neutral", children, className }: { tone?: Tone; children: ReactNode; className?: string }) {
+export function Badge({
+  tone = "neutral",
+  children,
+  className,
+  title,
+}: {
+  tone?: Tone;
+  children: ReactNode;
+  className?: string;
+  title?: string;
+}) {
   return (
     <span
+      title={title}
       className={clsx(
         "inline-flex h-5 items-center gap-1 rounded px-1.5 text-[11px] font-medium whitespace-nowrap",
         tone === "neutral" && "bg-panel-2 text-muted",

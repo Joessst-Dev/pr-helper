@@ -7,18 +7,59 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use super::{
-    GitProvider, PostResult, PrFilter, ReviewEvent, ReviewSubmission, basic_auth_header, check,
-    fold_comment,
+    GitProvider, PostResult, PrFilter, PrReviewInfo, ReviewEvent, ReviewSubmission,
+    basic_auth_header, check, fold_comment,
 };
-use crate::db::models::{PrState, ProviderKind, PullRequest, Server, Side};
+use futures_util::StreamExt as _;
+
+use crate::db::models::{
+    PrComment, PrComments, PrState, PrThread, ProviderKind, PullRequest, ReviewerState, Server,
+    Side,
+};
 use crate::error::{AppError, AppResult};
 
 const NAME: &str = "GitLab";
 const MAX_PAGES: u32 = 10;
+/// Merge requests per GraphQL approvals query while listing.
+const APPROVAL_BATCH: usize = 25;
+/// Approvals queries in flight at once.
+const APPROVAL_BATCHES_IN_FLIGHT: usize = 4;
+
+/// Who approved a merge request.
+#[derive(Debug, Clone)]
+struct Approvals {
+    approved_by: Vec<String>,
+    /// Enough approvals given. Never true without any approval: GitLab reports a merge request
+    /// that needs none as approved.
+    approved: bool,
+}
+
+impl Approvals {
+    fn new(approved_by: Vec<String>, all_given: bool) -> Self {
+        Self {
+            approved: all_given && !approved_by.is_empty(),
+            approved_by,
+        }
+    }
+
+    /// The merge request's listed reviewers plus its approvers.
+    fn status_of(self, pr: &PullRequest, me: &str) -> PrReviewInfo {
+        let current = pr.reviewers.iter().map(|r| (r.login.clone(), r.state));
+        let approvers = self
+            .approved_by
+            .into_iter()
+            .map(|u| (u, ReviewerState::Approved));
+        PrReviewInfo {
+            reviewers: super::merge_reviewers(&pr.author, me, current.chain(approvers)),
+            approved: self.approved,
+        }
+    }
+}
 
 pub struct GitLab {
     server_id: String,
     api: String,
+    graphql: String,
     token: String,
     username: tokio::sync::OnceCell<String>,
     groups: Vec<String>,
@@ -40,6 +81,7 @@ impl GitLab {
         };
         Self {
             server_id: server.id.clone(),
+            graphql: format!("{}/api/graphql", api.trim_end_matches("/api/v4")),
             api,
             token,
             username: tokio::sync::OnceCell::new_with(username),
@@ -66,6 +108,27 @@ impl GitLab {
         Ok(check(NAME, resp).await?.json().await?)
     }
 
+    /// A GraphQL query. Partial errors (say, one project the token can't see) still return the
+    /// data for the rest, so only a response without data is an error.
+    async fn graphql(&self, query: &str, variables: Value) -> AppResult<Value> {
+        let resp = self
+            .client
+            .post(&self.graphql)
+            .bearer_auth(&self.token)
+            .json(&json!({ "query": query, "variables": variables }))
+            .send()
+            .await?;
+        let mut v: Value = check(NAME, resp).await?.json().await?;
+        match v.get_mut("data").map(Value::take) {
+            Some(data) if !data.is_null() => Ok(data),
+            _ => Err(AppError::Api {
+                provider: NAME,
+                status: 200,
+                message: v["errors"].to_string(),
+            }),
+        }
+    }
+
     async fn me(&self) -> AppResult<String> {
         self.username
             .get_or_try_init(|| async {
@@ -81,6 +144,15 @@ impl GitLab {
 
     /// Follows `x-next-page` pagination.
     async fn paged(&self, path: &str, query: &[(&str, &str)]) -> AppResult<Vec<Value>> {
+        Ok(self.paged_capped(path, query).await?.0)
+    }
+
+    /// Like [`Self::paged`], and also tells whether pages were left out at the cap.
+    async fn paged_capped(
+        &self,
+        path: &str,
+        query: &[(&str, &str)],
+    ) -> AppResult<(Vec<Value>, bool)> {
         let mut out = Vec::new();
         let mut page = 1u32;
         loop {
@@ -100,10 +172,11 @@ impl GitLab {
             out.extend(items);
             match next {
                 Some(n) if n > page && n <= MAX_PAGES => page = n,
+                Some(n) if n > page => return Ok((out, true)),
                 _ => break,
             }
         }
-        Ok(out)
+        Ok((out, false))
     }
 
     fn map_mr(&self, v: &Value, me: &str) -> Option<PullRequest> {
@@ -122,6 +195,16 @@ impl GitLab {
             _ => PrState::Open,
         };
         let diff_refs = &v["diff_refs"];
+        let reviewers = super::merge_reviewers(
+            &author,
+            me,
+            v["reviewers"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|r| r["username"].as_str())
+                .map(|u| (u.to_string(), ReviewerState::Requested)),
+        );
         Some(PullRequest {
             server_id: self.server_id.clone(),
             repo,
@@ -152,7 +235,128 @@ impl GitLab {
                 .flatten()
                 .any(|r| r["username"].as_str() == Some(me)),
             authored_by_me: author == me,
+            reviewers,
+            // The merge request itself has no approvers; see `review_status`.
+            approved: false,
             author,
+        })
+    }
+
+    /// Approvals of several merge requests in one GraphQL query. `None` for a merge request
+    /// GitLab returned nothing for. Repo paths and iids go in as variables, never into the query.
+    async fn approvals_batch(&self, prs: &[PullRequest]) -> AppResult<Vec<Option<Approvals>>> {
+        let mut params = Vec::with_capacity(prs.len());
+        let mut fields = String::new();
+        let mut variables = serde_json::Map::new();
+        for (i, pr) in prs.iter().enumerate() {
+            params.push(format!("$p{i}: ID!, $i{i}: String!"));
+            let _ = write!(
+                fields,
+                " m{i}: project(fullPath: $p{i}) {{ mergeRequest(iid: $i{i}) {{ approved approvedBy {{ nodes {{ username }} }} }} }}"
+            );
+            variables.insert(format!("p{i}"), json!(pr.repo));
+            variables.insert(format!("i{i}"), json!(pr.number.to_string()));
+        }
+        let query = format!("query({}) {{{fields} }}", params.join(", "));
+        let data = self.graphql(&query, Value::Object(variables)).await?;
+        Ok((0..prs.len())
+            .map(|i| {
+                let mr = &data[format!("m{i}").as_str()]["mergeRequest"];
+                if mr.is_null() {
+                    return None;
+                }
+                let approved_by = mr["approvedBy"]["nodes"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|u| u["username"].as_str().map(str::to_string))
+                    .collect();
+                Some(Approvals::new(
+                    approved_by,
+                    mr["approved"].as_bool().unwrap_or(false),
+                ))
+            })
+            .collect())
+    }
+
+    /// Adds approvers and approval state to listed merge requests, a batch at a time. A failed
+    /// batch only costs those rows their approval state, so it is logged rather than returned.
+    async fn add_approvals(&self, prs: &mut [PullRequest], me: &str) {
+        // The futures are built by a plain iterator: a closure inside the stream would trip the
+        // higher-ranked lifetime check of the `async_trait` future.
+        let lookups: Vec<_> = prs
+            .chunks(APPROVAL_BATCH)
+            .map(|chunk| self.approvals_or_unknown(chunk))
+            .collect();
+        let batches: Vec<Vec<Option<Approvals>>> = futures_util::stream::iter(lookups)
+            .buffered(APPROVAL_BATCHES_IN_FLIGHT)
+            .collect()
+            .await;
+        for (pr, approvals) in prs.iter_mut().zip(batches.into_iter().flatten()) {
+            if let Some(a) = approvals {
+                a.status_of(pr, me).apply_to(pr);
+            }
+        }
+    }
+
+    async fn approvals_or_unknown(&self, prs: &[PullRequest]) -> Vec<Option<Approvals>> {
+        self.approvals_batch(prs).await.unwrap_or_else(|e| {
+            tracing::warn!(
+                "could not load the approvals of {} merge requests: {e}",
+                prs.len()
+            );
+            vec![None; prs.len()]
+        })
+    }
+
+    fn map_discussion(d: &Value, me: &str, web_url: &str) -> Option<PrThread> {
+        // System notes ("approved this merge request", "added 1 commit") are no comments.
+        let first = d["notes"]
+            .as_array()?
+            .iter()
+            .find(|n| n["system"].as_bool() != Some(true))?;
+        let comments: Vec<PrComment> = d["notes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|n| n["system"].as_bool() != Some(true))
+            .map(|n| {
+                let author = n["author"]["username"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
+                let id = n["id"]
+                    .as_u64()
+                    .map_or_else(String::new, |id| id.to_string());
+                PrComment {
+                    url: (!id.is_empty() && !web_url.is_empty())
+                        .then(|| format!("{web_url}#note_{id}")),
+                    id,
+                    is_me: !me.is_empty() && author.eq_ignore_ascii_case(me),
+                    author,
+                    body: n["body"].as_str().unwrap_or_default().into(),
+                    created_at: n["created_at"].as_str().unwrap_or_default().into(),
+                    review_state: None,
+                }
+            })
+            .collect();
+        let position = &first["position"];
+        Some(PrThread {
+            id: d["id"].as_str().unwrap_or_default().into(),
+            file: position["new_path"]
+                .as_str()
+                .or_else(|| position["old_path"].as_str())
+                .map(str::to_string),
+            line: position["new_line"]
+                .as_u64()
+                .or_else(|| position["old_line"].as_u64()),
+            resolved: if first["resolvable"].as_bool() == Some(true) {
+                first["resolved"].as_bool()
+            } else {
+                None
+            },
+            outdated: false,
+            comments,
         })
     }
 
@@ -295,6 +499,8 @@ impl GitProvider for GitLab {
             .filter_map(|v| self.map_mr(v, &me))
             .filter(|pr| seen.insert((pr.project_id.clone(), pr.number)))
             .collect();
+        // Merge request lists carry no approvers.
+        self.add_approvals(&mut out, &me).await;
         out.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
         Ok(out)
     }
@@ -387,6 +593,43 @@ impl GitProvider for GitLab {
         Ok(())
     }
 
+    async fn review_status(&self, pr: &PullRequest) -> AppResult<PrReviewInfo> {
+        let v = self
+            .get_json(&format!("{}/approvals", Self::mr_path(pr)))
+            .await?;
+        let approved_by = v["approved_by"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|a| a["user"]["username"].as_str().map(str::to_string))
+            .collect();
+        let all_given = v["approvals_left"].as_u64().unwrap_or(0) == 0;
+        // Only decides which entry is the user's.
+        let me = self.me().await.unwrap_or_default();
+        Ok(Approvals::new(approved_by, all_given).status_of(pr, &me))
+    }
+
+    async fn list_comments(&self, project_id: &str, number: u64) -> AppResult<PrComments> {
+        let mr_path = format!("/projects/{project_id}/merge_requests/{number}");
+        let discussions_path = format!("{mr_path}/discussions");
+        // Notes carry no link, so they are linked from the merge request's own URL.
+        let (mr, (discussions, truncated)) = tokio::try_join!(
+            self.get_json(&mr_path),
+            self.paged_capped(&discussions_path, &[]),
+        )?;
+        let web_url = mr["web_url"].as_str().unwrap_or_default();
+        let me = self.me().await.unwrap_or_else(|e| {
+            tracing::warn!("could not load the GitLab username: {e}");
+            String::new()
+        });
+        let mut threads: Vec<PrThread> = discussions
+            .iter()
+            .filter_map(|d| Self::map_discussion(d, &me, web_url))
+            .collect();
+        threads.sort_by(|a, b| a.comments[0].created_at.cmp(&b.comments[0].created_at));
+        Ok(PrComments { threads, truncated })
+    }
+
     fn git_auth_header(&self) -> String {
         basic_auth_header("oauth2", &self.token)
     }
@@ -462,8 +705,38 @@ mod tests {
             None,
             http_client(),
         );
+        // One query for both: MR 2 is approved by carol, MR 1 came back empty, which must not
+        // fail the list.
+        Mock::given(method("POST"))
+            .and(path("/api/graphql"))
+            .and(header("authorization", "Bearer tok"))
+            .and(body_partial_json(json!({ "variables": { "p0": "team/app", "i0": "1", "p1": "team/app", "i1": "2" } })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "m0": null,
+                    "m1": { "mergeRequest": { "approved": true, "approvedBy": { "nodes": [{ "username": "carol" }, { "username": "me" }] } } }
+                },
+                "errors": [{ "message": "m0 not accessible" }]
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
         let prs = gl.list_open_prs(PrFilter::All).await.unwrap();
         assert_eq!(prs.iter().map(|p| p.number).collect::<Vec<_>>(), vec![2, 1]);
+        assert!(prs[0].approved && !prs[1].approved);
+        assert_eq!(
+            prs[0]
+                .reviewers
+                .iter()
+                .map(|r| (r.login.as_str(), r.state, r.is_me))
+                .collect::<Vec<_>>(),
+            vec![
+                ("me", ReviewerState::Approved, true),
+                ("carol", ReviewerState::Approved, false),
+            ]
+        );
+        // The author "me" is no reviewer of their own MR.
+        assert!(prs[1].reviewers.is_empty());
         assert_eq!(prs[0].repo, "team/app");
         assert_eq!(prs[0].project_id, "42");
         assert!(prs[0].review_requested && !prs[0].authored_by_me);
@@ -561,6 +834,135 @@ mod tests {
         );
         let pr = gl.map_mr(&mr(3, "bob"), "me").unwrap();
         gl.approve(&pr, "").await.unwrap();
+    }
+
+    #[test]
+    fn approved_needs_at_least_one_approval() {
+        let pr = GitLab::new(&server("https://gl", None), "t".into(), None, http_client())
+            .map_mr(&mr(3, "bob"), "me")
+            .unwrap();
+        // GitLab says approved when nothing is required, even with no approvals.
+        assert!(!Approvals::new(vec![], true).status_of(&pr, "me").approved);
+        assert!(
+            !Approvals::new(vec!["x".into()], false)
+                .status_of(&pr, "me")
+                .approved
+        );
+        let status = Approvals::new(vec!["x".into()], true).status_of(&pr, "me");
+        assert!(status.approved);
+        assert_eq!(
+            status
+                .reviewers
+                .iter()
+                .map(|r| (r.login.as_str(), r.state))
+                .collect::<Vec<_>>(),
+            vec![
+                ("me", ReviewerState::Requested),
+                ("x", ReviewerState::Approved)
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn review_status_reads_the_approvals_endpoint() {
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v4/projects/42/merge_requests/3/approvals"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "approved": false, "approvals_left": 1, "approved_by": [{ "user": { "username": "x" } }]
+            })))
+            .mount(&mock)
+            .await;
+        let gl = GitLab::new(
+            &server(&mock.uri(), None),
+            "tok".into(),
+            Some("me".into()),
+            http_client(),
+        );
+        let pr = gl.map_mr(&mr(3, "bob"), "me").unwrap();
+        let status = gl.review_status(&pr).await.unwrap();
+        assert!(!status.approved, "one approval still missing");
+        assert_eq!(status.reviewers.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn approvals_batch_fails_soft_without_data() {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": null, "errors": [{ "message": "Field 'approved' doesn't exist" }]
+            })))
+            .mount(&mock)
+            .await;
+        let gl = GitLab::new(
+            &server(&mock.uri(), None),
+            "tok".into(),
+            Some("me".into()),
+            http_client(),
+        );
+        let mut prs = vec![gl.map_mr(&mr(3, "bob"), "me").unwrap()];
+        gl.add_approvals(&mut prs, "me").await;
+        assert!(!prs[0].approved);
+        assert_eq!(prs[0].reviewers.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn lists_discussions_without_system_notes() {
+        let mock = MockServer::start().await;
+        let note = |id: u64, who: &str, at: &str, system: bool| {
+            json!({ "id": id, "body": format!("note {id}"), "author": { "username": who },
+                    "created_at": at, "system": system, "resolvable": false })
+        };
+        let mut inline = note(3, "bob", "2026-01-01", false);
+        inline["resolvable"] = json!(true);
+        inline["resolved"] = json!(false);
+        inline["position"] =
+            json!({ "new_path": null, "old_path": "gone.rs", "new_line": null, "old_line": 4 });
+        Mock::given(method("GET"))
+            .and(path("/api/v4/projects/42/merge_requests/7"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({ "web_url": "https://gl/mr/7" })),
+            )
+            .mount(&mock)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v4/projects/42/merge_requests/7/discussions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("x-next-page", "11")
+                    .set_body_json(json!([
+                        { "id": "d1", "notes": [note(1, "me", "2026-01-02", false)] },
+                        { "id": "d2", "notes": [note(2, "bob", "2026-01-01", true)] },
+                        { "id": "d3", "notes": [inline, note(4, "me", "2026-01-03", false)] }
+                    ])),
+            )
+            .mount(&mock)
+            .await;
+        let gl = GitLab::new(
+            &server(&mock.uri(), None),
+            "tok".into(),
+            Some("me".into()),
+            http_client(),
+        );
+        let out = gl.list_comments("42", 7).await.unwrap();
+        assert!(out.truncated, "the next page is past the cap");
+        assert_eq!(
+            out.threads
+                .iter()
+                .map(|t| t.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["d3", "d1"]
+        );
+        let t = &out.threads[0];
+        assert_eq!(
+            (t.file.as_deref(), t.line, t.resolved),
+            (Some("gone.rs"), Some(4), Some(false))
+        );
+        assert_eq!(t.comments.len(), 2);
+        assert!(t.comments[1].is_me && !t.comments[0].is_me);
+        assert_eq!(t.comments[0].url.as_deref(), Some("https://gl/mr/7#note_3"));
+        assert!(out.threads[1].resolved.is_none() && out.threads[1].file.is_none());
     }
 
     #[test]

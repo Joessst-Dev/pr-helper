@@ -10,7 +10,9 @@ use async_trait::async_trait;
 use crate::db::Db;
 use crate::db::models::*;
 use crate::error::AppResult;
-use crate::providers::{GitProvider, PostResult, PrFilter, ReviewEvent, ReviewSubmission};
+use crate::providers::{
+    GitProvider, PostResult, PrFilter, PrReviewInfo, ReviewEvent, ReviewSubmission,
+};
 use crate::review::post::{PostRequest, SubmitMode, post_findings};
 use crate::review::queue;
 use crate::review::user_comment::{self, CommentAssessment, UserCommentInput};
@@ -60,6 +62,15 @@ impl GitProvider for FakeProvider {
     async fn approve(&self, _pr: &PullRequest, body: &str) -> AppResult<()> {
         self.recorded.lock().unwrap().approvals.push(body.into());
         Ok(())
+    }
+    async fn review_status(&self, pr: &PullRequest) -> AppResult<PrReviewInfo> {
+        Ok(PrReviewInfo {
+            reviewers: pr.reviewers.clone(),
+            approved: pr.approved,
+        })
+    }
+    async fn list_comments(&self, _p: &str, _n: u64) -> AppResult<PrComments> {
+        Ok(PrComments::default())
     }
     fn git_auth_header(&self) -> String {
         "Authorization: Basic dGVzdA==".into()
@@ -226,6 +237,8 @@ fn harness_with(
         updated_at: String::new(),
         review_requested: true,
         authored_by_me: false,
+        reviewers: Vec::new(),
+        approved: false,
     };
     let mut pr = pr;
     edit_pr(&mut pr);
@@ -832,6 +845,8 @@ fn dummy_pr() -> PullRequest {
         updated_at: String::new(),
         review_requested: false,
         authored_by_me: false,
+        reviewers: Vec::new(),
+        approved: false,
     }
 }
 

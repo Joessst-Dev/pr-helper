@@ -7,18 +7,21 @@ import { PrDetailPage, TicketsSection } from "./PrDetailPage";
 import { prDetailPath } from "../lib/useStartReview";
 import type { PrTicketInfo } from "../lib/bindings/PrTicketInfo";
 import type { TicketLoad } from "../lib/bindings/TicketLoad";
+import { pr } from "../test/fixtures";
 
 vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: vi.fn() }));
 const loadPrTickets = vi.fn();
 const getPrDetail = vi.fn();
 const cancelTicketLoad = vi.fn();
 const loadTicketImage = vi.fn();
+const listPrComments = vi.fn();
 vi.mock("../lib/api", () => ({
   api: {
     loadPrTickets: (...a: unknown[]) => loadPrTickets(...a),
     getPrDetail: (...a: unknown[]) => getPrDetail(...a),
     cancelTicketLoad: (...a: unknown[]) => cancelTicketLoad(...a),
     loadTicketImage: (...a: unknown[]) => loadTicketImage(...a),
+    listPrComments: (...a: unknown[]) => listPrComments(...a),
   },
   errorMessage: (e: unknown) => String(e),
 }));
@@ -118,28 +121,37 @@ describe("TicketsSection", () => {
 
 describe("PrDetailPage", () => {
   it("decodes slashed project ids and renders the description", async () => {
+    listPrComments.mockResolvedValue({
+      threads: [
+        {
+          id: "t1",
+          file: "src/login.rs",
+          line: 12,
+          resolved: false,
+          outdated: false,
+          comments: [
+            {
+              id: "c1",
+              author: "bob",
+              isMe: false,
+              body: "Why **not** reuse the session?",
+              createdAt: new Date().toISOString(),
+              url: null,
+              reviewState: null,
+            },
+          ],
+        },
+      ],
+      truncated: false,
+    });
     getPrDetail.mockResolvedValue({
-      pr: {
-        serverId: "s1",
-        repo: "acme/app",
-        projectId: "acme/app",
-        number: 42,
-        title: "Add login",
-        description: "Implements **login**.",
-        author: "dev",
-        webUrl: "https://github.com/acme/app/pull/42",
-        cloneUrl: null,
-        headSha: "abc",
-        baseSha: null,
-        startSha: null,
-        headRef: "feature/login",
-        baseRef: "main",
-        draft: false,
-        state: "open",
-        updatedAt: new Date().toISOString(),
-        reviewRequested: true,
-        authoredByMe: false,
-      },
+      pr: pr({
+        approved: true,
+        reviewers: [
+          { login: "me", state: "requested", isMe: true },
+          { login: "bob", state: "approved", isMe: false },
+        ],
+      }),
       tracked: null,
       reviews: [],
       tickets: null,
@@ -156,5 +168,11 @@ describe("PrDetailPage", () => {
     expect(getPrDetail).toHaveBeenCalledWith("s1", "acme/app", 42);
     expect(screen.queryByText(/Tickets/)).toBeNull();
     expect(screen.getByText("Not reviewed yet.")).toBeInTheDocument();
+    // The header badge and bob's state in the reviewer list.
+    expect(screen.getAllByText("Approved")).toHaveLength(2);
+    expect(screen.getByText(/In review: bob/)).toBeInTheDocument();
+    expect(screen.getByText("(you)")).toBeInTheDocument();
+    expect(await screen.findByText("src/login.rs:12")).toBeInTheDocument();
+    expect(listPrComments).toHaveBeenCalledWith("s1", "acme/app", 42);
   });
 });
