@@ -5,6 +5,7 @@
 //! empty directory and never sees PR content. The ticket
 //! key comes from the app and is validated before it goes into the prompt.
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -13,9 +14,11 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    MAX_COMMENTS, Ticket, TicketComment, TicketTextFormat, browse_url, is_valid_key, truncate,
+    MAX_COMMENT, MAX_COMMENTS, MAX_DESCRIPTION, MAX_FIELD, Ticket, TicketComment, TicketTextFormat,
+    browse_url, is_valid_key, truncate,
 };
 use crate::db::models::TicketSource;
+use crate::db::non_empty;
 use crate::error::{AppError, AppResult};
 use crate::review::runner::{self, RunRequest, ToolPolicy};
 
@@ -148,23 +151,26 @@ fn prompt(source: &TicketSource, key: &str, tools: &[String], extra_fields: &[St
         tools.join(", ")
     );
     if !source.base_url.is_empty() {
-        p.push_str(&format!(
-            "The tracker site is {}. If a tool needs a cloud or site id, look it up first.\n",
+        let _ = writeln!(
+            p,
+            "The tracker site is {}. If a tool needs a cloud or site id, look it up first.",
             source.base_url
-        ));
+        );
     }
-    p.push_str(&format!(
+    let _ = writeln!(
+        p,
         "Return its summary, type, status, full description, parent or epic, and the last \
-{MAX_COMMENTS} comments in the structured output.\n"
-    ));
-    if !extra_fields.is_empty() {
-        p.push_str(&format!(
-            "Also return these fields under their display names in `fields`: {}. Include the \
-acceptance criteria if the issue has any.\n",
-            extra_fields.join(", ")
-        ));
-    } else {
+{MAX_COMMENTS} comments in the structured output."
+    );
+    if extra_fields.is_empty() {
         p.push_str("If the issue has acceptance criteria, return them in `fields`.\n");
+    } else {
+        let _ = writeln!(
+            p,
+            "Also return these fields under their display names in `fields`: {}. Include the \
+acceptance criteria if the issue has any.",
+            extra_fields.join(", ")
+        );
     }
     p.push_str("If the issue cannot be loaded, return found=false with the reason in `error`.\n");
     p
@@ -194,25 +200,22 @@ pub async fn fetch(
     }
     let tools = allowed_tools(source)?;
     tokio::fs::create_dir_all(env.work_dir).await?;
+    let prompt = prompt(source, key, &tools, extra_fields);
     let request = RunRequest {
-        policy: ToolPolicy::TicketFetcher {
-            allowed: tools.clone(),
-        },
+        policy: ToolPolicy::TicketFetcher { allowed: tools },
         claude: env.claude,
         path_env: env.path_env,
         cwd: env.work_dir.to_path_buf(),
         add_dirs: Vec::new(),
         plugin_dir: None,
         system_prompt: SYSTEM.into(),
-        prompt: prompt(source, key, &tools, extra_fields),
+        prompt,
         schema: schema(),
         session_id: uuid::Uuid::new_v4().to_string(),
         model: Some(
-            source
-                .model
-                .clone()
-                .filter(|m| !m.trim().is_empty())
-                .unwrap_or_else(|| DEFAULT_MODEL.into()),
+            non_empty(source.model.as_deref())
+                .unwrap_or(DEFAULT_MODEL)
+                .to_owned(),
         ),
         effort: None,
         max_budget_usd: None,
@@ -238,7 +241,7 @@ fn to_ticket(raw: RawTicket, key: &str, base_url: &str) -> AppResult<Ticket> {
         summary: truncate(&raw.summary, 500),
         issue_type: truncate(&raw.issue_type, 100),
         status: truncate(&raw.status, 100),
-        description: truncate(&raw.description, 8_000),
+        description: truncate(&raw.description, MAX_DESCRIPTION),
         parent: raw
             .parent
             .map(|p| truncate(&p, 500))
@@ -247,7 +250,7 @@ fn to_ticket(raw: RawTicket, key: &str, base_url: &str) -> AppResult<Ticket> {
             .fields
             .into_iter()
             .filter(|f| !f.value.trim().is_empty())
-            .map(|f| (truncate(&f.name, 100), truncate(&f.value, 4_000)))
+            .map(|f| (truncate(&f.name, 100), truncate(&f.value, MAX_FIELD)))
             .collect(),
         comments: raw
             .comments
@@ -256,7 +259,7 @@ fn to_ticket(raw: RawTicket, key: &str, base_url: &str) -> AppResult<Ticket> {
             .map(|c| TicketComment {
                 author: truncate(&c.author, 100),
                 created: truncate(&c.created, 40),
-                body: truncate(&c.body, 1_500),
+                body: truncate(&c.body, MAX_COMMENT),
             })
             .collect(),
         comment_total: raw.comment_total.max(n),
@@ -405,7 +408,7 @@ mod tests {
     /// `PRH_MCP_SERVER=atlassian PRH_TICKET_KEY=ABC-1 cargo test real_claude_ticket_mcp -- --ignored --nocapture`
     /// (`PRH_JIRA_URL` optionally names the site.)
     #[tokio::test]
-    #[ignore]
+    #[ignore = "runs the real claude CLI with your MCP servers"]
     async fn real_claude_ticket_mcp() {
         let server = std::env::var("PRH_MCP_SERVER").unwrap_or_else(|_| "atlassian".into());
         let key = std::env::var("PRH_TICKET_KEY").expect("set PRH_TICKET_KEY");

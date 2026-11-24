@@ -6,15 +6,12 @@ use reqwest::StatusCode;
 use serde_json::Value;
 
 use super::{
-    MAX_COMMENTS, Ticket, TicketAttachment, TicketComment, TicketTextFormat, browse_url,
-    is_displayable_image, is_valid_key, truncate,
+    MAX_COMMENT, MAX_COMMENTS, MAX_DESCRIPTION, MAX_FIELD, Ticket, TicketAttachment, TicketComment,
+    TicketTextFormat, browse_url, is_displayable_image, is_valid_key, truncate,
 };
 use crate::error::{AppError, AppResult};
 
 const NAME: &str = "Jira";
-const MAX_DESCRIPTION: usize = 8_000;
-const MAX_FIELD: usize = 4_000;
-const MAX_COMMENT: usize = 1_500;
 /// Largest image attachment the app downloads for display.
 pub const MAX_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
 const MAX_ATTACHMENTS: usize = 50;
@@ -42,10 +39,15 @@ impl JiraClient {
     }
 
     fn get(&self, path: &str) -> reqwest::RequestBuilder {
-        let req = self
-            .client
-            .get(format!("{}/rest/api/2{path}", self.base))
-            .header("Accept", "application/json");
+        self.authed(
+            self.client
+                .get(format!("{}/rest/api/2{path}", self.base))
+                .header("Accept", "application/json"),
+        )
+    }
+
+    /// Adds the credentials. Only for URLs on the configured Jira site.
+    fn authed(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         match &self.auth {
             JiraAuth::Basic { email, token } => req.basic_auth(email, Some(token)),
             JiraAuth::Bearer(token) => req.bearer_auth(token),
@@ -102,7 +104,7 @@ impl JiraClient {
         if !is_valid_key(key) {
             return Err(AppError::invalid(format!("invalid ticket key {key:?}")));
         }
-        let mut fields = vec![
+        let fields: Vec<&str> = [
             "summary",
             "issuetype",
             "status",
@@ -112,9 +114,8 @@ impl JiraClient {
             "attachment",
         ]
         .into_iter()
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-        fields.extend(extra_fields.iter().cloned());
+        .chain(extra_fields.iter().map(String::as_str))
+        .collect();
         let req = self.get(&format!("/issue/{key}")).query(&[
             ("fields", fields.join(",")),
             ("expand", "names".to_string()),
@@ -172,10 +173,11 @@ impl JiraClient {
         let content = meta["content"]
             .as_str()
             .ok_or_else(|| AppError::invalid("Jira returned no attachment URL"))?;
-        let url = reqwest::Url::parse(content)
-            .map_err(|_| AppError::invalid("Jira returned an invalid attachment URL"))?;
+        let url = reqwest::Url::parse(content).map_err(|e| {
+            AppError::invalid(format!("Jira returned an invalid attachment URL: {e}"))
+        })?;
         let base = reqwest::Url::parse(&self.base)
-            .map_err(|_| AppError::invalid("the Jira URL is invalid"))?;
+            .map_err(|e| AppError::invalid(format!("the Jira URL is invalid: {e}")))?;
         if url.origin() != base.origin() {
             return Err(AppError::invalid(
                 "the attachment is not hosted on the configured Jira site",
@@ -183,12 +185,7 @@ impl JiraClient {
         }
         // reqwest drops the Authorization header if Jira redirects to another host (Cloud
         // serves attachment bytes from its media service with a signed URL).
-        let req = self.client.get(url);
-        let req = match &self.auth {
-            JiraAuth::Basic { email, token } => req.basic_auth(email, Some(token)),
-            JiraAuth::Bearer(token) => req.bearer_auth(token),
-        };
-        let mut resp = req.send().await?;
+        let mut resp = self.authed(self.client.get(url)).send().await?;
         let status = resp.status();
         if !status.is_success() {
             return Err(AppError::Api {
@@ -245,13 +242,14 @@ fn parse_issue(v: &Value, key: &str, extra_fields: &[String], base: &str) -> Tic
             })
         })
         .collect();
-    let all_comments = f["comment"]["comments"]
+    let all_comments: &[Value] = f["comment"]["comments"]
         .as_array()
-        .cloned()
-        .unwrap_or_default();
+        .map_or(&[], Vec::as_slice);
     let comment_total = f["comment"]["total"]
         .as_u64()
-        .map_or(all_comments.len(), |t| t as usize)
+        .map_or(all_comments.len(), |t| {
+            usize::try_from(t).unwrap_or(usize::MAX)
+        })
         .max(all_comments.len());
     let comments = all_comments
         .iter()
@@ -285,7 +283,7 @@ fn parse_issue(v: &Value, key: &str, extra_fields: &[String], base: &str) -> Tic
 /// Image attachments in Jira's order (oldest first), as the text references them by file name.
 /// On tickets with very many images only the newest [`MAX_ATTACHMENTS`] are kept.
 fn parse_attachments(v: &Value) -> Vec<TicketAttachment> {
-    let images: Vec<TicketAttachment> = v
+    let mut images: Vec<TicketAttachment> = v
         .as_array()
         .into_iter()
         .flatten()
@@ -309,7 +307,8 @@ fn parse_attachments(v: &Value) -> Vec<TicketAttachment> {
         })
         .collect();
     let skip = images.len().saturating_sub(MAX_ATTACHMENTS);
-    images.into_iter().skip(skip).collect()
+    images.drain(..skip);
+    images
 }
 
 /// Best-effort plain text for any Jira field value.

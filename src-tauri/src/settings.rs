@@ -70,37 +70,39 @@ pub struct EffectiveSettings {
 
 pub const MIN_POLL_INTERVAL_SECS: u32 = 60;
 
+/// The most specific level that sets a value: repo over server over global.
+fn most_specific<T>(levels: [(SettingSource, Option<&T>); 3]) -> Option<(SettingSource, &T)> {
+    levels
+        .into_iter()
+        .rev()
+        .find_map(|(source, value)| Some((source, value?)))
+}
+
 fn pick<T: Clone>(default: T, levels: [(SettingSource, Option<&T>); 3]) -> Sourced<T> {
-    let mut out = Sourced {
-        value: default,
-        source: SettingSource::Default,
-    };
-    for (source, value) in levels {
-        if let Some(v) = value {
-            out = Sourced {
-                value: v.clone(),
-                source,
-            };
-        }
-    }
-    out
+    most_specific(levels).map_or(
+        Sourced {
+            value: default,
+            source: SettingSource::Default,
+        },
+        |(source, v)| Sourced {
+            value: v.clone(),
+            source,
+        },
+    )
 }
 
 /// Like [`pick`], for settings whose default is "unset" (e.g. use the CLI's default model).
 fn pick_opt<T: Clone>(levels: [(SettingSource, Option<&T>); 3]) -> Sourced<Option<T>> {
-    let mut out = Sourced {
-        value: None,
-        source: SettingSource::Default,
-    };
-    for (source, value) in levels {
-        if let Some(v) = value {
-            out = Sourced {
-                value: Some(v.clone()),
-                source,
-            };
-        }
-    }
-    out
+    most_specific(levels).map_or(
+        Sourced {
+            value: None,
+            source: SettingSource::Default,
+        },
+        |(source, v)| Sourced {
+            value: Some(v.clone()),
+            source,
+        },
+    )
 }
 
 pub fn resolve(

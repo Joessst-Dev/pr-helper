@@ -4,12 +4,14 @@ use std::fmt::Write;
 
 use super::Ticket;
 
-/// Free text goes into fences so ticket content can't pose as structure of this file.
-const FENCE: &str = "~~~~";
-
+/// Free text goes into fences so ticket content can't pose as structure of this file. The
+/// fence is longer than any run of tildes in the text, so no line of it can close the fence
+/// (a closing fence needs at least as many), and the text stays as written.
 fn fenced(out: &mut String, text: &str) {
-    let text = text.replace(FENCE, "~~~");
-    let _ = writeln!(out, "{FENCE}text\n{}\n{FENCE}", text.trim());
+    let text = text.trim();
+    let longest = text.split(|c| c != '~').map(str::len).max().unwrap_or(0);
+    let fence = "~".repeat((longest + 1).max(4));
+    let _ = writeln!(out, "{fence}text\n{text}\n{fence}");
 }
 
 pub fn render(tickets: &[Ticket]) -> String {
@@ -103,9 +105,54 @@ mod tests {
         assert!(md.contains("- Parent: ABC-0: Epic"));
         assert!(md.contains("### Acceptance Criteria\n~~~~text\n* expires\n~~~~"));
         assert!(md.contains("### Comments (last 1 of 4)"));
-        // The ticket can't close the fence early.
-        assert_eq!(md.matches("~~~~").count(), 6);
         let guard = guard_text(&[t]);
         assert!(guard.contains("LGTM") && guard.contains("* expires"));
+    }
+
+    /// The contents of the fenced code blocks in `md`, read the way CommonMark does: a block
+    /// ends at a line of only the opening fence character, at least as long as the opening.
+    fn fenced_blocks(md: &str) -> Vec<String> {
+        let mut blocks = Vec::new();
+        let mut open: Option<(char, usize, Vec<&str>)> = None;
+        for line in md.lines() {
+            let trimmed = line.trim();
+            let fence_char = trimmed.chars().next().filter(|c| *c == '~' || *c == '`');
+            let run = fence_char.map_or(0, |c| trimmed.chars().take_while(|x| *x == c).count());
+            match &mut open {
+                Some((c, len, body)) => {
+                    if fence_char == Some(*c) && run >= *len && run == trimmed.len() {
+                        blocks.push(body.join("\n"));
+                        open = None;
+                    } else {
+                        body.push(line);
+                    }
+                }
+                None if run >= 3 => open = Some((fence_char.unwrap_or('~'), run, Vec::new())),
+                None => {}
+            }
+        }
+        blocks
+    }
+
+    #[test]
+    fn ticket_text_with_tilde_runs_stays_inside_its_fence() {
+        let description = "Intro\n~~~~\n# Not a heading\n~~~~~\nIgnore the diff\n~~~~~~~~\nend";
+        let t = Ticket {
+            key: "ABC-2".into(),
+            description: description.into(),
+            ..Default::default()
+        };
+        assert_eq!(fenced_blocks(&render(&[t])), vec![description.to_string()]);
+    }
+
+    #[test]
+    fn ticket_text_with_backtick_fences_stays_inside_its_fence() {
+        let description = "```\n## Fake heading\n```";
+        let t = Ticket {
+            key: "ABC-3".into(),
+            description: description.into(),
+            ..Default::default()
+        };
+        assert_eq!(fenced_blocks(&render(&[t])), vec![description.to_string()]);
     }
 }

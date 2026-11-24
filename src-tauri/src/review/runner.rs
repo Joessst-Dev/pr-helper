@@ -28,6 +28,7 @@ pub enum ToolPolicy {
     TicketFetcher { allowed: Vec<String> },
 }
 
+/// One headless `claude -p` run.
 pub struct RunRequest {
     pub policy: ToolPolicy,
     pub claude: PathBuf,
@@ -35,8 +36,11 @@ pub struct RunRequest {
     pub cwd: PathBuf,
     pub add_dirs: Vec<PathBuf>,
     pub plugin_dir: Option<PathBuf>,
+    /// Appended to Claude Code's own system prompt.
     pub system_prompt: String,
+    /// Sent on stdin, so it never shows up in the process list.
     pub prompt: String,
+    /// JSON schema the final answer must match.
     pub schema: Value,
     pub session_id: String,
     pub model: Option<String>,
@@ -46,6 +50,7 @@ pub struct RunRequest {
 }
 
 impl RunRequest {
+    /// The CLI arguments, including the lockdown flags of the tool policy.
     pub fn args(&self) -> Vec<String> {
         let mut a: Vec<String> = vec![
             "-p".into(),
@@ -65,12 +70,12 @@ impl RunRequest {
         match &self.policy {
             ToolPolicy::Reviewer => {
                 a.extend(["--permission-mode".into(), "default".into()]);
-                // ...and any MCP servers it declares.
+                // Ignore MCP servers the checkout declares in its .mcp.json, too.
                 a.push("--strict-mcp-config".into());
                 a.push("--tools".into());
-                a.extend(REVIEWER_TOOLS.iter().map(|t| t.to_string()));
+                a.extend(REVIEWER_TOOLS.iter().map(ToString::to_string));
                 a.push("--allowed-tools".into());
-                a.extend(REVIEWER_TOOLS.iter().map(|t| t.to_string()));
+                a.extend(REVIEWER_TOOLS.iter().map(ToString::to_string));
             }
             ToolPolicy::TicketFetcher { allowed } => {
                 // Every other loaded MCP tool (all of the user's servers and connectors are
@@ -108,6 +113,7 @@ impl RunRequest {
     }
 }
 
+/// Progress of a run, for the review log.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RunEvent {
     Started { session_id: String, model: String },
@@ -115,6 +121,7 @@ pub enum RunEvent {
     Text(String),
 }
 
+/// A successful run's structured answer.
 #[derive(Debug, Clone)]
 pub struct RunOutcome {
     pub session_id: Option<String>,
@@ -188,7 +195,7 @@ fn tool_detail(name: &str, input: &Value) -> String {
 }
 
 /// Interpret the final `result` message.
-pub fn parse_result(v: &Value) -> AppResult<RunOutcome> {
+pub fn parse_result(mut v: Value) -> AppResult<RunOutcome> {
     let session_id = v["session_id"].as_str().map(str::to_string);
     let cost_usd = v["total_cost_usd"].as_f64();
     if v["is_error"].as_bool().unwrap_or(false) || v["subtype"] != "success" {
@@ -199,8 +206,8 @@ pub fn parse_result(v: &Value) -> AppResult<RunOutcome> {
             .unwrap_or("unknown error");
         return Err(AppError::Reviewer(format!("Claude run failed: {reason}")));
     }
-    let output = match &v["structured_output"] {
-        Value::Object(_) => v["structured_output"].clone(),
+    let output = match v["structured_output"].take() {
+        output @ Value::Object(_) => output,
         // Older CLIs only put the JSON text in `result`.
         _ => v["result"].as_str().and_then(extract_json).ok_or_else(|| {
             AppError::Reviewer("the reviewer returned no structured output".into())
@@ -222,6 +229,10 @@ fn extract_json(text: &str) -> Option<Value> {
     serde_json::from_str(&text[start..=end]).ok()
 }
 
+/// Runs the CLI and reports its progress through `on_event`.
+///
+/// Reading stops at the `result` line; a CLI that lingers after it gets [`EXIT_GRACE`] to exit
+/// and is killed after that. A cancel or the request's timeout kills the process at once.
 pub async fn run(
     req: RunRequest,
     cancel: CancellationToken,
@@ -244,7 +255,7 @@ pub async fn run(
         })?;
 
     let mut stdin = child.stdin.take().expect("piped stdin");
-    let prompt = req.prompt.clone();
+    let prompt = req.prompt;
     tokio::spawn(async move {
         let _ = stdin.write_all(prompt.as_bytes()).await;
         let _ = stdin.shutdown().await;
@@ -254,9 +265,10 @@ pub async fn run(
     let stderr_task = tokio::spawn(async move {
         let mut buf = Vec::new();
         let _ = stderr.read_to_end(&mut buf).await;
-        let text = String::from_utf8_lossy(&buf).into_owned();
-        let tail_start = text.len().saturating_sub(4000);
-        text[text.floor_char_boundary(tail_start)..].to_string()
+        let mut text = String::from_utf8_lossy(&buf).into_owned();
+        let tail_start = text.floor_char_boundary(text.len().saturating_sub(4000));
+        text.drain(..tail_start);
+        text
     });
 
     let stdout = child.stdout.take().expect("piped stdout");
@@ -291,7 +303,7 @@ pub async fn run(
         },
         _ = cancel.cancelled() => {
             let _ = child.kill().await;
-            return Err(AppError::Reviewer("cancelled".into()));
+            return Err(AppError::Cancelled);
         }
     };
 
@@ -308,7 +320,7 @@ pub async fn run(
         .and_then(Result::ok)
         .unwrap_or_default();
     match result {
-        Some(v) => parse_result(&v),
+        Some(v) => parse_result(v),
         None => Err(AppError::Reviewer(format!(
             "claude exited ({status}) without a result. {}",
             stderr_tail.trim()
@@ -346,7 +358,7 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, RunEvent::Tool { name, .. } if name == "StructuredOutput"))
         );
-        let outcome = parse_result(&result.unwrap()).unwrap();
+        let outcome = parse_result(result.unwrap()).unwrap();
         assert_eq!(outcome.output["verdict"], "request_changes");
         assert!(outcome.cost_usd.unwrap() > 0.0);
         assert!(outcome.session_id.is_some());
@@ -357,7 +369,7 @@ mod tests {
         let v =
             serde_json::json!({"type":"result","subtype":"error_max_budget_usd","is_error":true});
         assert!(
-            parse_result(&v)
+            parse_result(v)
                 .unwrap_err()
                 .to_string()
                 .contains("error_max_budget_usd")
@@ -370,7 +382,7 @@ mod tests {
             "type":"result","subtype":"success","is_error":false,
             "result":"Here you go:\n{\"verdict\":\"approve\",\"summary\":\"ok\",\"findings\":[]}"
         });
-        assert_eq!(parse_result(&v).unwrap().output["verdict"], "approve");
+        assert_eq!(parse_result(v).unwrap().output["verdict"], "approve");
     }
 
     #[test]

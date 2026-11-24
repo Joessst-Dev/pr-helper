@@ -1,5 +1,7 @@
 //! GitHub.com and GitHub Enterprise Server.
 
+use std::fmt::Write as _;
+
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
@@ -8,6 +10,7 @@ use super::{
     fold_comment,
 };
 use crate::db::models::{PrState, ProviderKind, PullRequest, Server, Side};
+use crate::db::non_empty;
 use crate::error::{AppError, AppResult};
 
 const NAME: &str = "GitHub";
@@ -52,17 +55,13 @@ impl GitHub {
         client: reqwest::Client,
     ) -> Self {
         let (api, graphql) = api_urls(&server.base_url);
-        let cell = tokio::sync::OnceCell::new();
-        if let Some(u) = username {
-            let _ = cell.set(u);
-        }
         Self {
             server_id: server.id.clone(),
             api,
             graphql,
             token,
-            username: cell,
-            scope: server.pr_scope.clone().filter(|s| !s.trim().is_empty()),
+            username: tokio::sync::OnceCell::new_with(username),
+            scope: non_empty(server.pr_scope.as_deref()).map(str::to_owned),
             client,
         }
     }
@@ -137,13 +136,13 @@ impl GitHub {
         match (&self.scope, filter) {
             (Some(scope), _) => {
                 q.push(' ');
-                q.push_str(scope.trim());
+                q.push_str(scope);
             }
             (None, PrFilter::All) => {
                 // Multiple user:/org: qualifiers are ORed by GitHub search.
-                q.push_str(&format!(" user:{}", self.login().await?));
+                let _ = write!(q, " user:{}", self.login().await?);
                 for org in self.orgs().await? {
-                    q.push_str(&format!(" org:{org}"));
+                    let _ = write!(q, " org:{org}");
                 }
             }
             (None, _) => {}
@@ -226,7 +225,7 @@ impl GitHub {
         let mut body = c.body.clone();
         if let (Some(s), Side::Right) = (&c.suggestion, c.side) {
             let fence = super::fence_for(s);
-            body.push_str(&format!("\n\n{fence}suggestion\n{s}\n{fence}"));
+            let _ = write!(body, "\n\n{fence}suggestion\n{s}\n{fence}");
         }
         let side = if c.side == Side::Left {
             "LEFT"
@@ -275,7 +274,7 @@ impl GitProvider for GitHub {
     }
 
     async fn list_open_prs(&self, filter: PrFilter) -> AppResult<Vec<PullRequest>> {
-        const QUERY: &str = r#"
+        const QUERY: &str = r"
 query($q: String!, $cursor: String) {
   viewer { login }
   search(query: $q, type: ISSUE, first: 50, after: $cursor) {
@@ -289,7 +288,7 @@ query($q: String!, $cursor: String) {
       }
     }
   }
-}"#;
+}";
         let q = self.search_query(filter).await?;
         let mut out = Vec::new();
         let mut cursor: Option<String> = None;
@@ -297,12 +296,9 @@ query($q: String!, $cursor: String) {
             let data = self
                 .graphql(QUERY, json!({ "q": q, "cursor": cursor }))
                 .await?;
-            let me = data["viewer"]["login"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string();
+            let me = data["viewer"]["login"].as_str().unwrap_or_default();
             for n in data["search"]["nodes"].as_array().into_iter().flatten() {
-                if let Some(pr) = self.map_search_node(n, &me) {
+                if let Some(pr) = self.map_search_node(n, me) {
                     out.push(pr);
                 }
             }
@@ -325,7 +321,12 @@ query($q: String!, $cursor: String) {
             .send()
             .await?;
         let v: Value = check(NAME, resp).await?.json().await?;
-        let me = self.login().await.unwrap_or_default();
+        // The login only decides the "requested from me"/"authored by me" flags, which are not
+        // worth failing the fetch for.
+        let me = self.login().await.unwrap_or_else(|e| {
+            tracing::warn!("could not load the GitHub login: {e}");
+            String::new()
+        });
         self.map_rest_pr(&v, &me)
     }
 
@@ -354,7 +355,7 @@ query($q: String!, $cursor: String) {
                     if !body.is_empty() {
                         body.push_str("\n\n");
                     }
-                    body.push_str(&fold_comment(c, ""));
+                    body.push_str(&fold_comment(c));
                 }
                 let v = self.submit(pr, event, &body, Vec::new()).await?;
                 (v, sub.inline.iter().map(|c| c.finding_id.clone()).collect())

@@ -10,17 +10,17 @@ pub const PLUGIN_NAME: &str = "pr-helper-review-skills";
 
 /// Skill directory names must be simple slugs.
 pub fn slug(name: &str) -> String {
-    let s: String = name
-        .trim()
-        .to_ascii_lowercase()
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect();
-    let s = s
-        .split('-')
-        .filter(|p| !p.is_empty())
-        .collect::<Vec<_>>()
-        .join("-");
+    let mut s = String::with_capacity(name.len());
+    for c in name.trim().chars() {
+        if c.is_ascii_alphanumeric() {
+            s.push(c.to_ascii_lowercase());
+        } else if !s.is_empty() && !s.ends_with('-') {
+            s.push('-');
+        }
+    }
+    if s.ends_with('-') {
+        s.pop();
+    }
     if s.is_empty() { "skill".into() } else { s }
 }
 
@@ -38,7 +38,7 @@ fn with_frontmatter(skill: &Skill, body: &str, name: &str) -> String {
     format!(
         "---\nname: {}\ndescription: {}\n---\n\n{}",
         name,
-        serde_json::to_string(&description).unwrap_or_default(),
+        serde_json::to_string(&description).expect("a string always serializes"),
         body
     )
 }
@@ -133,9 +133,9 @@ pub async fn build_plugin(
         let target = skills_dir.join(&name);
         match (&skill.path, &skill.content) {
             (Some(path), _) => {
-                let src = PathBuf::from(path);
-                validate_skill_dir(&src)?;
-                copy_dir(&src, &target).await?;
+                let src = Path::new(path);
+                validate_skill_dir(src)?;
+                copy_dir(src, &target).await?;
                 let md = target.join("SKILL.md");
                 let text = tokio::fs::read_to_string(&md).await?;
                 tokio::fs::write(&md, set_frontmatter_name(&text, &name)).await?;
@@ -181,9 +181,16 @@ mod tests {
     }
 
     #[test]
-    fn slugs() {
+    fn slug_lowercases_and_joins_words_with_single_dashes() {
         assert_eq!(slug("Rust Safety!"), "rust-safety");
+        assert_eq!(slug("--API  /  Design--"), "api-design");
+        assert_eq!(slug("Café Größe"), "caf-gr-e");
+    }
+
+    #[test]
+    fn slug_falls_back_to_skill_when_nothing_is_left() {
         assert_eq!(slug("  "), "skill");
+        assert_eq!(slug("!!!"), "skill");
     }
 
     #[tokio::test]

@@ -11,6 +11,7 @@ pub mod settings;
 pub mod tickets;
 pub mod watcher;
 
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 use tauri::menu::{Menu, MenuItem};
@@ -69,16 +70,15 @@ fn update_tray(app: &AppHandle) {
     };
     let new_changes = svc
         .db
-        .list_tracked(true)
-        .map(|t| t.iter().filter(|t| t.has_new_changes).count())
-        .unwrap_or(0);
+        .list_tracked()
+        .map_or(0, |t| t.iter().filter(|t| t.has_new_changes).count());
     let running = svc.queue.active_count();
     let mut tooltip = String::from("PR Helper");
     if running > 0 {
-        tooltip.push_str(&format!(" · {running} review(s) running"));
+        let _ = write!(tooltip, " · {running} review(s) running");
     }
     if new_changes > 0 {
-        tooltip.push_str(&format!(" · {new_changes} PR(s) with new changes"));
+        let _ = write!(tooltip, " · {new_changes} PR(s) with new changes");
     }
     let _ = tray.set_tooltip(Some(&tooltip));
     #[cfg(target_os = "macos")]
@@ -165,7 +165,7 @@ pub fn run() {
                 tracing::info!("marked {interrupted} interrupted review(s) as failed");
             }
             // Leftover worktrees from interrupted runs are useless; reviews are recreated on demand.
-            let keep = db.app_config().map(|c| c.keep_worktrees).unwrap_or(false);
+            let keep = db.app_config().is_ok_and(|c| c.keep_worktrees);
             if !keep {
                 let _ = std::fs::remove_dir_all(cache_dir.join("reviews"));
             }
@@ -247,6 +247,7 @@ pub fn run() {
             if let tauri::RunEvent::Reopen { .. } = event {
                 show_main_window(app);
             }
+            // Both are only used on macOS; this keeps other targets free of unused warnings.
             let _ = (app, event);
         });
 }

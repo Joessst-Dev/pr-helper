@@ -174,12 +174,13 @@ criteria. Read it before the diff."
         if !prev.findings.is_empty() {
             s.push_str("Previous findings (check whether each is resolved; report it again only if it still applies):\n");
             for f in prev.findings {
-                let loc = match (&f.file, f.line_start) {
-                    (Some(file), Some(line)) => format!("{file}:{line}"),
-                    (Some(file), None) => file.clone(),
-                    _ => "PR-wide".into(),
+                let _ = write!(s, "- [{}] {} (", f.severity.as_str(), f.title);
+                let _ = match (&f.file, f.line_start) {
+                    (Some(file), Some(line)) => write!(s, "{file}:{line}"),
+                    (Some(file), None) => write!(s, "{file}"),
+                    _ => write!(s, "PR-wide"),
                 };
-                let _ = writeln!(s, "- [{}] {} ({loc})", f.severity.as_str(), f.title);
+                s.push_str(")\n");
             }
         }
         s.push_str("Review the whole PR, but pay special attention to the incremental changes.\n");
@@ -266,7 +267,7 @@ number, then the line with +, - or a space.\n\
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::models::{PrState, Severity, Side};
+    use crate::db::models::{FindingSource, PrState, Severity, Side};
     use crate::settings::{SettingsOverrides, resolve};
 
     fn pr() -> PullRequest {
@@ -384,7 +385,7 @@ mod tests {
             selected: true,
             posted_at: None,
             posted_ref: None,
-            source: Default::default(),
+            source: FindingSource::Reviewer,
         };
         let skills = [SkillInfo {
             name: "rust-safety".into(),

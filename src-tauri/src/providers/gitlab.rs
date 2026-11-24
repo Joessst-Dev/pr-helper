@@ -1,6 +1,7 @@
 //! GitLab.com and self-managed GitLab (API v4).
 
 use std::collections::HashSet;
+use std::fmt::Write as _;
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -37,15 +38,11 @@ impl GitLab {
         } else {
             format!("{base}/api/v4")
         };
-        let cell = tokio::sync::OnceCell::new();
-        if let Some(u) = username {
-            let _ = cell.set(u);
-        }
         Self {
             server_id: server.id.clone(),
             api,
             token,
-            username: cell,
+            username: tokio::sync::OnceCell::new_with(username),
             groups: server
                 .pr_scope
                 .as_deref()
@@ -83,16 +80,14 @@ impl GitLab {
     }
 
     /// Follows `x-next-page` pagination.
-    async fn paged(&self, path: &str, query: &[(&str, String)]) -> AppResult<Vec<Value>> {
+    async fn paged(&self, path: &str, query: &[(&str, &str)]) -> AppResult<Vec<Value>> {
         let mut out = Vec::new();
         let mut page = 1u32;
         loop {
-            let mut q: Vec<(&str, String)> = query.to_vec();
-            q.push(("per_page", "100".into()));
-            q.push(("page", page.to_string()));
             let resp = self
                 .req(reqwest::Method::GET, path)
-                .query(&q)
+                .query(query)
+                .query(&[("per_page", "100"), ("page", &page.to_string())])
                 .send()
                 .await?;
             let resp = check(NAME, resp).await?;
@@ -177,12 +172,65 @@ impl GitLab {
         Ok(check(NAME, resp).await?.json().await?)
     }
 
+    /// The diff position GitLab anchors an inline comment to.
+    fn position_json(pr: &PullRequest, c: &super::InlineComment) -> Value {
+        let mut position = json!({
+            "position_type": "text",
+            "base_sha": pr.base_sha,
+            "start_sha": pr.start_sha.as_ref().or(pr.base_sha.as_ref()),
+            "head_sha": pr.head_sha,
+            "old_path": c.old_path,
+            "new_path": c.path,
+        });
+        if let Some(n) = c.new_line {
+            position["new_line"] = json!(n);
+        }
+        if let Some(o) = c.old_line {
+            position["old_line"] = json!(o);
+        }
+        position
+    }
+
+    /// Link to a note of the merge request, if GitLab returned its id.
+    fn note_url(pr: &PullRequest, id: &Value) -> Option<String> {
+        id.as_u64().map(|id| format!("{}#note_{id}", pr.web_url))
+    }
+
+    /// Starts a diff discussion for one inline comment. Returns the link to its note.
+    async fn post_discussion(
+        &self,
+        pr: &PullRequest,
+        c: &super::InlineComment,
+    ) -> AppResult<Option<String>> {
+        let body = json!({
+            "body": Self::discussion_body(c),
+            "position": Self::position_json(pr, c),
+        });
+        let resp = self
+            .req(
+                reqwest::Method::POST,
+                &format!("{}/discussions", Self::mr_path(pr)),
+            )
+            .json(&body)
+            .send()
+            .await?;
+        let resp = check(NAME, resp).await?;
+        // The discussion exists either way; only the link is lost.
+        Ok(match resp.json::<Value>().await {
+            Ok(v) => Self::note_url(pr, &v["notes"][0]["id"]),
+            Err(e) => {
+                tracing::warn!("unreadable GitLab discussion response: {e}");
+                None
+            }
+        })
+    }
+
     fn discussion_body(c: &super::InlineComment) -> String {
         let mut body = c.body.clone();
         if let (Some(s), Side::Right) = (&c.suggestion, c.side) {
             let above = c.start_line.map_or(0, |start| c.line.saturating_sub(start));
             let fence = super::fence_for(s);
-            body.push_str(&format!("\n\n{fence}suggestion:-{above}+0\n{s}\n{fence}"));
+            let _ = write!(body, "\n\n{fence}suggestion:-{above}+0\n{s}\n{fence}");
         }
         body
     }
@@ -199,19 +247,14 @@ impl GitProvider for GitLab {
     }
 
     async fn list_open_prs(&self, filter: PrFilter) -> AppResult<Vec<PullRequest>> {
+        const OPENED: (&str, &str) = ("state", "opened");
         let me = self.me().await?;
-        let base = [("state", "opened".to_string())];
         let mut raw: Vec<Value> = Vec::new();
-        let with = |extra: &[(&'static str, String)]| {
-            let mut q = base.to_vec();
-            q.extend_from_slice(extra);
-            q
-        };
         match filter {
             PrFilter::All if !self.groups.is_empty() => {
                 for g in &self.groups {
                     let path = format!("/groups/{}/merge_requests", urlencoding::encode(g));
-                    raw.extend(self.paged(&path, &with(&[("scope", "all".into())])).await?);
+                    raw.extend(self.paged(&path, &[OPENED, ("scope", "all")]).await?);
                 }
             }
             // Without a group, `scope=all` means every merge request the token can see, which
@@ -225,25 +268,23 @@ impl GitProvider for GitLab {
                 raw = self
                     .paged(
                         "/merge_requests",
-                        &with(&[("scope", "all".into()), ("reviewer_username", me.clone())]),
+                        &[OPENED, ("scope", "all"), ("reviewer_username", &me)],
                     )
                     .await?
             }
             PrFilter::Authored => {
                 raw = self
-                    .paged(
-                        "/merge_requests",
-                        &with(&[("scope", "created_by_me".into())]),
-                    )
+                    .paged("/merge_requests", &[OPENED, ("scope", "created_by_me")])
                     .await?
             }
             PrFilter::Involved => {
-                for extra in [
-                    vec![("scope", "assigned_to_me".to_string())],
-                    vec![("scope", "all".into()), ("reviewer_username", me.clone())],
-                    vec![("scope", "created_by_me".into())],
-                ] {
-                    raw.extend(self.paged("/merge_requests", &with(&extra)).await?);
+                let queries: [&[(&str, &str)]; 3] = [
+                    &[OPENED, ("scope", "assigned_to_me")],
+                    &[OPENED, ("scope", "all"), ("reviewer_username", &me)],
+                    &[OPENED, ("scope", "created_by_me")],
+                ];
+                for query in queries {
+                    raw.extend(self.paged("/merge_requests", query).await?);
                 }
             }
         }
@@ -259,7 +300,12 @@ impl GitProvider for GitLab {
     }
 
     async fn get_pr(&self, project_id: &str, number: u64) -> AppResult<PullRequest> {
-        let me = self.me().await.unwrap_or_default();
+        // The username only decides the "requested from me"/"authored by me" flags, which are
+        // not worth failing the fetch for.
+        let me = self.me().await.unwrap_or_else(|e| {
+            tracing::warn!("could not load the GitLab username: {e}");
+            String::new()
+        });
         let v = self
             .get_json(&format!("/projects/{project_id}/merge_requests/{number}"))
             .await?;
@@ -279,48 +325,11 @@ impl GitProvider for GitLab {
         let mut folded_text = Vec::new();
         let mut folded_ids = Vec::new();
         for c in &sub.inline {
-            let mut position = json!({
-                "position_type": "text",
-                "base_sha": pr.base_sha,
-                "start_sha": pr.start_sha.as_ref().or(pr.base_sha.as_ref()),
-                "head_sha": pr.head_sha,
-                "old_path": c.old_path,
-                "new_path": c.path,
-            });
-            if let Some(n) = c.new_line {
-                position["new_line"] = json!(n);
-            }
-            if let Some(o) = c.old_line {
-                position["old_line"] = json!(o);
-            }
-            let sent = self
-                .req(
-                    reqwest::Method::POST,
-                    &format!("{}/discussions", Self::mr_path(pr)),
-                )
-                .json(&json!({ "body": Self::discussion_body(c), "position": position }))
-                .send()
-                .await;
-            let checked = match sent {
-                Ok(resp) => check(NAME, resp).await,
-                Err(e) => Err(e.into()),
-            };
-            match checked {
-                Ok(resp) => {
-                    let note_ref = match resp.json::<Value>().await {
-                        Ok(v) => v["notes"][0]["id"]
-                            .as_u64()
-                            .map(|id| format!("{}#note_{id}", pr.web_url)),
-                        Err(e) => {
-                            tracing::warn!("unreadable GitLab discussion response: {e}");
-                            None
-                        }
-                    };
-                    result.posted.push((c.finding_id.clone(), note_ref));
-                }
+            match self.post_discussion(pr, c).await {
+                Ok(note_ref) => result.posted.push((c.finding_id.clone(), note_ref)),
                 // A position GitLab can't resolve: keep the comment, attach it to the summary.
                 Err(AppError::Api { status: 400, .. }) => {
-                    folded_text.push(fold_comment(c, ""));
+                    folded_text.push(fold_comment(c));
                     folded_ids.push(c.finding_id.clone());
                 }
                 // Discussions already created stay in `result.posted`.
@@ -339,18 +348,17 @@ impl GitProvider for GitLab {
             body.push_str(&f);
         }
         let finished = if sub.event == ReviewEvent::Approve {
-            self.approve(pr, &body).await
+            self.approve(pr, &body).await.map(|()| None)
         } else if !body.trim().is_empty() {
-            self.note(pr, &body).await.map(|note| {
-                result.review_url = note["id"]
-                    .as_u64()
-                    .map(|id| format!("{}#note_{id}", pr.web_url));
-            })
+            self.note(pr, &body)
+                .await
+                .map(|note| Self::note_url(pr, &note["id"]))
         } else {
-            Ok(())
+            Ok(None)
         };
         match finished {
-            Ok(()) => {
+            Ok(review_url) => {
+                result.review_url = review_url;
                 // Folded comments only exist once the summary note is posted.
                 for id in folded_ids {
                     result.posted.push((id.clone(), None));

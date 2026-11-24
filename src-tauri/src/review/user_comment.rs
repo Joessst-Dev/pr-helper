@@ -5,7 +5,6 @@
 
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -13,13 +12,13 @@ use tokio_util::sync::CancellationToken;
 use ts_rs::TS;
 
 use crate::db::models::{
-    CriticalFileContent, DiffLineKind, FileDiffLine, FileNote, Finding, FindingSource,
+    CriticalFileContent, DiffLineKind, FileDiffLine, FileNote, Finding, FindingSource, Review,
     ReviewStatus, Severity, Side,
 };
 use crate::db::new_id;
 use crate::env;
 use crate::error::{AppError, AppResult};
-use crate::review::postprocess::{sanitize_comment, sanitize_dashes};
+use crate::review::postprocess::{Attribution, sanitize_comment, sanitize_dashes};
 use crate::review::prompt::{comment_check_prompt, comment_check_system_prompt};
 use crate::review::runner::{self, RunRequest, ToolPolicy};
 use crate::review::schema::{RawCommentAdvice, comment_check_schema};
@@ -140,8 +139,8 @@ fn title_of(body: &str) -> String {
 }
 
 /// The stored code of a critical file of a finished review, if it can still be commented on.
-fn critical_file(svc: &Service, review_id: &str, path: &str) -> AppResult<CriticalFileContent> {
-    let review = svc.db.get_review(review_id)?;
+fn critical_file(svc: &Service, review: &Review, path: &str) -> AppResult<CriticalFileContent> {
+    let review_id = review.id.as_str();
     if review.status != ReviewStatus::Done {
         return Err(AppError::invalid("the review has not finished"));
     }
@@ -179,7 +178,8 @@ fn checked_body(body: &str) -> AppResult<&str> {
 /// its code was pruned), or the lines are not part of the stored file or diff.
 pub fn add(svc: &Service, input: &UserCommentInput) -> AppResult<Finding> {
     let body = checked_body(&input.body)?;
-    let content = critical_file(svc, &input.review_id, &input.file)?;
+    let review = svc.db.get_review(&input.review_id)?;
+    let content = critical_file(svc, &review, &input.file)?;
     let anchor = validate_anchor(input, &content)?;
     let finding = Finding {
         id: new_id(),
@@ -320,13 +320,13 @@ fn check_request(
 /// The model's answer with the comment rules applied in code, never trusted from the prompt.
 fn advice_from(
     raw: RawCommentAdvice,
-    forbid_attribution: bool,
+    attribution: Attribution,
     cost_usd: Option<f64>,
 ) -> CommentAdvice {
     CommentAdvice {
         assessment: raw.assessment,
         feedback: sanitize_dashes(raw.feedback.trim()),
-        suggested_comment: sanitize_comment(&raw.suggested_comment, forbid_attribution),
+        suggested_comment: sanitize_comment(&raw.suggested_comment, attribution),
         cost_usd,
     }
 }
@@ -337,14 +337,14 @@ fn advice_from(
 /// Fails on the same input checks as [`add`], when the `claude` CLI can't be found, when the run
 /// fails, times out or is cancelled, or when its answer does not match the schema.
 pub async fn check(
-    svc: &Arc<Service>,
+    svc: &Service,
     input: &UserCommentInput,
     cancel: CancellationToken,
 ) -> AppResult<CommentAdvice> {
     checked_body(&input.body)?;
-    let content = critical_file(svc, &input.review_id, &input.file)?;
-    validate_anchor(input, &content)?;
     let review = svc.db.get_review(&input.review_id)?;
+    let content = critical_file(svc, &review, &input.file)?;
+    validate_anchor(input, &content)?;
     let settings = svc.effective_settings(&review.server_id, Some(&review.repo))?;
     let config = svc.db.app_config()?;
     let claude = env::resolve_tool("claude", config.claude_path.as_deref())?;
@@ -360,7 +360,7 @@ pub async fn check(
             .map_err(|e| AppError::Reviewer(format!("unexpected answer format: {e}")))?;
         Ok(advice_from(
             raw,
-            settings.forbid_ai_attribution.value,
+            Attribution::from_settings(&settings),
             outcome.cost_usd,
         ))
     }
@@ -542,7 +542,7 @@ mod tests {
 
         #[test]
         fn keeps_the_assessment_and_cost() {
-            let a = super::advice_from(raw("ok", "ok"), true, Some(0.01));
+            let a = super::advice_from(raw("ok", "ok"), Attribution::Forbidden, Some(0.01));
             assert_eq!(
                 (a.assessment, a.cost_usd),
                 (CommentAssessment::PartlyValid, Some(0.01))
@@ -551,14 +551,18 @@ mod tests {
 
         #[test]
         fn removes_dashes_from_the_feedback() {
-            let a = super::advice_from(raw("Mostly right — but see line 3", "x"), true, None);
+            let a = super::advice_from(
+                raw("Mostly right — but see line 3", "x"),
+                Attribution::Forbidden,
+                None,
+            );
             assert!(!a.feedback.contains('—'), "feedback: {}", a.feedback);
         }
 
         #[test]
         fn applies_the_comment_rules_to_the_suggestion() {
             let suggested = "Handle the error — it panics.\n\nCo-Authored-By: Claude <x@y>";
-            let a = super::advice_from(raw("x", suggested), true, None);
+            let a = super::advice_from(raw("x", suggested), Attribution::Forbidden, None);
             assert_eq!(a.suggested_comment, "Handle the error, it panics.");
         }
     }

@@ -11,7 +11,7 @@ use crate::env;
 use crate::error::{AppError, AppResult};
 use crate::providers::PrFilter;
 use crate::review::post::{self, PostOutcome, PostRequest};
-use crate::review::postprocess::{CommentCheck, check_comment};
+use crate::review::postprocess::{Attribution, CommentCheck, check_comment};
 use crate::review::queue;
 use crate::review::skills::validate_skill_dir;
 use crate::review::user_comment::{self, CommentAdvice, UserCommentInput};
@@ -110,11 +110,7 @@ pub async fn list_prs(
     prs.into_iter()
         .map(|pr| {
             let tracked = svc.db.get_tracked(&server_id, &pr.repo, pr.number)?;
-            let latest_review = svc
-                .db
-                .list_reviews_for_pr(&server_id, &pr.repo, pr.number)?
-                .into_iter()
-                .next();
+            let latest_review = svc.db.latest_review(&server_id, &pr.repo, pr.number)?;
             Ok(PrListItem {
                 pr,
                 tracked,
@@ -162,8 +158,8 @@ pub async fn get_pr_detail(
         TicketPlan::Skipped {
             source, message, ..
         } => Some(PrTicketInfo {
-            source_name: source.as_ref().map(|s| s.name.clone()).unwrap_or_default(),
-            source_kind: source.map(|s| s.kind),
+            source_kind: source.as_ref().map(|s| s.kind),
+            source_name: source.map_or_default(|s| s.name),
             keys: Vec::new(),
             message: Some(message),
         }),
@@ -335,7 +331,7 @@ pub fn check_comment_text(
     text: String,
 ) -> AppResult<CommentCheck> {
     let settings = svc.effective_settings(&server_id, Some(&repo))?;
-    Ok(check_comment(&text, settings.forbid_ai_attribution.value))
+    Ok(check_comment(&text, Attribution::from_settings(&settings)))
 }
 
 #[tauri::command]
@@ -368,7 +364,7 @@ pub fn resume_command(svc: Svc<'_>, review_id: String) -> AppResult<String> {
 
 #[tauri::command]
 pub fn list_tracked(svc: Svc<'_>) -> AppResult<Vec<TrackedPr>> {
-    svc.db.list_tracked(true)
+    svc.db.list_tracked()
 }
 
 #[tauri::command]
@@ -406,10 +402,11 @@ pub fn save_repo_settings(
     repo: String,
     settings: SettingsOverrides,
 ) -> AppResult<()> {
-    if repo.trim().is_empty() {
+    let repo = repo.trim();
+    if repo.is_empty() {
         return Err(AppError::invalid("repository path is required"));
     }
-    svc.db.set_repo_settings(&server_id, repo.trim(), &settings)
+    svc.db.set_repo_settings(&server_id, repo, &settings)
 }
 
 #[derive(Debug, Clone, Serialize, TS)]
@@ -466,6 +463,9 @@ pub fn get_app_config(svc: Svc<'_>) -> AppResult<AppConfig> {
 #[tauri::command(async)]
 pub fn save_app_config(app: tauri::AppHandle, svc: Svc<'_>, config: AppConfig) -> AppResult<()> {
     use tauri_plugin_autostart::ManagerExt;
+    // Checked before anything changes, so a mistyped path is reported instead of saved.
+    env::check_override("claude", config.claude_path.as_deref())?;
+    env::check_override("git", config.git_path.as_deref())?;
     let autolaunch = app.autolaunch();
     let result = if config.launch_at_login {
         autolaunch.enable()
@@ -537,19 +537,20 @@ async fn tool_status(name: &str, override_path: Option<&str>) -> ToolStatus {
                 .env("PATH", env::login_path())
                 .output()
                 .await;
+            let path = Some(path.to_string_lossy().into_owned());
             match out {
                 Ok(o) if o.status.success() => ToolStatus {
-                    path: Some(path.to_string_lossy().into()),
+                    path,
                     version: Some(String::from_utf8_lossy(&o.stdout).trim().to_string()),
                     error: None,
                 },
                 Ok(o) => ToolStatus {
-                    path: Some(path.to_string_lossy().into()),
+                    path,
                     version: None,
                     error: Some(String::from_utf8_lossy(&o.stderr).trim().to_string()),
                 },
                 Err(e) => ToolStatus {
-                    path: Some(path.to_string_lossy().into()),
+                    path,
                     version: None,
                     error: Some(e.to_string()),
                 },
@@ -566,8 +567,9 @@ async fn tool_status(name: &str, override_path: Option<&str>) -> ToolStatus {
 #[tauri::command]
 pub async fn check_environment(svc: Svc<'_>) -> AppResult<EnvironmentStatus> {
     let config = svc.db.app_config()?;
-    Ok(EnvironmentStatus {
-        claude: tool_status("claude", config.claude_path.as_deref()).await,
-        git: tool_status("git", config.git_path.as_deref()).await,
-    })
+    let (claude, git) = tokio::join!(
+        tool_status("claude", config.claude_path.as_deref()),
+        tool_status("git", config.git_path.as_deref()),
+    );
+    Ok(EnvironmentStatus { claude, git })
 }

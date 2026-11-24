@@ -1,17 +1,18 @@
 //! Shared application state used by commands, the review queue and the watcher.
 //! Everything UI-specific goes through [`UiSink`] so the logic is testable without Tauri.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use serde::Serialize;
 use ts_rs::TS;
 
 use crate::db::models::{
-    PullRequest, Review, Server, ServerInput, TicketSource, TicketSourceInput, TicketSourceKind,
+    PullRequest, Review, ReviewStatus, Server, ServerInput, TicketSource, TicketSourceInput,
+    TicketSourceKind,
 };
-use crate::db::{Db, now};
+use crate::db::{Db, non_empty, now};
 use crate::env;
 use crate::error::{AppError, AppResult};
 use crate::git::repo_cache::RepoCache;
@@ -51,8 +52,8 @@ pub trait UiSink: Send + Sync {
     fn notify(&self, title: &str, body: &str);
 }
 
-pub type ProviderFactory =
-    dyn Fn(&Server, String, Option<String>) -> Arc<dyn GitProvider> + Send + Sync;
+/// Builds the provider client for a server and its token. Tests swap in a fake.
+pub type ProviderFactory = dyn Fn(&Server, String) -> Arc<dyn GitProvider> + Send + Sync;
 
 const MAX_LOG_LINES: usize = 500;
 
@@ -102,27 +103,58 @@ pub struct Service {
     pub sink: Arc<dyn UiSink>,
     pub queue: ReviewQueue,
     provider_factory: Box<ProviderFactory>,
-    logs: Mutex<HashMap<String, Vec<ProgressEvent>>>,
-    /// Running ticket loads of the PR view, by request id, so the UI can cancel them.
-    ticket_loads: Mutex<HashMap<String, CancellationToken>>,
-    /// Running AI checks of user comments, by request id, so the UI can cancel them.
-    comment_checks: Mutex<HashMap<String, CancellationToken>>,
+    logs: Mutex<HashMap<String, VecDeque<ProgressEvent>>>,
+    /// Running ticket loads of the PR view, so the UI can cancel them.
+    ticket_loads: CancelRegistry,
+    /// Running AI checks of user comments, so the UI can cancel them.
+    comment_checks: CancelRegistry,
 }
 
-/// Unregisters a ticket load or comment check when it ends, also when the command future is
-/// dropped.
+/// At most this many cancels for requests that have not started are kept.
+const MAX_STRAY_CANCELS: usize = 64;
+
+/// Cancellation tokens of running UI requests, by request id.
+#[derive(Default)]
+struct CancelRegistry(Mutex<HashMap<String, CancellationToken>>);
+
+impl CancelRegistry {
+    fn tokens(&self) -> MutexGuard<'_, HashMap<String, CancellationToken>> {
+        // A poisoned map is still usable, and the guard's drop must not panic.
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Registers a request until the returned guard drops. A cancel can arrive before the
+    /// request starts; it leaves a cancelled token behind that the request picks up here.
+    fn start(&self, id: &str) -> (CancellationToken, CancelGuard<'_>) {
+        let token = self.tokens().entry(id.to_string()).or_default().clone();
+        let guard = CancelGuard {
+            registry: self,
+            id: id.to_string(),
+        };
+        (token, guard)
+    }
+
+    /// Cancels a request. Returns whether it was running.
+    fn cancel(&self, id: &str) -> bool {
+        let mut tokens = self.tokens();
+        let running = tokens.contains_key(id);
+        tokens.entry(id.to_string()).or_default().cancel();
+        if !running && tokens.len() > MAX_STRAY_CANCELS {
+            tokens.retain(|_, t| !t.is_cancelled());
+        }
+        running
+    }
+}
+
+/// Unregisters a request when it ends, also when the command future is dropped.
 struct CancelGuard<'a> {
-    running: &'a Mutex<HashMap<String, CancellationToken>>,
+    registry: &'a CancelRegistry,
     id: String,
 }
 
 impl Drop for CancelGuard<'_> {
     fn drop(&mut self) {
-        // A panic in drop would abort; a poisoned map is still usable here.
-        self.running
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&self.id);
+        self.registry.tokens().remove(&self.id);
     }
 }
 
@@ -135,8 +167,10 @@ impl Service {
         provider_factory: Option<Box<ProviderFactory>>,
     ) -> AppResult<Arc<Self>> {
         let config = db.app_config()?;
-        let git = env::resolve_tool("git", config.git_path.as_deref())
-            .unwrap_or_else(|_| PathBuf::from("git"));
+        let git = env::resolve_tool("git", config.git_path.as_deref()).unwrap_or_else(|e| {
+            tracing::warn!("using git from PATH: {e}");
+            PathBuf::from("git")
+        });
         Ok(Arc::new(Self {
             cache: Arc::new(RepoCache::new(
                 cache_root,
@@ -149,18 +183,14 @@ impl Service {
             sink,
             provider_factory: provider_factory.unwrap_or_else(|| Box::new(make_provider)),
             logs: Mutex::new(HashMap::new()),
-            ticket_loads: Mutex::new(HashMap::new()),
-            comment_checks: Mutex::new(HashMap::new()),
+            ticket_loads: CancelRegistry::default(),
+            comment_checks: CancelRegistry::default(),
         }))
     }
 
     pub fn provider(&self, server: &Server) -> AppResult<Arc<dyn GitProvider>> {
         let token = self.secrets.require(&server.id)?;
-        Ok((self.provider_factory)(
-            server,
-            token,
-            server.username.clone(),
-        ))
+        Ok((self.provider_factory)(server, token))
     }
 
     pub fn provider_for(&self, server_id: &str) -> AppResult<(Server, Arc<dyn GitProvider>)> {
@@ -176,11 +206,7 @@ impl Service {
             return Err(AppError::invalid("name and URL are required"));
         }
         let base_url = crate::db::normalize_base_url(&input.base_url);
-        let new_token = input
-            .token
-            .as_deref()
-            .map(str::trim)
-            .filter(|t| !t.is_empty());
+        let new_token = non_empty(input.token.as_deref());
         let existing = id.map(|id| self.db.get_server(id)).transpose()?;
         let token = match (new_token, &existing) {
             (Some(t), _) => t.to_string(),
@@ -204,37 +230,23 @@ impl Service {
             settings: SettingsOverrides::default(),
             created_at: String::new(),
         };
-        let username = (self.provider_factory)(&probe, token.clone(), None)
+        let username = (self.provider_factory)(&probe, token.clone())
             .current_user()
             .await?;
 
         let server = match &existing {
-            Some(old) => {
-                // Token before row: a failed keychain write must not leave the new URL paired
-                // with the old token.
-                let previous_token = match new_token {
-                    Some(t) => {
-                        let previous = self.secrets.get(&old.id)?;
-                        self.secrets.set(&old.id, t)?;
-                        previous
-                    }
-                    None => None,
-                };
-                match self.db.update_server(&old.id, input) {
-                    Ok(server) => server,
-                    Err(e) => {
-                        if let Some(previous) = previous_token {
-                            let _ = self.secrets.set(&old.id, &previous);
-                        }
-                        return Err(e);
-                    }
-                }
-            }
+            Some(old) => self
+                .update_with_token(&old.id, new_token, || self.db.update_server(&old.id, input))?,
             None => {
                 let server = self.db.insert_server(input)?;
                 if let Err(e) = self.secrets.set(&server.id, &token) {
                     // Never keep a server whose token could not be stored securely.
-                    let _ = self.db.delete_server(&server.id);
+                    if let Err(undo) = self.db.delete_server(&server.id) {
+                        tracing::error!(
+                            "could not remove server {} after a keychain failure: {undo}",
+                            server.id
+                        );
+                    }
                     return Err(e);
                 }
                 server
@@ -250,14 +262,12 @@ impl Service {
         format!("ticket-source:{source_id}")
     }
 
-    fn jira_client(&self, source: &TicketSource, token: String) -> AppResult<JiraClient> {
+    fn jira_client(source: &TicketSource, token: String) -> AppResult<JiraClient> {
         let auth = match source.kind {
             TicketSourceKind::JiraCloud => JiraAuth::Basic {
-                email: source
-                    .email
-                    .clone()
-                    .filter(|e| !e.trim().is_empty())
-                    .ok_or_else(|| AppError::invalid("Jira Cloud needs the account email"))?,
+                email: non_empty(source.email.as_deref())
+                    .ok_or_else(|| AppError::invalid("Jira Cloud needs the account email"))?
+                    .to_string(),
                 token,
             },
             TicketSourceKind::JiraServer => JiraAuth::Bearer(token),
@@ -270,6 +280,32 @@ impl Service {
             auth,
             crate::providers::http_client(),
         ))
+    }
+
+    /// Updates an existing row with `update`. A new token is written first, so a failed keychain
+    /// write can never leave a changed URL paired with the old token. If `update` then fails,
+    /// the previous token is put back.
+    fn update_with_token<T>(
+        &self,
+        account: &str,
+        new_token: Option<&str>,
+        update: impl FnOnce() -> AppResult<T>,
+    ) -> AppResult<T> {
+        let previous = match new_token {
+            Some(t) => {
+                let previous = self.secrets.get(account)?;
+                self.secrets.set(account, t)?;
+                previous
+            }
+            None => None,
+        };
+        update().inspect_err(|_| {
+            if let Some(previous) = previous
+                && let Err(e) = self.secrets.set(account, &previous)
+            {
+                tracing::error!("could not restore the previous token of {account}: {e}");
+            }
+        })
     }
 
     /// Like [`Self::save_server`]: verifies the token with Jira, stores it only in the secret
@@ -313,11 +349,7 @@ impl Service {
                 "enter the Jira URL, e.g. https://acme.atlassian.net",
             ));
         }
-        let new_token = input
-            .token
-            .as_deref()
-            .map(str::trim)
-            .filter(|t| !t.is_empty());
+        let new_token = non_empty(input.token.as_deref());
         let token = match (new_token, &existing) {
             (Some(t), _) => t.to_string(),
             // Never send a stored token to a newly typed URL.
@@ -329,36 +361,24 @@ impl Service {
             (None, Some(old)) => self.secrets.require(&Self::ticket_secret_id(&old.id))?,
             (None, None) => return Err(AppError::invalid("an API token is required")),
         };
-        let username = self.jira_client(&probe, token.clone())?.myself().await?;
+        let username = Self::jira_client(&probe, token.clone())?.myself().await?;
 
         match &existing {
             Some(old) => {
-                let secret_id = Self::ticket_secret_id(&old.id);
-                let previous = match new_token {
-                    Some(t) => {
-                        let previous = self.secrets.get(&secret_id)?;
-                        self.secrets.set(&secret_id, t)?;
-                        previous
-                    }
-                    None => None,
-                };
-                match self
-                    .db
-                    .upsert_ticket_source(Some(&old.id), input, Some(&username))
-                {
-                    Ok(s) => Ok(s),
-                    Err(e) => {
-                        if let Some(previous) = previous {
-                            let _ = self.secrets.set(&secret_id, &previous);
-                        }
-                        Err(e)
-                    }
-                }
+                self.update_with_token(&Self::ticket_secret_id(&old.id), new_token, || {
+                    self.db
+                        .upsert_ticket_source(Some(&old.id), input, Some(&username))
+                })
             }
             None => {
                 let saved = self.db.upsert_ticket_source(None, input, Some(&username))?;
                 if let Err(e) = self.secrets.set(&Self::ticket_secret_id(&saved.id), &token) {
-                    let _ = self.db.delete_ticket_source(&saved.id);
+                    if let Err(undo) = self.db.delete_ticket_source(&saved.id) {
+                        tracing::error!(
+                            "could not remove ticket source {} after a keychain failure: {undo}",
+                            saved.id
+                        );
+                    }
                     return Err(e);
                 }
                 Ok(saved)
@@ -403,10 +423,10 @@ impl Service {
             }
             _ => {
                 let token = self.secrets.require(&Self::ticket_secret_id(&source.id))?;
-                let client = self.jira_client(source, token)?;
+                let client = Self::jira_client(source, token)?;
                 tokio::select! {
                     t = client.issue(key, &extra) => t,
-                    _ = cancel.cancelled() => Err(AppError::Reviewer("cancelled".into())),
+                    _ = cancel.cancelled() => Err(AppError::Cancelled),
                 }
             }
         }
@@ -474,19 +494,7 @@ impl Service {
         request_id: &str,
     ) -> AppResult<Vec<TicketLoad>> {
         validate_request_id(request_id)?;
-        // A cancel can arrive before the load starts; it leaves a cancelled token behind.
-        let cancel = self
-            .ticket_loads
-            .lock()
-            .unwrap()
-            .entry(request_id.to_string())
-            .or_default()
-            .clone();
-        let _guard = CancelGuard {
-            running: &self.ticket_loads,
-            id: request_id.to_string(),
-        };
-        let cancelled = || AppError::Reviewer("cancelled".into());
+        let (cancel, _guard) = self.ticket_loads.start(request_id);
 
         let settings = self.effective_settings(server_id, Some(repo))?;
         let Some(source_id) = settings.ticket_source_id.value.as_deref() else {
@@ -500,7 +508,7 @@ impl Service {
         let mut loaded = Vec::with_capacity(keys.len());
         for key in keys {
             if cancel.is_cancelled() {
-                return Err(cancelled());
+                return Err(AppError::Cancelled);
             }
             let work_dir = self
                 .cache
@@ -510,7 +518,7 @@ impl Service {
                 .await;
             let _ = tokio::fs::remove_dir_all(&work_dir).await;
             if cancel.is_cancelled() {
-                return Err(cancelled());
+                return Err(AppError::Cancelled);
             }
             loaded.push(match result {
                 Ok(t) => TicketLoad {
@@ -561,8 +569,7 @@ impl Service {
             }
             _ => self.secrets.require(&Self::ticket_secret_id(&source.id))?,
         };
-        let (mime, bytes) = self
-            .jira_client(&source, token)?
+        let (mime, bytes) = Self::jira_client(&source, token)?
             .attachment_image(&key, attachment_id)
             .await?;
         Ok(format!(
@@ -575,53 +582,24 @@ impl Service {
     /// Returns whether a load with this id was running.
     pub fn cancel_ticket_load(&self, request_id: &str) -> AppResult<bool> {
         validate_request_id(request_id)?;
-        let mut loads = self.ticket_loads.lock().unwrap();
-        let running = loads.contains_key(request_id);
-        loads.entry(request_id.to_string()).or_default().cancel();
-        if !running {
-            // Nothing to stop yet. Keep the cancelled token only for a load that is about
-            // to start, and bound what a stream of stray cancels can leave behind.
-            if loads.len() > 64 {
-                loads.retain(|_, t| !t.is_cancelled());
-            }
-        }
-        Ok(running)
+        Ok(self.ticket_loads.cancel(request_id))
     }
 
     /// Runs the AI check of a user comment; `cancel_comment_check` stops it.
     pub async fn check_user_comment(
-        self: &Arc<Self>,
+        &self,
         input: &UserCommentInput,
         request_id: &str,
     ) -> AppResult<CommentAdvice> {
         validate_request_id(request_id)?;
-        let cancel = self
-            .comment_checks
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .entry(request_id.to_string())
-            .or_default()
-            .clone();
-        let _guard = CancelGuard {
-            running: &self.comment_checks,
-            id: request_id.to_string(),
-        };
+        let (cancel, _guard) = self.comment_checks.start(request_id);
         user_comment::check(self, input, cancel).await
     }
 
     /// Returns whether a check with this id was running.
     pub fn cancel_comment_check(&self, request_id: &str) -> AppResult<bool> {
         validate_request_id(request_id)?;
-        let mut checks = self
-            .comment_checks
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let running = checks.contains_key(request_id);
-        checks.entry(request_id.to_string()).or_default().cancel();
-        if !running && checks.len() > 64 {
-            checks.retain(|_, t| !t.is_cancelled());
-        }
-        Ok(running)
+        Ok(self.comment_checks.cancel(request_id))
     }
 
     pub fn effective_settings(
@@ -646,12 +624,12 @@ impl Service {
             at: now(),
         };
         {
-            let mut logs = self.logs.lock().unwrap_or_else(|e| e.into_inner());
+            let mut logs = self.logs.lock().unwrap_or_else(PoisonError::into_inner);
             let log = logs.entry(review_id.to_string()).or_default();
             if log.len() >= MAX_LOG_LINES {
-                log.remove(0);
+                log.pop_front();
             }
-            log.push(event.clone());
+            log.push_back(event.clone());
         }
         self.sink.review_progress(&event);
     }
@@ -659,15 +637,31 @@ impl Service {
     pub fn progress_log(&self, review_id: &str) -> Vec<ProgressEvent> {
         self.logs
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(PoisonError::into_inner)
             .get(review_id)
-            .cloned()
-            .unwrap_or_default()
+            .map_or_default(|log| log.iter().cloned().collect())
     }
 
     pub fn publish_review(&self, review_id: &str) {
-        if let Ok(review) = self.db.get_review(review_id) {
-            self.sink.review_updated(&review);
+        match self.db.get_review(review_id) {
+            Ok(review) => self.sink.review_updated(&review),
+            Err(e) => tracing::warn!("could not load review {review_id} to publish it: {e}"),
+        }
+    }
+
+    /// Records a review's status. Callers treat this as best effort (the review itself already
+    /// succeeded or failed), so a failed write is logged instead of returned.
+    pub fn record_review_status(
+        &self,
+        review_id: &str,
+        status: ReviewStatus,
+        message: Option<&str>,
+    ) {
+        if let Err(e) = self.db.set_review_status(review_id, status, message) {
+            tracing::warn!(
+                "could not mark review {review_id} as {}: {e}",
+                status.as_str()
+            );
         }
     }
 }

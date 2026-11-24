@@ -1,6 +1,7 @@
 pub mod github;
 pub mod gitlab;
 
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -75,6 +76,8 @@ pub trait GitProvider: Send + Sync {
     fn kind(&self) -> ProviderKind;
     async fn current_user(&self) -> AppResult<String>;
     async fn list_open_prs(&self, filter: PrFilter) -> AppResult<Vec<PullRequest>>;
+    /// Loads one PR. `project_id` is [`PullRequest::project_id`]: `owner/repo` on GitHub, the
+    /// numeric project id on GitLab.
     async fn get_pr(&self, project_id: &str, number: u64) -> AppResult<PullRequest>;
     async fn post_review(
         &self,
@@ -84,6 +87,7 @@ pub trait GitProvider: Send + Sync {
     async fn approve(&self, pr: &PullRequest, body: &str) -> AppResult<()>;
     /// `Authorization` header for git over HTTPS.
     fn git_auth_header(&self) -> String;
+    /// The ref the forge publishes a PR's head under, so forks can be fetched from the base repo.
     fn pr_fetch_ref(&self, number: u64) -> String;
 }
 
@@ -92,20 +96,23 @@ pub fn basic_auth_header(user: &str, token: &str) -> String {
     format!("Authorization: Basic {creds}")
 }
 
+/// Builds the HTTP client for one provider or ticket source.
+///
+/// Deliberately not a shared static: a pooled connection is bound to the tokio runtime that
+/// opened it, and tests run each case on its own runtime.
 pub fn http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .user_agent(concat!("pr-helper/", env!("CARGO_PKG_VERSION")))
         .timeout(std::time::Duration::from_secs(60))
         .build()
-        .expect("reqwest client")
+        // Only fails when the TLS backend can't initialise, which no request could recover from.
+        .expect("the HTTP client can be built")
 }
 
-pub fn make_provider(
-    server: &Server,
-    token: String,
-    username: Option<String>,
-) -> Arc<dyn GitProvider> {
+/// The provider client for a server. A username known from an earlier login saves a lookup.
+pub fn make_provider(server: &Server, token: String) -> Arc<dyn GitProvider> {
     let client = http_client();
+    let username = server.username.clone();
     match server.kind {
         ProviderKind::Github => Arc::new(github::GitHub::new(server, token, username, client)),
         ProviderKind::Gitlab => Arc::new(gitlab::GitLab::new(server, token, username, client)),
@@ -125,13 +132,10 @@ pub async fn check(
     let message = serde_json::from_str::<serde_json::Value>(&body)
         .ok()
         .and_then(|v| {
-            let m = v.get("message").or_else(|| v.get("error")).cloned()?;
-            let mut text = match m {
-                serde_json::Value::String(s) => s,
-                other => other.to_string(),
-            };
+            let m = v.get("message").or_else(|| v.get("error"))?;
+            let mut text = m.as_str().map_or_else(|| m.to_string(), str::to_owned);
             if let Some(errors) = v.get("errors") {
-                text.push_str(&format!(" {errors}"));
+                let _ = write!(text, " {errors}");
             }
             Some(text)
         })
@@ -144,11 +148,11 @@ pub async fn check(
 }
 
 /// Markdown block appended under a heading when a comment can't be attached inline.
-pub fn fold_comment(c: &InlineComment, suggestion_fence: &str) -> String {
+pub fn fold_comment(c: &InlineComment) -> String {
     let mut s = format!("**{}:{}**\n\n{}", c.path, c.line, c.body);
     if let Some(sugg) = &c.suggestion {
         let fence = fence_for(sugg);
-        s.push_str(&format!("\n\n{fence}{suggestion_fence}\n{sugg}\n{fence}"));
+        let _ = write!(s, "\n\n{fence}\n{sugg}\n{fence}");
     }
     s
 }

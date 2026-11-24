@@ -2,7 +2,7 @@ use rusqlite::Connection;
 
 /// Append-only. Each entry bumps `PRAGMA user_version` by one.
 const MIGRATIONS: &[&str] = &[
-    r#"
+    r"
 CREATE TABLE app_kv (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -99,8 +99,8 @@ CREATE TABLE findings (
     posted_ref       TEXT
 );
 CREATE INDEX findings_review ON findings (review_id, position);
-"#,
-    r#"
+",
+    r"
 CREATE TABLE ticket_sources (
     id           TEXT PRIMARY KEY,
     kind         TEXT NOT NULL,
@@ -116,8 +116,8 @@ CREATE TABLE ticket_sources (
 );
 
 ALTER TABLE reviews ADD COLUMN tickets TEXT;
-"#,
-    r#"
+",
+    r"
 CREATE TABLE review_files (
     review_id      TEXT NOT NULL REFERENCES reviews(id) ON DELETE CASCADE,
     position       INTEGER NOT NULL,
@@ -130,18 +130,20 @@ CREATE TABLE review_files (
     diff_truncated INTEGER NOT NULL,
     PRIMARY KEY (review_id, path)
 );
-"#,
-    r#"
+",
+    r"
 ALTER TABLE findings ADD COLUMN source TEXT NOT NULL DEFAULT 'reviewer';
-"#,
+",
 ];
 
+/// Applies the migrations the database has not seen yet, each in its own transaction.
+/// `PRAGMA user_version` counts the ones already applied.
 pub fn run(conn: &mut Connection) -> rusqlite::Result<()> {
-    let current: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    for (i, sql) in MIGRATIONS.iter().enumerate().skip(current as usize) {
+    let current: usize = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    for (i, sql) in MIGRATIONS.iter().enumerate().skip(current) {
         let tx = conn.transaction()?;
         tx.execute_batch(sql)?;
-        tx.pragma_update(None, "user_version", (i + 1) as i64)?;
+        tx.pragma_update(None, "user_version", i + 1)?;
         tx.commit()?;
     }
     Ok(())

@@ -25,7 +25,7 @@ static STEERING_RES: LazyLock<Vec<Regex>> = LazyLock::new(|| {
         r"(?i)\byou\s+are\s+(now\s+)?(an?\s+)?(ai|llm|language\s+model|assistant|reviewer)\b",
     ]
     .iter()
-    .map(|p| Regex::new(p).expect("valid steering regex"))
+    .map(|p| Regex::new(p).expect("hard-coded regex is valid"))
     .collect()
 });
 
@@ -41,8 +41,8 @@ pub fn steering_attempt(
 ) -> Option<String> {
     let added = diff
         .lines()
-        .filter(|l| l.starts_with('+') && !l.starts_with("+++"))
-        .map(|l| &l[1..]);
+        .filter(|l| !l.starts_with("+++"))
+        .filter_map(|l| l.strip_prefix('+'));
     let sources = [title, description, commits, tickets]
         .into_iter()
         .flat_map(str::lines)

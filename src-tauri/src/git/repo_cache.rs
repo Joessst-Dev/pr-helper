@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError};
 
 use tokio::process::Command;
 use tokio::sync::Mutex;
@@ -71,12 +71,11 @@ impl RepoCache {
     }
 
     pub fn set_git(&self, git: PathBuf) {
-        *self.git.write().unwrap_or_else(|e| e.into_inner()) = git;
+        *self.git.write().unwrap_or_else(PoisonError::into_inner) = git;
     }
 
     fn cmd(&self, auth_header: Option<&str>) -> Command {
-        let git = self.git.read().unwrap_or_else(|e| e.into_inner()).clone();
-        let mut c = Command::new(git);
+        let mut c = Command::new(&*self.git.read().unwrap_or_else(PoisonError::into_inner));
         c.env("PATH", &self.path_env)
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GIT_ASKPASS", "")
@@ -110,7 +109,10 @@ impl RepoCache {
             c.arg("-C").arg(d);
         }
         c.args(args);
-        let out = c.output().await?;
+        let out = c
+            .output()
+            .await
+            .map_err(|e| AppError::Git(format!("could not run git: {e}")))?;
         if out.status.success() {
             Ok(String::from_utf8_lossy(&out.stdout).into_owned())
         } else {
@@ -224,43 +226,30 @@ impl RepoCache {
 
     /// Three-dot diff (from the merge base), which is what GitHub and GitLab show.
     pub async fn diff(&self, bare: &Path, base: &str, head: &str) -> AppResult<String> {
-        self.run(
-            Some(bare),
-            &[
-                "diff",
-                "--no-color",
-                "--src-prefix=a/",
-                "--dst-prefix=b/",
-                "--no-ext-diff",
-                "--no-textconv",
-                "-U3",
-                "-M",
-                &format!("{base}...{head}"),
-            ],
-            None,
-        )
-        .await
+        self.git_diff(bare, &[&format!("{base}...{head}")]).await
     }
 
     /// Two-dot diff between two reviewed heads, for incremental re-reviews.
     pub async fn diff_between(&self, bare: &Path, from: &str, to: &str) -> AppResult<String> {
-        self.run(
-            Some(bare),
-            &[
-                "diff",
-                "--no-color",
-                "--src-prefix=a/",
-                "--dst-prefix=b/",
-                "--no-ext-diff",
-                "--no-textconv",
-                "-U3",
-                "-M",
-                from,
-                to,
-            ],
-            None,
-        )
-        .await
+        self.git_diff(bare, &[from, to]).await
+    }
+
+    /// Every diff the reviewer sees is made the same way, so their line numbers agree with the
+    /// index that anchors comments. No external diff drivers or textconv filters from the
+    /// repository run.
+    async fn git_diff(&self, bare: &Path, revs: &[&str]) -> AppResult<String> {
+        const FLAGS: [&str; 8] = [
+            "diff",
+            "--no-color",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+            "--no-ext-diff",
+            "--no-textconv",
+            "-U3",
+            "-M",
+        ];
+        let args: Vec<&str> = FLAGS.iter().chain(revs).copied().collect();
+        self.run(Some(bare), &args, None).await
     }
 
     pub async fn commit_log(&self, bare: &Path, base: &str, head: &str) -> AppResult<String> {
@@ -335,10 +324,16 @@ impl RepoCache {
                 None,
             )
             .await;
-        if removed.is_err() && dest.exists() {
-            tokio::fs::remove_dir_all(dest).await?;
+        if let Err(e) = removed {
+            tracing::debug!("git worktree remove failed, deleting the directory: {e}");
+            if dest.exists() {
+                tokio::fs::remove_dir_all(dest).await?;
+            }
         }
-        let _ = self.run(Some(bare), &["worktree", "prune"], None).await;
+        // Best effort: a stale worktree entry only costs a little disk until the next prune.
+        if let Err(e) = self.run(Some(bare), &["worktree", "prune"], None).await {
+            tracing::debug!("git worktree prune failed: {e}");
+        }
         Ok(())
     }
 }

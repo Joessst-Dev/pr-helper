@@ -57,6 +57,8 @@ pub struct ServerInput {
     pub token: Option<String>,
 }
 
+/// From most to least severe.
+// Sorting relies on the derived `Ord` following this declaration order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, TS)]
 #[serde(rename_all = "lowercase")]
 #[ts(export)]
@@ -69,17 +71,6 @@ pub enum Severity {
 }
 
 impl Severity {
-    /// Lower rank sorts first.
-    pub fn rank(self) -> u8 {
-        match self {
-            Self::Critical => 0,
-            Self::High => 1,
-            Self::Medium => 2,
-            Self::Low => 3,
-            Self::Nit => 4,
-        }
-    }
-
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Critical => "critical",
@@ -211,6 +202,7 @@ impl ReviewStatus {
         }
     }
 
+    /// Unknown values read as `Failed`: a review the app can't account for did not finish.
     pub fn parse(s: &str) -> Self {
         match s {
             "queued" => Self::Queued,
@@ -232,6 +224,23 @@ impl ReviewStatus {
 pub enum ReviewTrigger {
     Manual,
     Auto,
+}
+
+impl ReviewTrigger {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::Auto => "auto",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "manual" => Some(Self::Manual),
+            "auto" => Some(Self::Auto),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -382,6 +391,23 @@ pub struct ReviewFile {
 pub enum Side {
     Right,
     Left,
+}
+
+impl Side {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Right => "right",
+            Self::Left => "left",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "right" => Some(Self::Right),
+            "left" => Some(Self::Left),
+            _ => None,
+        }
+    }
 }
 
 /// Who wrote a finding: the reviewer, or the user on a file they reviewed by hand.

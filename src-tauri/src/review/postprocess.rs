@@ -14,7 +14,7 @@ use std::sync::LazyLock;
 
 use regex::{Captures, Regex};
 
-use crate::db::models::{CriticalFile, Finding, LineRange, Severity, Side, Verdict};
+use crate::db::models::{CriticalFile, Finding, FindingSource, LineRange, Severity, Side, Verdict};
 use crate::db::new_id;
 use crate::error::{AppError, AppResult};
 use crate::git::diff::DiffIndex;
@@ -26,7 +26,8 @@ use crate::settings::EffectiveSettings;
 const PH_OPEN: char = '\u{E000}';
 const PH_CLOSE: char = '\u{E001}';
 
-static URL_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://[^\s<>()\[\]]+").unwrap());
+static URL_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"https?://[^\s<>()\[\]]+").expect("hard-coded regex is valid"));
 
 /// Which lines count as code (left alone) rather than prose.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -162,7 +163,7 @@ fn unmask(line: &str, stash: &[String]) -> String {
         match after.find(PH_CLOSE) {
             Some(end) => {
                 let idx: usize = after[..end].parse().unwrap_or(usize::MAX);
-                out.push_str(stash.get(idx).map(String::as_str).unwrap_or(""));
+                out.push_str(stash.get(idx).map_or("", String::as_str));
                 rest = &after[end + PH_CLOSE.len_utf8()..];
             }
             None => {
@@ -176,31 +177,37 @@ fn unmask(line: &str, stash: &[String]) -> String {
 
 // ---- dashes -----------------------------------------------------------------
 
-static TABLE_DELIM_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)+\|?\s*$").unwrap());
-static HR_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s*(?:-{2,}|[—–]+)\s*$").unwrap());
-static ARROW_BOTH_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"<-{2,}>").unwrap());
-static ARROW_RIGHT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"-{2,}>").unwrap());
-static ARROW_LEFT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"<-{2,}").unwrap());
-static FLAG_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"(^|[\s(\[{"'])(--[A-Za-z0-9][\w.=/:-]*)"#).unwrap());
+static TABLE_DELIM_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)+\|?\s*$").expect("hard-coded regex is valid")
+});
+static HR_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*(?:-{2,}|[—–]+)\s*$").expect("hard-coded regex is valid"));
+static ARROW_BOTH_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"<-{2,}>").expect("hard-coded regex is valid"));
+static ARROW_RIGHT_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"-{2,}>").expect("hard-coded regex is valid"));
+static ARROW_LEFT_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"<-{2,}").expect("hard-coded regex is valid"));
+static FLAG_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(^|[\s(\[{"'])(--[A-Za-z0-9][\w.=/:-]*)"#).expect("hard-coded regex is valid")
+});
 static LIST_MARKER_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^(\s*)(?:-{2,}|[—–])\s+").unwrap());
-static RANGE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(\d)\s*(?:[—–]|-{2,})\s*(\d)").unwrap());
+    LazyLock::new(|| Regex::new(r"^(\s*)(?:-{2,}|[—–])\s+").expect("hard-coded regex is valid"));
+static RANGE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(\d)\s*(?:[—–]|-{2,})\s*(\d)").expect("hard-coded regex is valid")
+});
 static DASH_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"[ \t]*(?:[—–]|-{2,})[ \t]*").unwrap());
-static PUNCT_CLEANUP_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s*,(\s*,)+").unwrap());
-static FORBIDDEN_DASH_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[—–]|-{2,}").unwrap());
+    LazyLock::new(|| Regex::new(r"[ \t]*(?:[—–]|-{2,})[ \t]*").expect("hard-coded regex is valid"));
+static PUNCT_CLEANUP_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\s*,(\s*,)+").expect("hard-coded regex is valid"));
+static DASH_RUN_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new("-+").expect("hard-coded regex is valid"));
+static FORBIDDEN_DASH_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"[—–]|-{2,}").expect("hard-coded regex is valid"));
 
 fn sanitize_dash_line(line: &str) -> Option<String> {
     if TABLE_DELIM_RE.is_match(line) && line.contains('|') {
-        return Some(
-            Regex::new("-+")
-                .unwrap()
-                .replace_all(line, "-")
-                .into_owned(),
-        );
+        return Some(DASH_RUN_RE.replace_all(line, "-").into_owned());
     }
     if HR_RE.is_match(line) {
         return None;
@@ -278,7 +285,7 @@ static ATTRIBUTION_LINE_RES: LazyLock<Vec<Regex>> = LazyLock::new(|| {
         r"(?i)^\s*(?:[-*_—–]+\s*)?(?:sent|reviewed|signed)?\s*(?:by|from|via)?\s*(?:claude|anthropic)(?:\s+code)?\s*$",
     ]
     .iter()
-    .map(|p| Regex::new(p).unwrap())
+    .map(|p| Regex::new(p).expect("hard-coded regex is valid"))
     .collect()
 });
 
@@ -288,22 +295,23 @@ static ATTRIBUTION_SENTENCE_RES: LazyLock<Vec<Regex>> = LazyLock::new(|| {
         Regex::new(&format!(
             r"(?i)\b(this|the|my|our|these)\s+(review|comment|feedback|analysis|suggestion|summary|response|reply|text|message|note)s?\b[^.!?\n]{{0,30}}\b(generated|written|created|produced|drafted|authored|assisted|powered|composed|made|reviewed)\b[^.!?\n]{{0,25}}\b(with|by|using|via|from|through)\b[^.!?\n]{{0,25}}\b{AI_TERMS}"
         ))
-        .unwrap(),
+        .expect("hard-coded regex is valid"),
         // Sentence-initial passive signature: "Generated with Claude Code", "Written by an AI".
         // A mid-sentence "errors produced by the Claude CLI" is a legitimate code remark.
         Regex::new(&format!(
             r"(?i)(?:^|[.!?]\s+)[\s*_—–-]*(generated|written|created|produced|drafted|authored|assisted|powered|brought to you|composed|made|reviewed)\s+(with|by|using|via|from|through)\b[^.!?\n]{{0,25}}\b{AI_TERMS}"
         ))
-        .unwrap(),
-        Regex::new(r"(?i)\bas an? (ai|language model|llm|assistant|automated (reviewer|tool))\b").unwrap(),
-        Regex::new(r"(?i)\b(i am|i'm)\s+(claude|an ai|a language model|an assistant|an automated)\b").unwrap(),
-        Regex::new(r"(?i)\bai[- ](generated|assisted|powered|authored|written|driven)\b").unwrap(),
-        Regex::new(r"(?i)\b(this|the|my)\s+(review|comment|feedback|analysis|suggestion)s?\s+(was|is|were|are|has been|have been)\s+(automated|automatically generated|machine[- ]generated|generated)\b").unwrap(),
+        .expect("hard-coded regex is valid"),
+        Regex::new(r"(?i)\bas an? (ai|language model|llm|assistant|automated (reviewer|tool))\b").expect("hard-coded regex is valid"),
+        Regex::new(r"(?i)\b(i am|i'm)\s+(claude|an ai|a language model|an assistant|an automated)\b").expect("hard-coded regex is valid"),
+        Regex::new(r"(?i)\bai[- ](generated|assisted|powered|authored|written|driven)\b").expect("hard-coded regex is valid"),
+        Regex::new(r"(?i)\b(this|the|my)\s+(review|comment|feedback|analysis|suggestion)s?\s+(was|is|were|are|has been|have been)\s+(automated|automatically generated|machine[- ]generated|generated)\b").expect("hard-coded regex is valid"),
     ]
 });
 
 static ATTRIBUTION_LINK_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)^https?://([a-z0-9-]+\.)*(claude\.(ai|com)|anthropic\.com)\b").unwrap()
+    Regex::new(r"(?i)^https?://([a-z0-9-]+\.)*(claude\.(ai|com)|anthropic\.com)\b")
+        .expect("hard-coded regex is valid")
 });
 
 fn split_sentences(line: &str) -> Vec<&str> {
@@ -357,15 +365,15 @@ fn strip_attribution_line(line: &str, stash: &[String]) -> Option<String> {
     if !attribution_hit(line, stash) {
         return Some(line.to_string());
     }
-    let kept: Vec<&str> = split_sentences(line)
+    let kept: String = split_sentences(line)
         .into_iter()
         .filter(|s| !attribution_hit(s, stash))
         .collect();
-    let joined = kept.concat().trim().to_string();
+    let joined = kept.trim().to_string();
     if joined.is_empty() {
         None
     } else {
-        let indent: String = line.chars().take_while(|c| c.is_whitespace()).collect();
+        let indent = &line[..line.len() - line.trim_start().len()];
         Some(format!("{indent}{joined}"))
     }
 }
@@ -386,15 +394,32 @@ pub fn attribution_violations(text: &str) -> Vec<String> {
 
 // ---- public API -------------------------------------------------------------
 
-static BLANK_RUN_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\n{3,}").unwrap());
+static BLANK_RUN_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\n{3,}").expect("hard-coded regex is valid"));
+
+/// Whether AI attribution is stripped from comments (`forbid_ai_attribution`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Attribution {
+    Allowed,
+    Forbidden,
+}
+
+impl Attribution {
+    pub fn from_settings(settings: &EffectiveSettings) -> Self {
+        if settings.forbid_ai_attribution.value {
+            Self::Forbidden
+        } else {
+            Self::Allowed
+        }
+    }
+}
 
 /// Sanitize text that will be posted.
-pub fn sanitize_comment(text: &str, forbid_attribution: bool) -> String {
+pub fn sanitize_comment(text: &str, attribution: Attribution) -> String {
     let text = text.replace("\r\n", "\n");
-    let text = if forbid_attribution {
-        strip_attribution(&text)
-    } else {
-        text
+    let text = match attribution {
+        Attribution::Forbidden => strip_attribution(&text),
+        Attribution::Allowed => text,
     };
     let text = sanitize_dashes(&text);
     BLANK_RUN_RE.replace_all(&text, "\n\n").trim().to_string()
@@ -410,25 +435,24 @@ pub struct CommentCheck {
     pub sanitized: String,
 }
 
-pub fn check_comment(text: &str, forbid_attribution: bool) -> CommentCheck {
+pub fn check_comment(text: &str, attribution: Attribution) -> CommentCheck {
     CommentCheck {
         dash_violations: dash_violations(text),
-        attribution_violations: if forbid_attribution {
-            attribution_violations(text)
-        } else {
-            Vec::new()
+        attribution_violations: match attribution {
+            Attribution::Forbidden => attribution_violations(text),
+            Attribution::Allowed => Vec::new(),
         },
-        sanitized: sanitize_comment(text, forbid_attribution),
+        sanitized: sanitize_comment(text, attribution),
     }
 }
 
 /// Final gate before posting: sanitize, append the optional footer, and refuse if anything
 /// forbidden survives.
 pub fn finalize_body(text: &str, settings: &EffectiveSettings) -> AppResult<String> {
-    let forbid = settings.forbid_ai_attribution.value;
-    let mut body = sanitize_comment(text, forbid);
+    let attribution = Attribution::from_settings(settings);
+    let mut body = sanitize_comment(text, attribution);
     let footer = settings.attribution_footer.value.trim();
-    if !forbid && !footer.is_empty() && !body.is_empty() {
+    if attribution == Attribution::Allowed && !footer.is_empty() && !body.is_empty() {
         body = format!("{body}\n\n{}", sanitize_dashes(footer));
     }
     let dashes = dash_violations(&body);
@@ -438,29 +462,30 @@ pub fn finalize_body(text: &str, settings: &EffectiveSettings) -> AppResult<Stri
             dashes.join(" | ")
         )));
     }
-    if forbid {
-        let attribution = attribution_violations(&body);
-        if !attribution.is_empty() {
+    if attribution == Attribution::Forbidden {
+        let remaining = attribution_violations(&body);
+        if !remaining.is_empty() {
             return Err(AppError::invalid(format!(
                 "refusing to post: AI attribution remains in: {}",
-                attribution.join(" | ")
+                remaining.join(" | ")
             )));
         }
     }
     Ok(body)
 }
 
+/// Sorts by severity, then PR-wide findings last, then file and line. Also renumbers
+/// `position` to match, which is the order the UI shows.
 pub fn sort_findings(findings: &mut [Finding]) {
     findings.sort_by(|a, b| {
         a.severity
-            .rank()
-            .cmp(&b.severity.rank())
+            .cmp(&b.severity)
             .then_with(|| a.file.is_none().cmp(&b.file.is_none()))
             .then_with(|| a.file.cmp(&b.file))
             .then_with(|| a.line_start.cmp(&b.line_start))
     });
     for (i, f) in findings.iter_mut().enumerate() {
-        f.position = i as u32;
+        f.position = u32::try_from(i).unwrap_or(u32::MAX);
     }
 }
 
@@ -482,18 +507,18 @@ pub fn process(
     diff: &DiffIndex,
     has_tickets: bool,
 ) -> Processed {
-    let forbid = settings.forbid_ai_attribution.value;
+    let attribution = Attribution::from_settings(settings);
     let min_selected = settings.default_selected_min_severity.value;
     let scope_allowed = has_tickets && settings.ticket_scope_check.value;
 
     let mut findings: Vec<Finding> = raw
         .findings
         .into_iter()
-        .filter_map(|f| to_finding(f, review_id, forbid, diff))
+        .filter_map(|f| to_finding(f, review_id, attribution, diff))
         .filter(|f| !(settings.skip_nits.value && f.severity == Severity::Nit))
         .filter(|f| scope_allowed || f.category != SCOPE_CATEGORY)
         .map(|mut f| {
-            if f.category == SCOPE_CATEGORY && f.severity.rank() < Severity::Medium.rank() {
+            if f.category == SCOPE_CATEGORY && f.severity < Severity::Medium {
                 f.severity = Severity::Medium;
             }
             f
@@ -501,20 +526,13 @@ pub fn process(
         .collect();
     sort_findings(&mut findings);
     for f in &mut findings {
-        f.selected = f.severity.rank() <= min_selected.rank() && !f.proposed_comment.is_empty();
+        f.selected = f.severity <= min_selected && !f.proposed_comment.is_empty();
     }
 
     let mut verdict = Verdict::parse(raw.verdict.trim()).unwrap_or(Verdict::Comment);
     // Never let an approve verdict through with blocking findings.
-    if verdict == Verdict::Approve
-        && findings
-            .iter()
-            .any(|f| f.severity.rank() <= Severity::Medium.rank())
-    {
-        verdict = if findings
-            .iter()
-            .any(|f| f.severity.rank() <= Severity::High.rank())
-        {
+    if verdict == Verdict::Approve && findings.iter().any(|f| f.severity <= Severity::Medium) {
+        verdict = if findings.iter().any(|f| f.severity <= Severity::High) {
             Verdict::RequestChanges
         } else {
             Verdict::Comment
@@ -523,7 +541,7 @@ pub fn process(
 
     Processed {
         verdict,
-        summary: sanitize_comment(&raw.summary, forbid),
+        summary: sanitize_comment(&raw.summary, attribution),
         findings,
         critical_files: critical_files(raw.critical_files, diff),
     }
@@ -558,12 +576,9 @@ fn critical_files(raw: Vec<RawCriticalFile>, diff: &DiffIndex) -> Vec<CriticalFi
             .focus_lines
             .iter()
             .filter_map(|r| {
-                let start = r.start.clamp(0, MAX_LINE);
-                let end = if r.end < r.start { r.start } else { r.end }.clamp(0, MAX_LINE);
-                (start > 0).then_some(LineRange {
-                    start: start as u32,
-                    end: end as u32,
-                })
+                let start = u32::try_from(r.start.clamp(0, MAX_LINE)).ok()?;
+                let end = u32::try_from(r.end.max(r.start).clamp(0, MAX_LINE)).ok()?;
+                (start > 0).then_some(LineRange { start, end })
             })
             .collect();
         focus_lines.sort_by_key(|r| (r.start, r.end));
@@ -595,7 +610,12 @@ fn normalize_path(p: &str, diff: &DiffIndex) -> String {
         .to_string()
 }
 
-fn to_finding(f: RawFinding, review_id: &str, forbid: bool, diff: &DiffIndex) -> Option<Finding> {
+fn to_finding(
+    f: RawFinding,
+    review_id: &str,
+    attribution: Attribution,
+    diff: &DiffIndex,
+) -> Option<Finding> {
     let severity = Severity::parse(&f.severity).unwrap_or(Severity::Low);
     let side = match f.side.as_deref() {
         Some("left") => Side::Left,
@@ -620,8 +640,8 @@ fn to_finding(f: RawFinding, review_id: &str, forbid: bool, diff: &DiffIndex) ->
         _ => None,
     };
 
-    let proposed_comment = sanitize_comment(&f.proposed_comment, forbid);
-    let title = sanitize_comment(&f.title, forbid);
+    let proposed_comment = sanitize_comment(&f.proposed_comment, attribution);
+    let title = sanitize_comment(&f.title, attribution);
     if title.is_empty() && proposed_comment.is_empty() {
         return None;
     }
@@ -640,7 +660,7 @@ fn to_finding(f: RawFinding, review_id: &str, forbid: bool, diff: &DiffIndex) ->
         line_start,
         line_end,
         side: anchor.as_ref().map_or(side, |a| a.side),
-        explanation: sanitize_comment(&f.explanation, forbid),
+        explanation: sanitize_comment(&f.explanation, attribution),
         proposed_comment,
         suggestion: f.suggestion.filter(|s| !s.trim().is_empty()),
         in_diff: anchor.is_some(),
@@ -648,7 +668,7 @@ fn to_finding(f: RawFinding, review_id: &str, forbid: bool, diff: &DiffIndex) ->
         selected: false,
         posted_at: None,
         posted_ref: None,
-        source: Default::default(),
+        source: FindingSource::Reviewer,
     })
 }
 
@@ -710,32 +730,35 @@ mod tests {
     fn strips_attribution() {
         let text = "Please handle the error here.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nCo-Authored-By: Claude <noreply@anthropic.com>";
         assert_eq!(
-            sanitize_comment(text, true),
+            sanitize_comment(text, Attribution::Forbidden),
             "Please handle the error here."
         );
 
         let text =
             "This leaks a handle. This review was generated by an AI assistant. Close it in Drop.";
         assert_eq!(
-            sanitize_comment(text, true),
+            sanitize_comment(text, Attribution::Forbidden),
             "This leaks a handle. Close it in Drop."
         );
 
         let text = "As an AI, I think this is fine. The loop is O(n^2).";
-        assert_eq!(sanitize_comment(text, true), "The loop is O(n^2).");
+        assert_eq!(
+            sanitize_comment(text, Attribution::Forbidden),
+            "The loop is O(n^2)."
+        );
     }
 
     #[test]
     fn keeps_legitimate_mentions_in_code() {
         let text = "Rename `ClaudeClient::send` to match the other clients.";
-        assert_eq!(sanitize_comment(text, true), text);
+        assert_eq!(sanitize_comment(text, Attribution::Forbidden), text);
         assert!(attribution_violations(text).is_empty());
     }
 
     #[test]
     fn attribution_allowed_keeps_text() {
         let text = "Generated with Claude.";
-        assert_eq!(sanitize_comment(text, false), text);
+        assert_eq!(sanitize_comment(text, Attribution::Allowed), text);
     }
 
     fn settings(over: SettingsOverrides) -> EffectiveSettings {
@@ -857,8 +880,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn process_sorts_filters_and_anchors() {
+    /// An approve verdict with one finding per severity, reviewed with `skip_nits` on.
+    fn process_mixed_review() -> Processed {
         let diff = DiffIndex::parse(DIFF);
         let raw_review = RawReview {
             verdict: "approve".into(),
@@ -875,28 +898,64 @@ mod tests {
             skip_nits: Some(true),
             ..Default::default()
         });
-        let p = process(raw_review, "r1", &s, &diff, false);
+        process(raw_review, "r1", &s, &diff, false)
+    }
+
+    #[test]
+    fn process_drops_nits_and_sorts_by_severity() {
+        let p = process_mixed_review();
         let sev: Vec<_> = p.findings.iter().map(|f| f.severity).collect();
         assert_eq!(
             sev,
             vec![Severity::Critical, Severity::Medium, Severity::Low]
         );
-        assert_eq!(p.findings[0].proposed_comment, "Fix this, now");
-        assert!(p.findings[0].in_diff);
-        assert!(p.findings[0].diff_excerpt.is_some());
-        assert!(!p.findings[1].in_diff); // line 50 is not in the diff
-        assert!(p.findings[0].selected && p.findings[1].selected && !p.findings[2].selected);
+    }
+
+    #[test]
+    fn process_numbers_positions_in_sorted_order() {
+        let p = process_mixed_review();
         assert_eq!(
             p.findings.iter().map(|f| f.position).collect::<Vec<_>>(),
             vec![0, 1, 2]
         );
-        // Approve with a critical finding is downgraded.
-        assert_eq!(p.verdict, Verdict::RequestChanges);
-        assert_eq!(p.summary, "Summary, fine");
     }
 
     #[test]
-    fn process_keeps_nits_when_allowed_and_respects_clean_approve() {
+    fn process_sanitizes_dashes_in_comments_and_summary() {
+        let p = process_mixed_review();
+        assert_eq!(
+            (p.findings[0].proposed_comment.as_str(), p.summary.as_str()),
+            ("Fix this, now", "Summary, fine")
+        );
+    }
+
+    #[test]
+    fn process_anchors_findings_on_diff_lines_with_an_excerpt() {
+        let p = process_mixed_review();
+        assert!(p.findings[0].in_diff && p.findings[0].diff_excerpt.is_some());
+    }
+
+    #[test]
+    fn process_marks_findings_outside_the_diff() {
+        let p = process_mixed_review();
+        // Line 50 of a.rs is not part of the diff.
+        assert!(!p.findings[1].in_diff);
+    }
+
+    #[test]
+    fn process_preselects_findings_from_the_default_minimum_severity() {
+        let p = process_mixed_review();
+        let selected: Vec<_> = p.findings.iter().map(|f| f.selected).collect();
+        assert_eq!(selected, vec![true, true, false]);
+    }
+
+    #[test]
+    fn approve_with_a_critical_finding_is_downgraded() {
+        assert_eq!(process_mixed_review().verdict, Verdict::RequestChanges);
+    }
+
+    /// An approve verdict with a single nit, reviewed with default settings.
+    fn process_nit_only_review() -> Processed {
         let diff = DiffIndex::parse(DIFF);
         let raw_review = RawReview {
             verdict: "approve".into(),
@@ -904,15 +963,23 @@ mod tests {
             critical_files: Vec::new(),
             findings: vec![raw("nit", "a.rs", 2, "tiny")],
         };
-        let p = process(
+        process(
             raw_review,
             "r1",
             &settings(SettingsOverrides::default()),
             &diff,
             false,
-        );
-        assert_eq!(p.findings.len(), 1);
-        assert_eq!(p.verdict, Verdict::Approve);
+        )
+    }
+
+    #[test]
+    fn process_keeps_nits_when_skip_nits_is_off() {
+        assert_eq!(process_nit_only_review().findings.len(), 1);
+    }
+
+    #[test]
+    fn approve_with_only_nits_stays_approve() {
+        assert_eq!(process_nit_only_review().verdict, Verdict::Approve);
     }
 
     #[test]
@@ -954,30 +1021,40 @@ mod tests {
             "Errors produced by the Claude CLI are swallowed here. Return them.",
             "The token is created by the OpenAI client but never closed.",
         ] {
-            assert_eq!(sanitize_comment(text, true), text);
+            assert_eq!(sanitize_comment(text, Attribution::Forbidden), text);
             assert!(attribution_violations(text).is_empty(), "{text}");
         }
         assert_eq!(
-            sanitize_comment("Looks good. Generated with Claude Code.", true),
+            sanitize_comment(
+                "Looks good. Generated with Claude Code.",
+                Attribution::Forbidden
+            ),
             "Looks good."
         );
         assert_eq!(
-            sanitize_comment("Fine. This review was written by an AI.", true),
+            sanitize_comment(
+                "Fine. This review was written by an AI.",
+                Attribution::Forbidden
+            ),
             "Fine."
         );
     }
 
     #[test]
     fn em_dash_signatures_are_stripped_not_blocked() {
-        let out = sanitize_comment("Thanks!\n\n— Claude", true);
+        let out = sanitize_comment("Thanks!\n\n— Claude", Attribution::Forbidden);
         assert_eq!(out, "Thanks!");
-        assert!(check_comment(&out, true).attribution_violations.is_empty());
+        assert!(
+            check_comment(&out, Attribution::Forbidden)
+                .attribution_violations
+                .is_empty()
+        );
     }
 
     #[test]
     fn indented_code_blocks_keep_their_dashes() {
         let text = "Run the tests with output:\n\n    cargo test -- --nocapture\n\nThen check -- carefully.";
-        let out = sanitize_comment(text, true);
+        let out = sanitize_comment(text, Attribution::Forbidden);
         assert!(out.contains("    cargo test -- --nocapture"), "{out}");
         assert!(!out.contains("check --"), "{out}");
         assert!(dash_violations(&out).is_empty());

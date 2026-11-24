@@ -2,7 +2,7 @@ pub mod migrations;
 pub mod models;
 
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Mutex, PoisonError};
 
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
@@ -45,7 +45,7 @@ impl Db {
     }
 
     fn with<T>(&self, f: impl FnOnce(&Connection) -> rusqlite::Result<T>) -> AppResult<T> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let conn = self.conn.lock().unwrap_or_else(PoisonError::into_inner);
         Ok(f(&conn)?)
     }
 
@@ -99,12 +99,17 @@ impl Db {
         let settings: String = r.get("settings")?;
         Ok(Server {
             id: r.get("id")?,
-            kind: ProviderKind::parse(&kind).unwrap_or(ProviderKind::Github),
+            kind: parsed_or(
+                ProviderKind::parse(&kind),
+                ProviderKind::Github,
+                "provider kind",
+                &kind,
+            ),
             name: r.get("name")?,
             base_url: r.get("base_url")?,
             username: r.get("username")?,
             pr_scope: r.get("pr_scope")?,
-            settings: serde_json::from_str(&settings).unwrap_or_default(),
+            settings: json_or_default(&settings, "server settings"),
             created_at: r.get("created_at")?,
         })
     }
@@ -140,11 +145,7 @@ impl Db {
                     input.kind.as_str(),
                     input.name.trim(),
                     normalize_base_url(&input.base_url),
-                    input
-                        .pr_scope
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty()),
+                    non_empty(input.pr_scope.as_deref()),
                     now()
                 ],
             )
@@ -161,7 +162,7 @@ impl Db {
                     input.kind.as_str(),
                     input.name.trim(),
                     normalize_base_url(&input.base_url),
-                    input.pr_scope.as_deref().map(str::trim).filter(|s| !s.is_empty()),
+                    non_empty(input.pr_scope.as_deref()),
                 ],
             )
         })?;
@@ -209,7 +210,7 @@ impl Db {
             )
             .optional()
         })?;
-        Ok(raw.map(|s| serde_json::from_str(&s).unwrap_or_default()))
+        Ok(raw.map(|s| json_or_default(&s, "repo settings")))
     }
 
     pub fn set_repo_settings(
@@ -248,7 +249,7 @@ impl Db {
             )?;
             let rows = stmt.query_map([server_id], |r| {
                 let raw: String = r.get(1)?;
-                Ok((r.get(0)?, serde_json::from_str(&raw).unwrap_or_default()))
+                Ok((r.get(0)?, json_or_default(&raw, "repo settings")))
             })?;
             rows.collect()
         })
@@ -293,12 +294,8 @@ impl Db {
     }
 
     pub fn upsert_skill(&self, id: Option<&str>, input: &SkillInput) -> AppResult<Skill> {
-        let id = id.map(str::to_string).unwrap_or_else(new_id);
-        let repo = input
-            .repo
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty());
+        let id = id.map_or_else(new_id, str::to_string);
+        let repo = non_empty(input.repo.as_deref());
         self.with(|c| {
             c.execute(
                 "INSERT INTO skills (id, server_id, repo, name, description, path, content, enabled, created_at)
@@ -339,7 +336,12 @@ impl Db {
         let kind: String = r.get("kind")?;
         Ok(TicketSource {
             id: r.get("id")?,
-            kind: TicketSourceKind::parse(&kind).unwrap_or(TicketSourceKind::JiraCloud),
+            kind: parsed_or(
+                TicketSourceKind::parse(&kind),
+                TicketSourceKind::JiraCloud,
+                "ticket source kind",
+                &kind,
+            ),
             name: r.get("name")?,
             base_url: r.get("base_url")?,
             email: r.get("email")?,
@@ -380,13 +382,7 @@ impl Db {
         input: &TicketSourceInput,
         username: Option<&str>,
     ) -> AppResult<TicketSource> {
-        let id = id.map(str::to_string).unwrap_or_else(new_id);
-        let opt = |v: &Option<String>| {
-            v.as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-        };
+        let id = id.map_or_else(new_id, str::to_string);
         self.with(|c| {
             c.execute(
                 "INSERT INTO ticket_sources (id, kind, name, base_url, email, mcp_server, mcp_tools,
@@ -402,11 +398,11 @@ impl Db {
                     input.kind.as_str(),
                     input.name.trim(),
                     normalize_base_url(&input.base_url),
-                    opt(&input.email),
-                    opt(&input.mcp_server),
-                    opt(&input.mcp_tools),
-                    opt(&input.model),
-                    opt(&input.extra_fields),
+                    non_empty(input.email.as_deref()),
+                    non_empty(input.mcp_server.as_deref()),
+                    non_empty(input.mcp_tools.as_deref()),
+                    non_empty(input.model.as_deref()),
+                    non_empty(input.extra_fields.as_deref()),
                     username,
                     now()
                 ],
@@ -428,7 +424,7 @@ impl Db {
             server_id: r.get("server_id")?,
             repo: r.get("repo")?,
             project_id: r.get("project_id")?,
-            number: r.get::<_, i64>("number")? as u64,
+            number: r.get("number")?,
             title: r.get("title")?,
             author: r.get("author")?,
             web_url: r.get("web_url")?,
@@ -455,7 +451,7 @@ impl Db {
                 params![
                     pr.server_id,
                     pr.repo,
-                    pr.number as i64,
+                    pr.number,
                     pr.project_id,
                     pr.title,
                     pr.author,
@@ -477,21 +473,18 @@ impl Db {
         self.with(|c| {
             c.query_row(
                 "SELECT * FROM tracked_prs WHERE server_id = ?1 AND repo = ?2 AND number = ?3",
-                params![server_id, repo, number as i64],
+                params![server_id, repo, number],
                 Self::tracked_from_row,
             )
             .optional()
         })
     }
 
-    pub fn list_tracked(&self, only_active: bool) -> AppResult<Vec<TrackedPr>> {
+    /// The PRs still being watched, most recently updated first.
+    pub fn list_tracked(&self) -> AppResult<Vec<TrackedPr>> {
         self.with(|c| {
-            let sql = if only_active {
-                "SELECT * FROM tracked_prs WHERE active = 1 ORDER BY updated_at DESC"
-            } else {
-                "SELECT * FROM tracked_prs ORDER BY updated_at DESC"
-            };
-            let mut stmt = c.prepare(sql)?;
+            let mut stmt =
+                c.prepare("SELECT * FROM tracked_prs WHERE active = 1 ORDER BY updated_at DESC")?;
             let rows = stmt.query_map([], Self::tracked_from_row)?;
             rows.collect()
         })
@@ -509,7 +502,7 @@ impl Db {
             c.execute(
                 "UPDATE tracked_prs SET last_seen_head_sha = ?4, has_new_changes = ?5, updated_at = ?6
                  WHERE server_id = ?1 AND repo = ?2 AND number = ?3",
-                params![server_id, repo, number as i64, head_sha, has_new_changes, now()],
+                params![server_id, repo, number, head_sha, has_new_changes, now()],
             )
         })?;
         Ok(())
@@ -532,7 +525,7 @@ impl Db {
                 params![
                     server_id,
                     repo,
-                    number as i64,
+                    number,
                     reviewed_sha,
                     verdict.map(Verdict::as_str),
                     now()
@@ -553,7 +546,7 @@ impl Db {
             c.execute(
                 "UPDATE tracked_prs SET active = ?4, updated_at = ?5
                  WHERE server_id = ?1 AND repo = ?2 AND number = ?3",
-                params![server_id, repo, number as i64, active, now()],
+                params![server_id, repo, number, active, now()],
             )
         })?;
         Ok(())
@@ -563,7 +556,7 @@ impl Db {
         self.with(|c| {
             c.execute(
                 "DELETE FROM tracked_prs WHERE server_id = ?1 AND repo = ?2 AND number = ?3",
-                params![server_id, repo, number as i64],
+                params![server_id, repo, number],
             )
         })?;
         Ok(())
@@ -580,16 +573,17 @@ impl Db {
             server_id: r.get("server_id")?,
             repo: r.get("repo")?,
             project_id: r.get("project_id")?,
-            number: r.get::<_, i64>("number")? as u64,
+            number: r.get("number")?,
             pr_title: r.get("pr_title")?,
             head_sha: r.get("head_sha")?,
             base_sha: r.get("base_sha")?,
             status: ReviewStatus::parse(&status),
-            trigger: if trigger == "auto" {
-                ReviewTrigger::Auto
-            } else {
-                ReviewTrigger::Manual
-            },
+            trigger: parsed_or(
+                ReviewTrigger::parse(&trigger),
+                ReviewTrigger::Manual,
+                "review trigger",
+                &trigger,
+            ),
             session_id: r.get("session_id")?,
             verdict: verdict.as_deref().and_then(Verdict::parse),
             summary: r.get("summary")?,
@@ -601,8 +595,7 @@ impl Db {
             finished_at: r.get("finished_at")?,
             tickets: r
                 .get::<_, Option<String>>("tickets")?
-                .and_then(|t| serde_json::from_str(&t).ok())
-                .unwrap_or_default(),
+                .map_or_else(Vec::new, |t| json_or_default(&t, "review tickets")),
         })
     }
 
@@ -618,11 +611,11 @@ impl Db {
                     pr.server_id,
                     pr.repo,
                     pr.project_id,
-                    pr.number as i64,
+                    pr.number,
                     pr.title,
                     pr.head_sha,
                     pr.base_sha,
-                    if trigger == ReviewTrigger::Auto { "auto" } else { "manual" },
+                    trigger.as_str(),
                     now()
                 ],
             )
@@ -653,11 +646,26 @@ impl Db {
                 "SELECT * FROM reviews WHERE server_id = ?1 AND repo = ?2 AND number = ?3
                  ORDER BY created_at DESC",
             )?;
-            let rows = stmt.query_map(
-                params![server_id, repo, number as i64],
-                Self::review_from_row,
-            )?;
+            let rows = stmt.query_map(params![server_id, repo, number], Self::review_from_row)?;
             rows.collect()
+        })
+    }
+
+    /// The newest review of a PR, whatever its status.
+    pub fn latest_review(
+        &self,
+        server_id: &str,
+        repo: &str,
+        number: u64,
+    ) -> AppResult<Option<Review>> {
+        self.with(|c| {
+            c.query_row(
+                "SELECT * FROM reviews WHERE server_id = ?1 AND repo = ?2 AND number = ?3
+                 ORDER BY created_at DESC LIMIT 1",
+                params![server_id, repo, number],
+                Self::review_from_row,
+            )
+            .optional()
         })
     }
 
@@ -680,7 +688,7 @@ impl Db {
             c.query_row(
                 "SELECT * FROM reviews WHERE server_id = ?1 AND repo = ?2 AND number = ?3
                  AND status = 'done' ORDER BY created_at DESC LIMIT 1",
-                params![server_id, repo, number as i64],
+                params![server_id, repo, number],
                 Self::review_from_row,
             )
             .optional()
@@ -744,7 +752,7 @@ impl Db {
         findings: &[Finding],
         files: &[ReviewFile],
     ) -> AppResult<()> {
-        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let mut conn = self.conn.lock().unwrap_or_else(PoisonError::into_inner);
         let tx = conn.transaction()?;
         tx.execute(
             "UPDATE reviews SET status = 'done', verdict = ?2, summary = ?3, cost_usd = ?4,
@@ -768,11 +776,7 @@ impl Db {
                     f.file,
                     f.line_start,
                     f.line_end,
-                    if f.side == Side::Left {
-                        "left"
-                    } else {
-                        "right"
-                    },
+                    f.side.as_str(),
                     f.explanation,
                     f.proposed_comment,
                     f.suggestion,
@@ -790,7 +794,7 @@ impl Db {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     id,
-                    position as i64,
+                    position,
                     f.meta.path,
                     f.meta.reason,
                     json_col(&f.meta.focus_lines)?,
@@ -859,7 +863,7 @@ impl Db {
                 Ok(CriticalFile {
                     path: r.get("path")?,
                     reason: r.get("reason")?,
-                    focus_lines: serde_json::from_str(&focus).unwrap_or_default(),
+                    focus_lines: json_or_default(&focus, "focus lines"),
                     note: note.as_deref().and_then(FileNote::parse),
                 })
             })?;
@@ -877,7 +881,7 @@ impl Db {
                     let diff: String = r.get("diff")?;
                     Ok(CriticalFileContent {
                         content: r.get("content")?,
-                        diff: serde_json::from_str(&diff).unwrap_or_default(),
+                        diff: json_or_default(&diff, "critical file diff"),
                         diff_truncated: r.get("diff_truncated")?,
                     })
                 },
@@ -896,17 +900,18 @@ impl Db {
             id: r.get("id")?,
             review_id: r.get("review_id")?,
             position: r.get("position")?,
-            severity: Severity::parse(&severity).unwrap_or(Severity::Low),
+            severity: parsed_or(
+                Severity::parse(&severity),
+                Severity::Low,
+                "severity",
+                &severity,
+            ),
             category: r.get("category")?,
             title: r.get("title")?,
             file: r.get("file")?,
             line_start: r.get("line_start")?,
             line_end: r.get("line_end")?,
-            side: if side == "left" {
-                Side::Left
-            } else {
-                Side::Right
-            },
+            side: parsed_or(Side::parse(&side), Side::Right, "side", &side),
             explanation: r.get("explanation")?,
             proposed_comment: r.get("proposed_comment")?,
             suggestion: r.get("suggestion")?,
@@ -915,7 +920,15 @@ impl Db {
             selected: r.get("selected")?,
             posted_at: r.get("posted_at")?,
             posted_ref: r.get("posted_ref")?,
-            source: FindingSource::parse(&r.get::<_, String>("source")?).unwrap_or_default(),
+            source: {
+                let source: String = r.get("source")?;
+                parsed_or(
+                    FindingSource::parse(&source),
+                    FindingSource::Reviewer,
+                    "finding source",
+                    &source,
+                )
+            },
         })
     }
 
@@ -958,10 +971,11 @@ impl Db {
     /// Stores a comment the user wrote on a critical file. It keeps the severity order: it goes
     /// after every finding of the same or a higher severity, and the rest move down one place.
     pub fn insert_user_finding(&self, f: &Finding) -> AppResult<Finding> {
+        // Scoped so the connection lock is released before `get_finding` takes it again.
         {
-            let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+            let mut conn = self.conn.lock().unwrap_or_else(PoisonError::into_inner);
             let tx = conn.transaction()?;
-            let ranked: Vec<(u32, u8)> = {
+            let ranked: Vec<(u32, Severity)> = {
                 let mut stmt = tx.prepare(
                     "SELECT position, severity FROM findings WHERE review_id = ?1 ORDER BY position",
                 )?;
@@ -969,14 +983,19 @@ impl Db {
                     let severity: String = r.get(1)?;
                     Ok((
                         r.get(0)?,
-                        Severity::parse(&severity).unwrap_or(Severity::Low).rank(),
+                        parsed_or(
+                            Severity::parse(&severity),
+                            Severity::Low,
+                            "severity",
+                            &severity,
+                        ),
                     ))
                 })?
                 .collect::<rusqlite::Result<_>>()?
             };
             let position = ranked
                 .iter()
-                .filter(|(_, rank)| *rank <= f.severity.rank())
+                .filter(|(_, severity)| *severity <= f.severity)
                 .map(|(p, _)| p + 1)
                 .max()
                 .unwrap_or(0);
@@ -1000,11 +1019,7 @@ impl Db {
                     f.file,
                     f.line_start,
                     f.line_end,
-                    if f.side == Side::Left {
-                        "left"
-                    } else {
-                        "right"
-                    },
+                    f.side.as_str(),
                     f.proposed_comment,
                     f.in_diff,
                     f.selected,
@@ -1052,8 +1067,30 @@ impl Db {
     }
 }
 
+/// Rows are written by this app, so stored JSON that does not parse means a corrupt row or a
+/// newer app version. Reads fall back to the default so the app keeps working, but log it.
+fn json_or_default<T: serde::de::DeserializeOwned + Default>(raw: &str, what: &str) -> T {
+    serde_json::from_str(raw).unwrap_or_else(|e| {
+        tracing::warn!("ignoring unreadable stored {what}: {e}");
+        T::default()
+    })
+}
+
+/// Like [`json_or_default`], for stored enum values.
+fn parsed_or<T>(parsed: Option<T>, fallback: T, what: &str, raw: &str) -> T {
+    parsed.unwrap_or_else(|| {
+        tracing::warn!("unknown stored {what} {raw:?}, using the default");
+        fallback
+    })
+}
+
 fn json_col<T: serde::Serialize>(value: &T) -> rusqlite::Result<String> {
     serde_json::to_string(value).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
+}
+
+/// Trims optional user input; blank counts as unset.
+pub fn non_empty(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|s| !s.is_empty())
 }
 
 pub fn normalize_base_url(url: &str) -> String {
@@ -1201,6 +1238,35 @@ mod tests {
     }
 
     #[test]
+    fn latest_review_is_the_newest_of_that_pr_whatever_its_status() {
+        let db = Db::open_in_memory().unwrap();
+        let s = db.insert_server(&server_input()).unwrap();
+        let pr = sample_pr(&s.id);
+        let done = db.insert_review(&pr, ReviewTrigger::Manual).unwrap();
+        db.complete_review(&done.id, Verdict::Comment, "s", None, &[], &[])
+            .unwrap();
+        let queued = db.insert_review(&pr, ReviewTrigger::Auto).unwrap();
+        db.insert_review(
+            &PullRequest {
+                number: 8,
+                ..sample_pr(&s.id)
+            },
+            ReviewTrigger::Manual,
+        )
+        .unwrap();
+
+        let latest = db.latest_review(&s.id, &pr.repo, pr.number).unwrap();
+        assert_eq!(latest.map(|r| r.id), Some(queued.id));
+    }
+
+    #[test]
+    fn latest_review_is_none_for_an_unreviewed_pr() {
+        let db = Db::open_in_memory().unwrap();
+        let s = db.insert_server(&server_input()).unwrap();
+        assert!(db.latest_review(&s.id, "team/app", 7).unwrap().is_none());
+    }
+
+    #[test]
     fn user_findings_follow_the_reviewer_and_only_they_can_be_deleted() {
         let db = Db::open_in_memory().unwrap();
         let s = db.insert_server(&server_input()).unwrap();
@@ -1301,7 +1367,7 @@ mod tests {
             selected: true,
             posted_at: None,
             posted_ref: None,
-            source: Default::default(),
+            source: FindingSource::Reviewer,
         };
         db.complete_review(
             &review.id,
@@ -1389,7 +1455,7 @@ mod tests {
         assert_eq!(s.base_url, "https://acme.atlassian.net");
         assert_eq!(s.mcp_server, None);
         assert_eq!(s.username.as_deref(), Some("Me"));
-        let mut edited = input.clone();
+        let mut edited = input;
         edited.name = "Renamed".into();
         db.upsert_ticket_source(Some(&s.id), &edited, None).unwrap();
         let all = db.list_ticket_sources().unwrap();

@@ -2,7 +2,7 @@
 //! (cancels) an older queued or running review of the same PR.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
@@ -50,7 +50,7 @@ impl ReviewQueue {
     }
 
     fn jobs(&self) -> std::sync::MutexGuard<'_, HashMap<PrKey, Job>> {
-        self.jobs.lock().unwrap_or_else(|e| e.into_inner())
+        self.jobs.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     pub fn active_count(&self) -> usize {
@@ -59,25 +59,23 @@ impl ReviewQueue {
 
     pub fn is_active(&self, server_id: &str, repo: &str, number: u64) -> bool {
         self.jobs()
-            .contains_key(&(server_id.to_string(), repo.to_string(), number))
+            .keys()
+            .any(|(s, r, n)| s == server_id && r == repo && *n == number)
     }
 
     pub fn cancel(&self, review_id: &str) -> bool {
-        let jobs = self.jobs();
-        match jobs.values().find(|j| j.review_id == review_id) {
-            Some(job) => {
-                job.cancel.cancel();
-                true
-            }
-            None => false,
-        }
+        self.jobs()
+            .values()
+            .find(|j| j.review_id == review_id)
+            .map(|job| job.cancel.cancel())
+            .is_some()
     }
 
     /// Changes how many reviews may run at once. Lowering the limit lets running reviews
     /// finish; their permits are retired as they are released.
     pub fn set_limit(&self, max_concurrent: usize) {
         let new = max_concurrent.max(1);
-        let mut limit = self.limit.lock().unwrap_or_else(|e| e.into_inner());
+        let mut limit = self.limit.lock().unwrap_or_else(PoisonError::into_inner);
         if new > limit.max {
             let mut extra = new - limit.max;
             let repaid = extra.min(limit.debt);
@@ -94,7 +92,7 @@ impl ReviewQueue {
 
     /// Returns a finished review's permit, or retires it if the limit was lowered meanwhile.
     fn release(&self, permit: OwnedSemaphorePermit) {
-        let mut limit = self.limit.lock().unwrap_or_else(|e| e.into_inner());
+        let mut limit = self.limit.lock().unwrap_or_else(PoisonError::into_inner);
         if limit.debt > 0 {
             limit.debt -= 1;
             permit.forget();
@@ -161,7 +159,7 @@ pub fn enqueue(svc: &Arc<Service>, pr: PullRequest, trigger: ReviewTrigger) -> A
                 svc2.queue.release(permit);
             }
             None => {
-                let _ = svc2.db.set_review_status(
+                svc2.record_review_status(
                     &review_id,
                     ReviewStatus::Cancelled,
                     Some("Superseded before it started"),
