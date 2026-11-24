@@ -110,11 +110,7 @@ pub async fn list_prs(
     prs.into_iter()
         .map(|pr| {
             let tracked = svc.db.get_tracked(&server_id, &pr.repo, pr.number)?;
-            let latest_review = svc
-                .db
-                .list_reviews_for_pr(&server_id, &pr.repo, pr.number)?
-                .into_iter()
-                .next();
+            let latest_review = svc.db.latest_review(&server_id, &pr.repo, pr.number)?;
             Ok(PrListItem {
                 pr,
                 tracked,

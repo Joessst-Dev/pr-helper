@@ -651,6 +651,24 @@ impl Db {
         })
     }
 
+    /// The newest review of a PR, whatever its status.
+    pub fn latest_review(
+        &self,
+        server_id: &str,
+        repo: &str,
+        number: u64,
+    ) -> AppResult<Option<Review>> {
+        self.with(|c| {
+            c.query_row(
+                "SELECT * FROM reviews WHERE server_id = ?1 AND repo = ?2 AND number = ?3
+                 ORDER BY created_at DESC LIMIT 1",
+                params![server_id, repo, number],
+                Self::review_from_row,
+            )
+            .optional()
+        })
+    }
+
     pub fn list_recent_reviews(&self, limit: u32) -> AppResult<Vec<Review>> {
         self.with(|c| {
             let mut stmt = c.prepare("SELECT * FROM reviews ORDER BY created_at DESC LIMIT ?1")?;
@@ -1217,6 +1235,35 @@ mod tests {
                 Some("code")
             );
         }
+    }
+
+    #[test]
+    fn latest_review_is_the_newest_of_that_pr_whatever_its_status() {
+        let db = Db::open_in_memory().unwrap();
+        let s = db.insert_server(&server_input()).unwrap();
+        let pr = sample_pr(&s.id);
+        let done = db.insert_review(&pr, ReviewTrigger::Manual).unwrap();
+        db.complete_review(&done.id, Verdict::Comment, "s", None, &[], &[])
+            .unwrap();
+        let queued = db.insert_review(&pr, ReviewTrigger::Auto).unwrap();
+        db.insert_review(
+            &PullRequest {
+                number: 8,
+                ..sample_pr(&s.id)
+            },
+            ReviewTrigger::Manual,
+        )
+        .unwrap();
+
+        let latest = db.latest_review(&s.id, &pr.repo, pr.number).unwrap();
+        assert_eq!(latest.map(|r| r.id), Some(queued.id));
+    }
+
+    #[test]
+    fn latest_review_is_none_for_an_unreviewed_pr() {
+        let db = Db::open_in_memory().unwrap();
+        let s = db.insert_server(&server_input()).unwrap();
+        assert!(db.latest_review(&s.id, "team/app", 7).unwrap().is_none());
     }
 
     #[test]
