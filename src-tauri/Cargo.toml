@@ -1,6 +1,6 @@
 [package]
 name = "pr-helper"
-version = "0.5.1"
+version = "0.6.0"
 description = "Claude-powered PR reviewer for GitHub and GitLab"
 authors = ["Jost Weyers"]
 license = "MIT"
