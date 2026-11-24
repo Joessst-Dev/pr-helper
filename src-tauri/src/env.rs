@@ -127,9 +127,33 @@ pub fn resolve_tool(name: &str, override_path: Option<&str>) -> AppResult<PathBu
     })
 }
 
+/// Rejects a tool location the user entered that is not an executable file. An unset location
+/// is looked up on PATH when the tool is used, so there is nothing to check yet.
+pub fn check_override(name: &str, override_path: Option<&str>) -> AppResult<()> {
+    if override_path.is_some_and(|p| !p.trim().is_empty()) {
+        resolve_tool(name, override_path)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unset_override_needs_no_check() {
+        assert!(check_override("git", None).is_ok());
+        assert!(check_override("git", Some("  ")).is_ok());
+    }
+
+    #[test]
+    fn an_override_that_is_not_an_executable_is_rejected() {
+        let err = check_override("git", Some("/nonexistent/git")).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "/nonexistent/git is not an executable file"
+        );
+    }
 
     #[test]
     fn finds_executables_on_a_path() {

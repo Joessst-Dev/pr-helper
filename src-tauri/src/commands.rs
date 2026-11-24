@@ -463,6 +463,9 @@ pub fn get_app_config(svc: Svc<'_>) -> AppResult<AppConfig> {
 #[tauri::command(async)]
 pub fn save_app_config(app: tauri::AppHandle, svc: Svc<'_>, config: AppConfig) -> AppResult<()> {
     use tauri_plugin_autostart::ManagerExt;
+    // Checked before anything changes, so a mistyped path is reported instead of saved.
+    env::check_override("claude", config.claude_path.as_deref())?;
+    env::check_override("git", config.git_path.as_deref())?;
     let autolaunch = app.autolaunch();
     let result = if config.launch_at_login {
         autolaunch.enable()
