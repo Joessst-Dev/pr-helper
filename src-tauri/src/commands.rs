@@ -162,7 +162,7 @@ pub async fn get_pr_detail(
         TicketPlan::Skipped {
             source, message, ..
         } => Some(PrTicketInfo {
-            source_name: source.as_ref().map(|s| s.name.clone()).unwrap_or_default(),
+            source_name: source.as_ref().map_or_default(|s| s.name.clone()),
             source_kind: source.map(|s| s.kind),
             keys: Vec::new(),
             message: Some(message),

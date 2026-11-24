@@ -40,11 +40,7 @@ pub async fn run_review(
     let review_dir = svc.cache.review_dir(review_id);
     let outcome = execute(svc, review_id, &pr, &review_dir, cancel.clone()).await;
 
-    let keep = svc
-        .db
-        .app_config()
-        .map(|c| c.keep_worktrees)
-        .unwrap_or(false);
+    let keep = svc.db.app_config().is_ok_and(|c| c.keep_worktrees);
     let worktree = review_dir.join("worktree");
     match &outcome {
         Ok(_) if keep => {
@@ -342,8 +338,7 @@ async fn snapshot_files(
         check_cancel(cancel)?;
         let (diff, diff_truncated) = index
             .file(&meta.path)
-            .map(|f| f.view_lines(MAX_SNAPSHOT_DIFF_LINES))
-            .unwrap_or_default();
+            .map_or_default(|f| f.view_lines(MAX_SNAPSHOT_DIFF_LINES));
         let read = async {
             Ok::<_, AppError>(match svc.cache.tree_entry(bare, head, &meta.path).await? {
                 TreeEntry::Missing => Err(FileNote::Deleted),
@@ -459,11 +454,7 @@ async fn after_review(
     let Ok(settings) = svc.effective_settings(&pr.server_id, Some(&pr.repo)) else {
         return;
     };
-    let finding_count = svc
-        .db
-        .list_findings(review_id)
-        .map(|f| f.len())
-        .unwrap_or(0);
+    let finding_count = svc.db.list_findings(review_id).map_or(0, |f| f.len());
     let label = format!("{}#{}", pr.repo, pr.number);
 
     if verdict == Verdict::Approve

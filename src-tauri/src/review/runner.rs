@@ -68,9 +68,9 @@ impl RunRequest {
                 // ...and any MCP servers it declares.
                 a.push("--strict-mcp-config".into());
                 a.push("--tools".into());
-                a.extend(REVIEWER_TOOLS.iter().map(|t| t.to_string()));
+                a.extend(REVIEWER_TOOLS.iter().map(ToString::to_string));
                 a.push("--allowed-tools".into());
-                a.extend(REVIEWER_TOOLS.iter().map(|t| t.to_string()));
+                a.extend(REVIEWER_TOOLS.iter().map(ToString::to_string));
             }
             ToolPolicy::TicketFetcher { allowed } => {
                 // Every other loaded MCP tool (all of the user's servers and connectors are

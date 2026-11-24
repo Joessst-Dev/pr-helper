@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError};
 
 use tokio::process::Command;
 use tokio::sync::Mutex;
@@ -71,11 +71,15 @@ impl RepoCache {
     }
 
     pub fn set_git(&self, git: PathBuf) {
-        *self.git.write().unwrap_or_else(|e| e.into_inner()) = git;
+        *self.git.write().unwrap_or_else(PoisonError::into_inner) = git;
     }
 
     fn cmd(&self, auth_header: Option<&str>) -> Command {
-        let git = self.git.read().unwrap_or_else(|e| e.into_inner()).clone();
+        let git = self
+            .git
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
         let mut c = Command::new(git);
         c.env("PATH", &self.path_env)
             .env("GIT_TERMINAL_PROMPT", "0")

@@ -1,6 +1,7 @@
 //! GitLab.com and self-managed GitLab (API v4).
 
 use std::collections::HashSet;
+use std::fmt::Write as _;
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -182,7 +183,7 @@ impl GitLab {
         if let (Some(s), Side::Right) = (&c.suggestion, c.side) {
             let above = c.start_line.map_or(0, |start| c.line.saturating_sub(start));
             let fence = super::fence_for(s);
-            body.push_str(&format!("\n\n{fence}suggestion:-{above}+0\n{s}\n{fence}"));
+            let _ = write!(body, "\n\n{fence}suggestion:-{above}+0\n{s}\n{fence}");
         }
         body
     }

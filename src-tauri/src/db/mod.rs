@@ -2,7 +2,7 @@ pub mod migrations;
 pub mod models;
 
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Mutex, PoisonError};
 
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
@@ -45,7 +45,7 @@ impl Db {
     }
 
     fn with<T>(&self, f: impl FnOnce(&Connection) -> rusqlite::Result<T>) -> AppResult<T> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let conn = self.conn.lock().unwrap_or_else(PoisonError::into_inner);
         Ok(f(&conn)?)
     }
 
@@ -293,7 +293,7 @@ impl Db {
     }
 
     pub fn upsert_skill(&self, id: Option<&str>, input: &SkillInput) -> AppResult<Skill> {
-        let id = id.map(str::to_string).unwrap_or_else(new_id);
+        let id = id.map_or_else(new_id, str::to_string);
         let repo = input
             .repo
             .as_deref()
@@ -380,7 +380,7 @@ impl Db {
         input: &TicketSourceInput,
         username: Option<&str>,
     ) -> AppResult<TicketSource> {
-        let id = id.map(str::to_string).unwrap_or_else(new_id);
+        let id = id.map_or_else(new_id, str::to_string);
         let opt = |v: &Option<String>| {
             v.as_deref()
                 .map(str::trim)
@@ -428,7 +428,7 @@ impl Db {
             server_id: r.get("server_id")?,
             repo: r.get("repo")?,
             project_id: r.get("project_id")?,
-            number: r.get::<_, i64>("number")? as u64,
+            number: r.get("number")?,
             title: r.get("title")?,
             author: r.get("author")?,
             web_url: r.get("web_url")?,
@@ -455,7 +455,7 @@ impl Db {
                 params![
                     pr.server_id,
                     pr.repo,
-                    pr.number as i64,
+                    pr.number,
                     pr.project_id,
                     pr.title,
                     pr.author,
@@ -477,7 +477,7 @@ impl Db {
         self.with(|c| {
             c.query_row(
                 "SELECT * FROM tracked_prs WHERE server_id = ?1 AND repo = ?2 AND number = ?3",
-                params![server_id, repo, number as i64],
+                params![server_id, repo, number],
                 Self::tracked_from_row,
             )
             .optional()
@@ -509,7 +509,7 @@ impl Db {
             c.execute(
                 "UPDATE tracked_prs SET last_seen_head_sha = ?4, has_new_changes = ?5, updated_at = ?6
                  WHERE server_id = ?1 AND repo = ?2 AND number = ?3",
-                params![server_id, repo, number as i64, head_sha, has_new_changes, now()],
+                params![server_id, repo, number, head_sha, has_new_changes, now()],
             )
         })?;
         Ok(())
@@ -532,7 +532,7 @@ impl Db {
                 params![
                     server_id,
                     repo,
-                    number as i64,
+                    number,
                     reviewed_sha,
                     verdict.map(Verdict::as_str),
                     now()
@@ -553,7 +553,7 @@ impl Db {
             c.execute(
                 "UPDATE tracked_prs SET active = ?4, updated_at = ?5
                  WHERE server_id = ?1 AND repo = ?2 AND number = ?3",
-                params![server_id, repo, number as i64, active, now()],
+                params![server_id, repo, number, active, now()],
             )
         })?;
         Ok(())
@@ -563,7 +563,7 @@ impl Db {
         self.with(|c| {
             c.execute(
                 "DELETE FROM tracked_prs WHERE server_id = ?1 AND repo = ?2 AND number = ?3",
-                params![server_id, repo, number as i64],
+                params![server_id, repo, number],
             )
         })?;
         Ok(())
@@ -580,7 +580,7 @@ impl Db {
             server_id: r.get("server_id")?,
             repo: r.get("repo")?,
             project_id: r.get("project_id")?,
-            number: r.get::<_, i64>("number")? as u64,
+            number: r.get("number")?,
             pr_title: r.get("pr_title")?,
             head_sha: r.get("head_sha")?,
             base_sha: r.get("base_sha")?,
@@ -618,7 +618,7 @@ impl Db {
                     pr.server_id,
                     pr.repo,
                     pr.project_id,
-                    pr.number as i64,
+                    pr.number,
                     pr.title,
                     pr.head_sha,
                     pr.base_sha,
@@ -653,10 +653,7 @@ impl Db {
                 "SELECT * FROM reviews WHERE server_id = ?1 AND repo = ?2 AND number = ?3
                  ORDER BY created_at DESC",
             )?;
-            let rows = stmt.query_map(
-                params![server_id, repo, number as i64],
-                Self::review_from_row,
-            )?;
+            let rows = stmt.query_map(params![server_id, repo, number], Self::review_from_row)?;
             rows.collect()
         })
     }
@@ -680,7 +677,7 @@ impl Db {
             c.query_row(
                 "SELECT * FROM reviews WHERE server_id = ?1 AND repo = ?2 AND number = ?3
                  AND status = 'done' ORDER BY created_at DESC LIMIT 1",
-                params![server_id, repo, number as i64],
+                params![server_id, repo, number],
                 Self::review_from_row,
             )
             .optional()
@@ -744,7 +741,7 @@ impl Db {
         findings: &[Finding],
         files: &[ReviewFile],
     ) -> AppResult<()> {
-        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let mut conn = self.conn.lock().unwrap_or_else(PoisonError::into_inner);
         let tx = conn.transaction()?;
         tx.execute(
             "UPDATE reviews SET status = 'done', verdict = ?2, summary = ?3, cost_usd = ?4,
@@ -790,7 +787,7 @@ impl Db {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     id,
-                    position as i64,
+                    position,
                     f.meta.path,
                     f.meta.reason,
                     json_col(&f.meta.focus_lines)?,
@@ -959,7 +956,7 @@ impl Db {
     /// after every finding of the same or a higher severity, and the rest move down one place.
     pub fn insert_user_finding(&self, f: &Finding) -> AppResult<Finding> {
         {
-            let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+            let mut conn = self.conn.lock().unwrap_or_else(PoisonError::into_inner);
             let tx = conn.transaction()?;
             let ranked: Vec<(u32, u8)> = {
                 let mut stmt = tx.prepare(
@@ -1389,7 +1386,7 @@ mod tests {
         assert_eq!(s.base_url, "https://acme.atlassian.net");
         assert_eq!(s.mcp_server, None);
         assert_eq!(s.username.as_deref(), Some("Me"));
-        let mut edited = input.clone();
+        let mut edited = input;
         edited.name = "Renamed".into();
         db.upsert_ticket_source(Some(&s.id), &edited, None).unwrap();
         let all = db.list_ticket_sources().unwrap();

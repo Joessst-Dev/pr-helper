@@ -1,5 +1,7 @@
 //! GitHub.com and GitHub Enterprise Server.
 
+use std::fmt::Write as _;
+
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
@@ -141,9 +143,9 @@ impl GitHub {
             }
             (None, PrFilter::All) => {
                 // Multiple user:/org: qualifiers are ORed by GitHub search.
-                q.push_str(&format!(" user:{}", self.login().await?));
+                let _ = write!(q, " user:{}", self.login().await?);
                 for org in self.orgs().await? {
-                    q.push_str(&format!(" org:{org}"));
+                    let _ = write!(q, " org:{org}");
                 }
             }
             (None, _) => {}
@@ -226,7 +228,7 @@ impl GitHub {
         let mut body = c.body.clone();
         if let (Some(s), Side::Right) = (&c.suggestion, c.side) {
             let fence = super::fence_for(s);
-            body.push_str(&format!("\n\n{fence}suggestion\n{s}\n{fence}"));
+            let _ = write!(body, "\n\n{fence}suggestion\n{s}\n{fence}");
         }
         let side = if c.side == Side::Left {
             "LEFT"
@@ -275,7 +277,7 @@ impl GitProvider for GitHub {
     }
 
     async fn list_open_prs(&self, filter: PrFilter) -> AppResult<Vec<PullRequest>> {
-        const QUERY: &str = r#"
+        const QUERY: &str = r"
 query($q: String!, $cursor: String) {
   viewer { login }
   search(query: $q, type: ISSUE, first: 50, after: $cursor) {
@@ -289,7 +291,7 @@ query($q: String!, $cursor: String) {
       }
     }
   }
-}"#;
+}";
         let q = self.search_query(filter).await?;
         let mut out = Vec::new();
         let mut cursor: Option<String> = None;

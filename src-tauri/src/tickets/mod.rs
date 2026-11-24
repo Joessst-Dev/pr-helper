@@ -191,7 +191,7 @@ mod tests {
     use super::*;
 
     fn allow(keys: &[&str]) -> Vec<String> {
-        keys.iter().map(|k| k.to_string()).collect()
+        keys.iter().map(ToString::to_string).collect()
     }
 
     #[test]
@@ -236,7 +236,7 @@ mod tests {
             "ABC-4",
         ]
         .iter()
-        .map(|k| k.to_string())
+        .map(ToString::to_string)
         .collect();
         assert_eq!(
             filter_keys(&requested, &allow(&["ABC"])),

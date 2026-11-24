@@ -1,6 +1,7 @@
 pub mod github;
 pub mod gitlab;
 
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -131,7 +132,7 @@ pub async fn check(
                 other => other.to_string(),
             };
             if let Some(errors) = v.get("errors") {
-                text.push_str(&format!(" {errors}"));
+                let _ = write!(text, " {errors}");
             }
             Some(text)
         })
@@ -148,7 +149,7 @@ pub fn fold_comment(c: &InlineComment, suggestion_fence: &str) -> String {
     let mut s = format!("**{}:{}**\n\n{}", c.path, c.line, c.body);
     if let Some(sugg) = &c.suggestion {
         let fence = fence_for(sugg);
-        s.push_str(&format!("\n\n{fence}{suggestion_fence}\n{sugg}\n{fence}"));
+        let _ = write!(s, "\n\n{fence}{suggestion_fence}\n{sugg}\n{fence}");
     }
     s
 }

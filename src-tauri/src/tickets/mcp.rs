@@ -5,6 +5,7 @@
 //! empty directory and never sees PR content. The ticket
 //! key comes from the app and is validated before it goes into the prompt.
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -148,23 +149,26 @@ fn prompt(source: &TicketSource, key: &str, tools: &[String], extra_fields: &[St
         tools.join(", ")
     );
     if !source.base_url.is_empty() {
-        p.push_str(&format!(
-            "The tracker site is {}. If a tool needs a cloud or site id, look it up first.\n",
+        let _ = writeln!(
+            p,
+            "The tracker site is {}. If a tool needs a cloud or site id, look it up first.",
             source.base_url
-        ));
+        );
     }
-    p.push_str(&format!(
+    let _ = writeln!(
+        p,
         "Return its summary, type, status, full description, parent or epic, and the last \
-{MAX_COMMENTS} comments in the structured output.\n"
-    ));
-    if !extra_fields.is_empty() {
-        p.push_str(&format!(
-            "Also return these fields under their display names in `fields`: {}. Include the \
-acceptance criteria if the issue has any.\n",
-            extra_fields.join(", ")
-        ));
-    } else {
+{MAX_COMMENTS} comments in the structured output."
+    );
+    if extra_fields.is_empty() {
         p.push_str("If the issue has acceptance criteria, return them in `fields`.\n");
+    } else {
+        let _ = writeln!(
+            p,
+            "Also return these fields under their display names in `fields`: {}. Include the \
+acceptance criteria if the issue has any.",
+            extra_fields.join(", ")
+        );
     }
     p.push_str("If the issue cannot be loaded, return found=false with the reason in `error`.\n");
     p
@@ -405,7 +409,7 @@ mod tests {
     /// `PRH_MCP_SERVER=atlassian PRH_TICKET_KEY=ABC-1 cargo test real_claude_ticket_mcp -- --ignored --nocapture`
     /// (`PRH_JIRA_URL` optionally names the site.)
     #[tokio::test]
-    #[ignore]
+    #[ignore = "runs the real claude CLI with your MCP servers"]
     async fn real_claude_ticket_mcp() {
         let server = std::env::var("PRH_MCP_SERVER").unwrap_or_else(|_| "atlassian".into());
         let key = std::env::var("PRH_TICKET_KEY").expect("set PRH_TICKET_KEY");

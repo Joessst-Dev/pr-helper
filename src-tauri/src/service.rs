@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use serde::Serialize;
 use ts_rs::TS;
@@ -121,7 +121,7 @@ impl Drop for CancelGuard<'_> {
         // A panic in drop would abort; a poisoned map is still usable here.
         self.running
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(PoisonError::into_inner)
             .remove(&self.id);
     }
 }
@@ -598,7 +598,7 @@ impl Service {
         let cancel = self
             .comment_checks
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(PoisonError::into_inner)
             .entry(request_id.to_string())
             .or_default()
             .clone();
@@ -615,7 +615,7 @@ impl Service {
         let mut checks = self
             .comment_checks
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(PoisonError::into_inner);
         let running = checks.contains_key(request_id);
         checks.entry(request_id.to_string()).or_default().cancel();
         if !running && checks.len() > 64 {
@@ -646,7 +646,7 @@ impl Service {
             at: now(),
         };
         {
-            let mut logs = self.logs.lock().unwrap_or_else(|e| e.into_inner());
+            let mut logs = self.logs.lock().unwrap_or_else(PoisonError::into_inner);
             let log = logs.entry(review_id.to_string()).or_default();
             if log.len() >= MAX_LOG_LINES {
                 log.remove(0);
@@ -659,7 +659,7 @@ impl Service {
     pub fn progress_log(&self, review_id: &str) -> Vec<ProgressEvent> {
         self.logs
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(PoisonError::into_inner)
             .get(review_id)
             .cloned()
             .unwrap_or_default()

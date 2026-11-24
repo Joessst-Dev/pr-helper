@@ -2,7 +2,7 @@
 //! (cancels) an older queued or running review of the same PR.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
@@ -50,7 +50,7 @@ impl ReviewQueue {
     }
 
     fn jobs(&self) -> std::sync::MutexGuard<'_, HashMap<PrKey, Job>> {
-        self.jobs.lock().unwrap_or_else(|e| e.into_inner())
+        self.jobs.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     pub fn active_count(&self) -> usize {
@@ -77,7 +77,7 @@ impl ReviewQueue {
     /// finish; their permits are retired as they are released.
     pub fn set_limit(&self, max_concurrent: usize) {
         let new = max_concurrent.max(1);
-        let mut limit = self.limit.lock().unwrap_or_else(|e| e.into_inner());
+        let mut limit = self.limit.lock().unwrap_or_else(PoisonError::into_inner);
         if new > limit.max {
             let mut extra = new - limit.max;
             let repaid = extra.min(limit.debt);
@@ -94,7 +94,7 @@ impl ReviewQueue {
 
     /// Returns a finished review's permit, or retires it if the limit was lowered meanwhile.
     fn release(&self, permit: OwnedSemaphorePermit) {
-        let mut limit = self.limit.lock().unwrap_or_else(|e| e.into_inner());
+        let mut limit = self.limit.lock().unwrap_or_else(PoisonError::into_inner);
         if limit.debt > 0 {
             limit.debt -= 1;
             permit.forget();

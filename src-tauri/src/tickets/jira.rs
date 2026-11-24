@@ -251,7 +251,9 @@ fn parse_issue(v: &Value, key: &str, extra_fields: &[String], base: &str) -> Tic
         .unwrap_or_default();
     let comment_total = f["comment"]["total"]
         .as_u64()
-        .map_or(all_comments.len(), |t| t as usize)
+        .map_or(all_comments.len(), |t| {
+            usize::try_from(t).unwrap_or(usize::MAX)
+        })
         .max(all_comments.len());
     let comments = all_comments
         .iter()

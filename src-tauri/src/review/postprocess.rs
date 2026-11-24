@@ -162,7 +162,7 @@ fn unmask(line: &str, stash: &[String]) -> String {
         match after.find(PH_CLOSE) {
             Some(end) => {
                 let idx: usize = after[..end].parse().unwrap_or(usize::MAX);
-                out.push_str(stash.get(idx).map(String::as_str).unwrap_or(""));
+                out.push_str(stash.get(idx).map_or("", String::as_str));
                 rest = &after[end + PH_CLOSE.len_utf8()..];
             }
             None => {
@@ -460,7 +460,7 @@ pub fn sort_findings(findings: &mut [Finding]) {
             .then_with(|| a.line_start.cmp(&b.line_start))
     });
     for (i, f) in findings.iter_mut().enumerate() {
-        f.position = i as u32;
+        f.position = u32::try_from(i).unwrap_or(u32::MAX);
     }
 }
 
@@ -558,12 +558,9 @@ fn critical_files(raw: Vec<RawCriticalFile>, diff: &DiffIndex) -> Vec<CriticalFi
             .focus_lines
             .iter()
             .filter_map(|r| {
-                let start = r.start.clamp(0, MAX_LINE);
-                let end = if r.end < r.start { r.start } else { r.end }.clamp(0, MAX_LINE);
-                (start > 0).then_some(LineRange {
-                    start: start as u32,
-                    end: end as u32,
-                })
+                let start = u32::try_from(r.start.clamp(0, MAX_LINE)).ok()?;
+                let end = u32::try_from(r.end.max(r.start).clamp(0, MAX_LINE)).ok()?;
+                (start > 0).then_some(LineRange { start, end })
             })
             .collect();
         focus_lines.sort_by_key(|r| (r.start, r.end));

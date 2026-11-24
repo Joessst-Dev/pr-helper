@@ -28,7 +28,7 @@ tauri-plugin-dialog = "2.8.4"
 tauri-plugin-single-instance = "2.5.5"
 tauri-plugin-window-state = "2.5.0"
 tokio = { version = "1.54.1", features = ["full"] }
-rusqlite = { version = "0.43.0", features = ["bundled"] }
+rusqlite = { version = "0.43.0", features = ["bundled", "fallible_uint"] }
 uuid = { version = "1.29.3", features = ["v4", "serde"] }
 chrono = { version = "0.4.45", features = ["serde"] }
 thiserror = "2.0.21"
@@ -55,3 +55,16 @@ strip = true
 [dev-dependencies]
 tempfile = "3.27.0"
 wiremock = "0.6.5"
+
+# A curated subset of the lints from the Rust best-practices skill (.claude/skills/rust-best-practices).
+# CI runs clippy with `-D warnings`, so these fail the build.
+[lints.clippy]
+redundant_clone = "warn"
+needless_collect = "warn"
+map_unwrap_or = "warn"
+format_push_string = "warn"
+redundant_closure_for_method_calls = "warn"
+allow_attributes_without_reason = "warn"
+cast_possible_wrap = "warn"
+cast_sign_loss = "warn"
+manual_let_else = "warn"

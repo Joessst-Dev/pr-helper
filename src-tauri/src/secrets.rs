@@ -79,7 +79,7 @@ mod tests {
     /// Talks to the real OS keychain (macOS asks for permission the first time).
     /// `cargo test keychain_roundtrip -- --ignored`
     #[test]
-    #[ignore]
+    #[ignore = "talks to the real OS keychain"]
     fn keychain_roundtrip() {
         let store = KeyringStore;
         let id = format!("test-{}", uuid::Uuid::new_v4());

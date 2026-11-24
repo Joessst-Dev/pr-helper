@@ -147,7 +147,7 @@ fn write_fake_claude(dir: &Path, verdict: &str) -> PathBuf {
         serde_json::json!({"type":"result","subtype":"success","is_error":false,"session_id":"s","total_cost_usd":0.12,"structured_output":output}),
     ]
     .iter()
-    .map(|v| v.to_string())
+    .map(ToString::to_string)
     .collect::<Vec<_>>()
     .join("\n");
     std::fs::write(dir.join("stream.jsonl"), stream).unwrap();
@@ -207,7 +207,7 @@ fn harness_with(
     secrets.set(&server.id, "token").unwrap();
 
     let pr = PullRequest {
-        server_id: server.id.clone(),
+        server_id: server.id,
         repo: "acme/app".into(),
         project_id: "acme/app".into(),
         number: 9,
@@ -721,7 +721,7 @@ async fn user_comments_are_checked_and_posted() {
 /// Checks a user comment with the real `claude` CLI (haiku, costs under a cent).
 #[cfg(unix)]
 #[tokio::test]
-#[ignore]
+#[ignore = "runs the real claude CLI and costs money"]
 async fn real_claude_comment_check() {
     let h = harness(
         "comment",
@@ -757,7 +757,7 @@ async fn real_claude_comment_check() {
 /// Runs the real `claude` CLI (costs a few cents). `cargo test real_claude -- --ignored`
 #[cfg(unix)]
 #[tokio::test]
-#[ignore]
+#[ignore = "runs the real claude CLI and costs money"]
 async fn real_claude_review() {
     let h = harness(
         "unused",

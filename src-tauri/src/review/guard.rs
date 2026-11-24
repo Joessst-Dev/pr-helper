@@ -41,8 +41,8 @@ pub fn steering_attempt(
 ) -> Option<String> {
     let added = diff
         .lines()
-        .filter(|l| l.starts_with('+') && !l.starts_with("+++"))
-        .map(|l| &l[1..]);
+        .filter(|l| !l.starts_with("+++"))
+        .filter_map(|l| l.strip_prefix('+'));
     let sources = [title, description, commits, tickets]
         .into_iter()
         .flat_map(str::lines)
