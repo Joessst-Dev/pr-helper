@@ -99,12 +99,17 @@ impl Db {
         let settings: String = r.get("settings")?;
         Ok(Server {
             id: r.get("id")?,
-            kind: ProviderKind::parse(&kind).unwrap_or(ProviderKind::Github),
+            kind: parsed_or(
+                ProviderKind::parse(&kind),
+                ProviderKind::Github,
+                "provider kind",
+                &kind,
+            ),
             name: r.get("name")?,
             base_url: r.get("base_url")?,
             username: r.get("username")?,
             pr_scope: r.get("pr_scope")?,
-            settings: serde_json::from_str(&settings).unwrap_or_default(),
+            settings: json_or_default(&settings, "server settings"),
             created_at: r.get("created_at")?,
         })
     }
@@ -209,7 +214,7 @@ impl Db {
             )
             .optional()
         })?;
-        Ok(raw.map(|s| serde_json::from_str(&s).unwrap_or_default()))
+        Ok(raw.map(|s| json_or_default(&s, "repo settings")))
     }
 
     pub fn set_repo_settings(
@@ -248,7 +253,7 @@ impl Db {
             )?;
             let rows = stmt.query_map([server_id], |r| {
                 let raw: String = r.get(1)?;
-                Ok((r.get(0)?, serde_json::from_str(&raw).unwrap_or_default()))
+                Ok((r.get(0)?, json_or_default(&raw, "repo settings")))
             })?;
             rows.collect()
         })
@@ -339,7 +344,12 @@ impl Db {
         let kind: String = r.get("kind")?;
         Ok(TicketSource {
             id: r.get("id")?,
-            kind: TicketSourceKind::parse(&kind).unwrap_or(TicketSourceKind::JiraCloud),
+            kind: parsed_or(
+                TicketSourceKind::parse(&kind),
+                TicketSourceKind::JiraCloud,
+                "ticket source kind",
+                &kind,
+            ),
             name: r.get("name")?,
             base_url: r.get("base_url")?,
             email: r.get("email")?,
@@ -601,8 +611,7 @@ impl Db {
             finished_at: r.get("finished_at")?,
             tickets: r
                 .get::<_, Option<String>>("tickets")?
-                .and_then(|t| serde_json::from_str(&t).ok())
-                .unwrap_or_default(),
+                .map_or_else(Vec::new, |t| json_or_default(&t, "review tickets")),
         })
     }
 
@@ -856,7 +865,7 @@ impl Db {
                 Ok(CriticalFile {
                     path: r.get("path")?,
                     reason: r.get("reason")?,
-                    focus_lines: serde_json::from_str(&focus).unwrap_or_default(),
+                    focus_lines: json_or_default(&focus, "focus lines"),
                     note: note.as_deref().and_then(FileNote::parse),
                 })
             })?;
@@ -874,7 +883,7 @@ impl Db {
                     let diff: String = r.get("diff")?;
                     Ok(CriticalFileContent {
                         content: r.get("content")?,
-                        diff: serde_json::from_str(&diff).unwrap_or_default(),
+                        diff: json_or_default(&diff, "critical file diff"),
                         diff_truncated: r.get("diff_truncated")?,
                     })
                 },
@@ -893,7 +902,12 @@ impl Db {
             id: r.get("id")?,
             review_id: r.get("review_id")?,
             position: r.get("position")?,
-            severity: Severity::parse(&severity).unwrap_or(Severity::Low),
+            severity: parsed_or(
+                Severity::parse(&severity),
+                Severity::Low,
+                "severity",
+                &severity,
+            ),
             category: r.get("category")?,
             title: r.get("title")?,
             file: r.get("file")?,
@@ -912,7 +926,15 @@ impl Db {
             selected: r.get("selected")?,
             posted_at: r.get("posted_at")?,
             posted_ref: r.get("posted_ref")?,
-            source: FindingSource::parse(&r.get::<_, String>("source")?).unwrap_or_default(),
+            source: {
+                let source: String = r.get("source")?;
+                parsed_or(
+                    FindingSource::parse(&source),
+                    FindingSource::default(),
+                    "finding source",
+                    &source,
+                )
+            },
         })
     }
 
@@ -966,7 +988,13 @@ impl Db {
                     let severity: String = r.get(1)?;
                     Ok((
                         r.get(0)?,
-                        Severity::parse(&severity).unwrap_or(Severity::Low).rank(),
+                        parsed_or(
+                            Severity::parse(&severity),
+                            Severity::Low,
+                            "severity",
+                            &severity,
+                        )
+                        .rank(),
                     ))
                 })?
                 .collect::<rusqlite::Result<_>>()?
@@ -1047,6 +1075,23 @@ impl Db {
         })?;
         Ok(())
     }
+}
+
+/// Rows are written by this app, so stored JSON that does not parse means a corrupt row or a
+/// newer app version. Reads fall back to the default so the app keeps working, but log it.
+fn json_or_default<T: serde::de::DeserializeOwned + Default>(raw: &str, what: &str) -> T {
+    serde_json::from_str(raw).unwrap_or_else(|e| {
+        tracing::warn!("ignoring unreadable stored {what}: {e}");
+        T::default()
+    })
+}
+
+/// Like [`json_or_default`], for stored enum values.
+fn parsed_or<T>(parsed: Option<T>, fallback: T, what: &str, raw: &str) -> T {
+    parsed.unwrap_or_else(|| {
+        tracing::warn!("unknown stored {what} {raw:?}, using the default");
+        fallback
+    })
 }
 
 fn json_col<T: serde::Serialize>(value: &T) -> rusqlite::Result<String> {

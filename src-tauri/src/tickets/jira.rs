@@ -172,10 +172,11 @@ impl JiraClient {
         let content = meta["content"]
             .as_str()
             .ok_or_else(|| AppError::invalid("Jira returned no attachment URL"))?;
-        let url = reqwest::Url::parse(content)
-            .map_err(|_| AppError::invalid("Jira returned an invalid attachment URL"))?;
+        let url = reqwest::Url::parse(content).map_err(|e| {
+            AppError::invalid(format!("Jira returned an invalid attachment URL: {e}"))
+        })?;
         let base = reqwest::Url::parse(&self.base)
-            .map_err(|_| AppError::invalid("the Jira URL is invalid"))?;
+            .map_err(|e| AppError::invalid(format!("the Jira URL is invalid: {e}")))?;
         if url.origin() != base.origin() {
             return Err(AppError::invalid(
                 "the attachment is not hosted on the configured Jira site",

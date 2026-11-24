@@ -26,7 +26,8 @@ use crate::settings::EffectiveSettings;
 const PH_OPEN: char = '\u{E000}';
 const PH_CLOSE: char = '\u{E001}';
 
-static URL_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://[^\s<>()\[\]]+").unwrap());
+static URL_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"https?://[^\s<>()\[\]]+").expect("hard-coded regex is valid"));
 
 /// Which lines count as code (left alone) rather than prose.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -176,31 +177,37 @@ fn unmask(line: &str, stash: &[String]) -> String {
 
 // ---- dashes -----------------------------------------------------------------
 
-static TABLE_DELIM_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)+\|?\s*$").unwrap());
-static HR_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s*(?:-{2,}|[—–]+)\s*$").unwrap());
-static ARROW_BOTH_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"<-{2,}>").unwrap());
-static ARROW_RIGHT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"-{2,}>").unwrap());
-static ARROW_LEFT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"<-{2,}").unwrap());
-static FLAG_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"(^|[\s(\[{"'])(--[A-Za-z0-9][\w.=/:-]*)"#).unwrap());
+static TABLE_DELIM_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)+\|?\s*$").expect("hard-coded regex is valid")
+});
+static HR_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*(?:-{2,}|[—–]+)\s*$").expect("hard-coded regex is valid"));
+static ARROW_BOTH_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"<-{2,}>").expect("hard-coded regex is valid"));
+static ARROW_RIGHT_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"-{2,}>").expect("hard-coded regex is valid"));
+static ARROW_LEFT_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"<-{2,}").expect("hard-coded regex is valid"));
+static FLAG_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(^|[\s(\[{"'])(--[A-Za-z0-9][\w.=/:-]*)"#).expect("hard-coded regex is valid")
+});
 static LIST_MARKER_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^(\s*)(?:-{2,}|[—–])\s+").unwrap());
-static RANGE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(\d)\s*(?:[—–]|-{2,})\s*(\d)").unwrap());
+    LazyLock::new(|| Regex::new(r"^(\s*)(?:-{2,}|[—–])\s+").expect("hard-coded regex is valid"));
+static RANGE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(\d)\s*(?:[—–]|-{2,})\s*(\d)").expect("hard-coded regex is valid")
+});
 static DASH_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"[ \t]*(?:[—–]|-{2,})[ \t]*").unwrap());
-static PUNCT_CLEANUP_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s*,(\s*,)+").unwrap());
-static FORBIDDEN_DASH_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[—–]|-{2,}").unwrap());
+    LazyLock::new(|| Regex::new(r"[ \t]*(?:[—–]|-{2,})[ \t]*").expect("hard-coded regex is valid"));
+static PUNCT_CLEANUP_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\s*,(\s*,)+").expect("hard-coded regex is valid"));
+static DASH_RUN_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new("-+").expect("hard-coded regex is valid"));
+static FORBIDDEN_DASH_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"[—–]|-{2,}").expect("hard-coded regex is valid"));
 
 fn sanitize_dash_line(line: &str) -> Option<String> {
     if TABLE_DELIM_RE.is_match(line) && line.contains('|') {
-        return Some(
-            Regex::new("-+")
-                .unwrap()
-                .replace_all(line, "-")
-                .into_owned(),
-        );
+        return Some(DASH_RUN_RE.replace_all(line, "-").into_owned());
     }
     if HR_RE.is_match(line) {
         return None;
@@ -278,7 +285,7 @@ static ATTRIBUTION_LINE_RES: LazyLock<Vec<Regex>> = LazyLock::new(|| {
         r"(?i)^\s*(?:[-*_—–]+\s*)?(?:sent|reviewed|signed)?\s*(?:by|from|via)?\s*(?:claude|anthropic)(?:\s+code)?\s*$",
     ]
     .iter()
-    .map(|p| Regex::new(p).unwrap())
+    .map(|p| Regex::new(p).expect("hard-coded regex is valid"))
     .collect()
 });
 
@@ -288,22 +295,23 @@ static ATTRIBUTION_SENTENCE_RES: LazyLock<Vec<Regex>> = LazyLock::new(|| {
         Regex::new(&format!(
             r"(?i)\b(this|the|my|our|these)\s+(review|comment|feedback|analysis|suggestion|summary|response|reply|text|message|note)s?\b[^.!?\n]{{0,30}}\b(generated|written|created|produced|drafted|authored|assisted|powered|composed|made|reviewed)\b[^.!?\n]{{0,25}}\b(with|by|using|via|from|through)\b[^.!?\n]{{0,25}}\b{AI_TERMS}"
         ))
-        .unwrap(),
+        .expect("hard-coded regex is valid"),
         // Sentence-initial passive signature: "Generated with Claude Code", "Written by an AI".
         // A mid-sentence "errors produced by the Claude CLI" is a legitimate code remark.
         Regex::new(&format!(
             r"(?i)(?:^|[.!?]\s+)[\s*_—–-]*(generated|written|created|produced|drafted|authored|assisted|powered|brought to you|composed|made|reviewed)\s+(with|by|using|via|from|through)\b[^.!?\n]{{0,25}}\b{AI_TERMS}"
         ))
-        .unwrap(),
-        Regex::new(r"(?i)\bas an? (ai|language model|llm|assistant|automated (reviewer|tool))\b").unwrap(),
-        Regex::new(r"(?i)\b(i am|i'm)\s+(claude|an ai|a language model|an assistant|an automated)\b").unwrap(),
-        Regex::new(r"(?i)\bai[- ](generated|assisted|powered|authored|written|driven)\b").unwrap(),
-        Regex::new(r"(?i)\b(this|the|my)\s+(review|comment|feedback|analysis|suggestion)s?\s+(was|is|were|are|has been|have been)\s+(automated|automatically generated|machine[- ]generated|generated)\b").unwrap(),
+        .expect("hard-coded regex is valid"),
+        Regex::new(r"(?i)\bas an? (ai|language model|llm|assistant|automated (reviewer|tool))\b").expect("hard-coded regex is valid"),
+        Regex::new(r"(?i)\b(i am|i'm)\s+(claude|an ai|a language model|an assistant|an automated)\b").expect("hard-coded regex is valid"),
+        Regex::new(r"(?i)\bai[- ](generated|assisted|powered|authored|written|driven)\b").expect("hard-coded regex is valid"),
+        Regex::new(r"(?i)\b(this|the|my)\s+(review|comment|feedback|analysis|suggestion)s?\s+(was|is|were|are|has been|have been)\s+(automated|automatically generated|machine[- ]generated|generated)\b").expect("hard-coded regex is valid"),
     ]
 });
 
 static ATTRIBUTION_LINK_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)^https?://([a-z0-9-]+\.)*(claude\.(ai|com)|anthropic\.com)\b").unwrap()
+    Regex::new(r"(?i)^https?://([a-z0-9-]+\.)*(claude\.(ai|com)|anthropic\.com)\b")
+        .expect("hard-coded regex is valid")
 });
 
 fn split_sentences(line: &str) -> Vec<&str> {
@@ -386,7 +394,8 @@ pub fn attribution_violations(text: &str) -> Vec<String> {
 
 // ---- public API -------------------------------------------------------------
 
-static BLANK_RUN_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\n{3,}").unwrap());
+static BLANK_RUN_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\n{3,}").expect("hard-coded regex is valid"));
 
 /// Sanitize text that will be posted.
 pub fn sanitize_comment(text: &str, forbid_attribution: bool) -> String {

@@ -1,18 +1,21 @@
 //! API tokens live in the OS keychain, never in the database.
 
+#[cfg(test)]
 use std::collections::HashMap;
+#[cfg(test)]
 use std::sync::Mutex;
 
 use crate::error::{AppError, AppResult};
 
+/// Stores API tokens by account: a server id, or `ticket-source:<id>` for a ticket source.
 pub trait SecretStore: Send + Sync {
-    fn get(&self, server_id: &str) -> AppResult<Option<String>>;
-    fn set(&self, server_id: &str, token: &str) -> AppResult<()>;
-    fn delete(&self, server_id: &str) -> AppResult<()>;
+    fn get(&self, account: &str) -> AppResult<Option<String>>;
+    fn set(&self, account: &str, token: &str) -> AppResult<()>;
+    fn delete(&self, account: &str) -> AppResult<()>;
 
-    fn require(&self, server_id: &str) -> AppResult<String> {
-        self.get(server_id)?
-            .ok_or_else(|| AppError::Secret("no token stored for this server".into()))
+    fn require(&self, account: &str) -> AppResult<String> {
+        self.get(account)?
+            .ok_or_else(|| AppError::Secret("no token stored for this connection".into()))
     }
 }
 
@@ -21,53 +24,50 @@ const SERVICE: &str = "dev.jostweyers.prhelper";
 pub struct KeyringStore;
 
 impl KeyringStore {
-    fn entry(server_id: &str) -> AppResult<keyring::Entry> {
-        keyring::Entry::new(SERVICE, server_id).map_err(|e| AppError::Secret(e.to_string()))
+    fn entry(account: &str) -> AppResult<keyring::Entry> {
+        Ok(keyring::Entry::new(SERVICE, account)?)
     }
 }
 
 impl SecretStore for KeyringStore {
-    fn get(&self, server_id: &str) -> AppResult<Option<String>> {
-        match Self::entry(server_id)?.get_password() {
+    fn get(&self, account: &str) -> AppResult<Option<String>> {
+        match Self::entry(account)?.get_password() {
             Ok(token) => Ok(Some(token)),
             Err(keyring::Error::NoEntry) => Ok(None),
-            Err(e) => Err(AppError::Secret(e.to_string())),
+            Err(e) => Err(e.into()),
         }
     }
 
-    fn set(&self, server_id: &str, token: &str) -> AppResult<()> {
-        Self::entry(server_id)?
-            .set_password(token)
-            .map_err(|e| AppError::Secret(e.to_string()))
+    fn set(&self, account: &str, token: &str) -> AppResult<()> {
+        Ok(Self::entry(account)?.set_password(token)?)
     }
 
-    fn delete(&self, server_id: &str) -> AppResult<()> {
-        match Self::entry(server_id)?.delete_credential() {
+    fn delete(&self, account: &str) -> AppResult<()> {
+        match Self::entry(account)?.delete_credential() {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-            Err(e) => Err(AppError::Secret(e.to_string())),
+            Err(e) => Err(e.into()),
         }
     }
 }
 
-/// Used in tests and as a fallback when no keychain is available.
+/// In-memory store for tests.
+#[cfg(test)]
 #[derive(Default)]
 pub struct MemoryStore(Mutex<HashMap<String, String>>);
 
+#[cfg(test)]
 impl SecretStore for MemoryStore {
-    fn get(&self, server_id: &str) -> AppResult<Option<String>> {
-        Ok(self.0.lock().unwrap().get(server_id).cloned())
+    fn get(&self, account: &str) -> AppResult<Option<String>> {
+        Ok(self.0.lock().unwrap().get(account).cloned())
     }
 
-    fn set(&self, server_id: &str, token: &str) -> AppResult<()> {
-        self.0
-            .lock()
-            .unwrap()
-            .insert(server_id.into(), token.into());
+    fn set(&self, account: &str, token: &str) -> AppResult<()> {
+        self.0.lock().unwrap().insert(account.into(), token.into());
         Ok(())
     }
 
-    fn delete(&self, server_id: &str) -> AppResult<()> {
-        self.0.lock().unwrap().remove(server_id);
+    fn delete(&self, account: &str) -> AppResult<()> {
+        self.0.lock().unwrap().remove(account);
         Ok(())
     }
 }

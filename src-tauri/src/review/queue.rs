@@ -161,7 +161,7 @@ pub fn enqueue(svc: &Arc<Service>, pr: PullRequest, trigger: ReviewTrigger) -> A
                 svc2.queue.release(permit);
             }
             None => {
-                let _ = svc2.db.set_review_status(
+                svc2.record_review_status(
                     &review_id,
                     ReviewStatus::Cancelled,
                     Some("Superseded before it started"),

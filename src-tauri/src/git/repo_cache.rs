@@ -114,7 +114,10 @@ impl RepoCache {
             c.arg("-C").arg(d);
         }
         c.args(args);
-        let out = c.output().await?;
+        let out = c
+            .output()
+            .await
+            .map_err(|e| AppError::Git(format!("could not run git: {e}")))?;
         if out.status.success() {
             Ok(String::from_utf8_lossy(&out.stdout).into_owned())
         } else {
@@ -339,10 +342,16 @@ impl RepoCache {
                 None,
             )
             .await;
-        if removed.is_err() && dest.exists() {
-            tokio::fs::remove_dir_all(dest).await?;
+        if let Err(e) = removed {
+            tracing::debug!("git worktree remove failed, deleting the directory: {e}");
+            if dest.exists() {
+                tokio::fs::remove_dir_all(dest).await?;
+            }
         }
-        let _ = self.run(Some(bare), &["worktree", "prune"], None).await;
+        // Best effort: a stale worktree entry only costs a little disk until the next prune.
+        if let Err(e) = self.run(Some(bare), &["worktree", "prune"], None).await {
+            tracing::debug!("git worktree prune failed: {e}");
+        }
         Ok(())
     }
 }

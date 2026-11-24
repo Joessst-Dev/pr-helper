@@ -31,9 +31,7 @@ pub async fn run_review(
     trigger: ReviewTrigger,
     cancel: CancellationToken,
 ) {
-    let _ = svc
-        .db
-        .set_review_status(review_id, ReviewStatus::Running, None);
+    svc.record_review_status(review_id, ReviewStatus::Running, None);
     svc.publish_review(review_id);
     svc.progress(review_id, ProgressKind::Status, "Started");
 
@@ -44,9 +42,12 @@ pub async fn run_review(
     let worktree = review_dir.join("worktree");
     match &outcome {
         Ok(_) if keep => {
-            let _ = svc
+            if let Err(e) = svc
                 .db
-                .set_review_worktree(review_id, Some(&worktree.to_string_lossy()));
+                .set_review_worktree(review_id, Some(&worktree.to_string_lossy()))
+            {
+                tracing::warn!("could not record the kept worktree of review {review_id}: {e}");
+            }
         }
         _ => cleanup(svc, &pr, &review_dir).await,
     }
@@ -63,17 +64,13 @@ pub async fn run_review(
             after_review(svc, review_id, &pr, verdict, trigger, steering.as_deref()).await;
         }
         Err(e) if cancel.is_cancelled() => {
-            let _ =
-                svc.db
-                    .set_review_status(review_id, ReviewStatus::Cancelled, Some(&e.to_string()));
+            svc.record_review_status(review_id, ReviewStatus::Cancelled, Some(&e.to_string()));
             svc.progress(review_id, ProgressKind::Status, "Cancelled");
             svc.publish_review(review_id);
         }
         Err(e) => {
             let msg = e.to_string();
-            let _ = svc
-                .db
-                .set_review_status(review_id, ReviewStatus::Failed, Some(&msg));
+            svc.record_review_status(review_id, ReviewStatus::Failed, Some(&msg));
             svc.progress(review_id, ProgressKind::Error, &msg);
             svc.publish_review(review_id);
             svc.sink.notify(
@@ -87,8 +84,10 @@ pub async fn run_review(
 async fn cleanup(svc: &Service, pr: &PullRequest, review_dir: &Path) {
     let bare = svc.cache.bare_path(&pr.server_id, &pr.repo);
     let worktree = review_dir.join("worktree");
-    if worktree.exists() {
-        let _ = svc.cache.remove_worktree(&bare, &worktree).await;
+    if worktree.exists()
+        && let Err(e) = svc.cache.remove_worktree(&bare, &worktree).await
+    {
+        tracing::debug!("could not remove worktree {}: {e}", worktree.display());
     }
     let _ = tokio::fs::remove_dir_all(review_dir).await;
 }
@@ -436,7 +435,7 @@ async fn load_tickets(
 
 fn check_cancel(cancel: &CancellationToken) -> AppResult<()> {
     if cancel.is_cancelled() {
-        Err(AppError::Reviewer("cancelled".into()))
+        Err(AppError::Cancelled)
     } else {
         Ok(())
     }

@@ -291,7 +291,7 @@ pub async fn run(
         },
         _ = cancel.cancelled() => {
             let _ = child.kill().await;
-            return Err(AppError::Reviewer("cancelled".into()));
+            return Err(AppError::Cancelled);
         }
     };
 

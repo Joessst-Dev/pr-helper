@@ -25,7 +25,7 @@ static STEERING_RES: LazyLock<Vec<Regex>> = LazyLock::new(|| {
         r"(?i)\byou\s+are\s+(now\s+)?(an?\s+)?(ai|llm|language\s+model|assistant|reviewer)\b",
     ]
     .iter()
-    .map(|p| Regex::new(p).expect("valid steering regex"))
+    .map(|p| Regex::new(p).expect("hard-coded regex is valid"))
     .collect()
 });
 

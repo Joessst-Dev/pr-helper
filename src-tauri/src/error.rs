@@ -20,8 +20,13 @@ pub enum AppError {
     Git(String),
     #[error("secret store error: {0}")]
     Secret(String),
+    #[error("secret store error: {0}")]
+    Keyring(#[from] keyring::Error),
     #[error("reviewer error: {0}")]
     Reviewer(String),
+    /// The user (or a newer review of the same PR) stopped the operation.
+    #[error("cancelled")]
+    Cancelled,
     #[error("not found: {0}")]
     NotFound(String),
     #[error("{0}")]

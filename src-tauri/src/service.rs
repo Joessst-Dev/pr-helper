@@ -9,7 +9,8 @@ use serde::Serialize;
 use ts_rs::TS;
 
 use crate::db::models::{
-    PullRequest, Review, Server, ServerInput, TicketSource, TicketSourceInput, TicketSourceKind,
+    PullRequest, Review, ReviewStatus, Server, ServerInput, TicketSource, TicketSourceInput,
+    TicketSourceKind,
 };
 use crate::db::{Db, now};
 use crate::env;
@@ -135,8 +136,10 @@ impl Service {
         provider_factory: Option<Box<ProviderFactory>>,
     ) -> AppResult<Arc<Self>> {
         let config = db.app_config()?;
-        let git = env::resolve_tool("git", config.git_path.as_deref())
-            .unwrap_or_else(|_| PathBuf::from("git"));
+        let git = env::resolve_tool("git", config.git_path.as_deref()).unwrap_or_else(|e| {
+            tracing::warn!("using git from PATH: {e}");
+            PathBuf::from("git")
+        });
         Ok(Arc::new(Self {
             cache: Arc::new(RepoCache::new(
                 cache_root,
@@ -209,32 +212,18 @@ impl Service {
             .await?;
 
         let server = match &existing {
-            Some(old) => {
-                // Token before row: a failed keychain write must not leave the new URL paired
-                // with the old token.
-                let previous_token = match new_token {
-                    Some(t) => {
-                        let previous = self.secrets.get(&old.id)?;
-                        self.secrets.set(&old.id, t)?;
-                        previous
-                    }
-                    None => None,
-                };
-                match self.db.update_server(&old.id, input) {
-                    Ok(server) => server,
-                    Err(e) => {
-                        if let Some(previous) = previous_token {
-                            let _ = self.secrets.set(&old.id, &previous);
-                        }
-                        return Err(e);
-                    }
-                }
-            }
+            Some(old) => self
+                .update_with_token(&old.id, new_token, || self.db.update_server(&old.id, input))?,
             None => {
                 let server = self.db.insert_server(input)?;
                 if let Err(e) = self.secrets.set(&server.id, &token) {
                     // Never keep a server whose token could not be stored securely.
-                    let _ = self.db.delete_server(&server.id);
+                    if let Err(undo) = self.db.delete_server(&server.id) {
+                        tracing::error!(
+                            "could not remove server {} after a keychain failure: {undo}",
+                            server.id
+                        );
+                    }
                     return Err(e);
                 }
                 server
@@ -270,6 +259,32 @@ impl Service {
             auth,
             crate::providers::http_client(),
         ))
+    }
+
+    /// Updates an existing row with `update`. A new token is written first, so a failed keychain
+    /// write can never leave a changed URL paired with the old token. If `update` then fails,
+    /// the previous token is put back.
+    fn update_with_token<T>(
+        &self,
+        account: &str,
+        new_token: Option<&str>,
+        update: impl FnOnce() -> AppResult<T>,
+    ) -> AppResult<T> {
+        let previous = match new_token {
+            Some(t) => {
+                let previous = self.secrets.get(account)?;
+                self.secrets.set(account, t)?;
+                previous
+            }
+            None => None,
+        };
+        update().inspect_err(|_| {
+            if let Some(previous) = previous
+                && let Err(e) = self.secrets.set(account, &previous)
+            {
+                tracing::error!("could not restore the previous token of {account}: {e}");
+            }
+        })
     }
 
     /// Like [`Self::save_server`]: verifies the token with Jira, stores it only in the secret
@@ -333,32 +348,20 @@ impl Service {
 
         match &existing {
             Some(old) => {
-                let secret_id = Self::ticket_secret_id(&old.id);
-                let previous = match new_token {
-                    Some(t) => {
-                        let previous = self.secrets.get(&secret_id)?;
-                        self.secrets.set(&secret_id, t)?;
-                        previous
-                    }
-                    None => None,
-                };
-                match self
-                    .db
-                    .upsert_ticket_source(Some(&old.id), input, Some(&username))
-                {
-                    Ok(s) => Ok(s),
-                    Err(e) => {
-                        if let Some(previous) = previous {
-                            let _ = self.secrets.set(&secret_id, &previous);
-                        }
-                        Err(e)
-                    }
-                }
+                self.update_with_token(&Self::ticket_secret_id(&old.id), new_token, || {
+                    self.db
+                        .upsert_ticket_source(Some(&old.id), input, Some(&username))
+                })
             }
             None => {
                 let saved = self.db.upsert_ticket_source(None, input, Some(&username))?;
                 if let Err(e) = self.secrets.set(&Self::ticket_secret_id(&saved.id), &token) {
-                    let _ = self.db.delete_ticket_source(&saved.id);
+                    if let Err(undo) = self.db.delete_ticket_source(&saved.id) {
+                        tracing::error!(
+                            "could not remove ticket source {} after a keychain failure: {undo}",
+                            saved.id
+                        );
+                    }
                     return Err(e);
                 }
                 Ok(saved)
@@ -406,7 +409,7 @@ impl Service {
                 let client = self.jira_client(source, token)?;
                 tokio::select! {
                     t = client.issue(key, &extra) => t,
-                    _ = cancel.cancelled() => Err(AppError::Reviewer("cancelled".into())),
+                    _ = cancel.cancelled() => Err(AppError::Cancelled),
                 }
             }
         }
@@ -478,7 +481,7 @@ impl Service {
         let cancel = self
             .ticket_loads
             .lock()
-            .unwrap()
+            .unwrap_or_else(PoisonError::into_inner)
             .entry(request_id.to_string())
             .or_default()
             .clone();
@@ -486,7 +489,6 @@ impl Service {
             running: &self.ticket_loads,
             id: request_id.to_string(),
         };
-        let cancelled = || AppError::Reviewer("cancelled".into());
 
         let settings = self.effective_settings(server_id, Some(repo))?;
         let Some(source_id) = settings.ticket_source_id.value.as_deref() else {
@@ -500,7 +502,7 @@ impl Service {
         let mut loaded = Vec::with_capacity(keys.len());
         for key in keys {
             if cancel.is_cancelled() {
-                return Err(cancelled());
+                return Err(AppError::Cancelled);
             }
             let work_dir = self
                 .cache
@@ -510,7 +512,7 @@ impl Service {
                 .await;
             let _ = tokio::fs::remove_dir_all(&work_dir).await;
             if cancel.is_cancelled() {
-                return Err(cancelled());
+                return Err(AppError::Cancelled);
             }
             loaded.push(match result {
                 Ok(t) => TicketLoad {
@@ -575,7 +577,10 @@ impl Service {
     /// Returns whether a load with this id was running.
     pub fn cancel_ticket_load(&self, request_id: &str) -> AppResult<bool> {
         validate_request_id(request_id)?;
-        let mut loads = self.ticket_loads.lock().unwrap();
+        let mut loads = self
+            .ticket_loads
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let running = loads.contains_key(request_id);
         loads.entry(request_id.to_string()).or_default().cancel();
         if !running {
@@ -666,8 +671,25 @@ impl Service {
     }
 
     pub fn publish_review(&self, review_id: &str) {
-        if let Ok(review) = self.db.get_review(review_id) {
-            self.sink.review_updated(&review);
+        match self.db.get_review(review_id) {
+            Ok(review) => self.sink.review_updated(&review),
+            Err(e) => tracing::warn!("could not load review {review_id} to publish it: {e}"),
+        }
+    }
+
+    /// Records a review's status. Callers treat this as best effort (the review itself already
+    /// succeeded or failed), so a failed write is logged instead of returned.
+    pub fn record_review_status(
+        &self,
+        review_id: &str,
+        status: ReviewStatus,
+        message: Option<&str>,
+    ) {
+        if let Err(e) = self.db.set_review_status(review_id, status, message) {
+            tracing::warn!(
+                "could not mark review {review_id} as {}: {e}",
+                status.as_str()
+            );
         }
     }
 }

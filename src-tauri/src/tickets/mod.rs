@@ -22,15 +22,16 @@ pub const MAX_TICKETS: usize = 3;
 /// The last N comments of a ticket are included.
 pub const MAX_COMMENTS: usize = 10;
 
-static KEY_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^[A-Z][A-Z0-9_]{0,49}-[1-9][0-9]{0,9}$").unwrap());
+static KEY_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^[A-Z][A-Z0-9_]{0,49}-[1-9][0-9]{0,9}$").expect("hard-coded regex is valid")
+});
 /// Finds candidate keys in free text. Case-insensitive; the result is uppercased and then
 /// validated with [`KEY_RE`].
 static FIND_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"(?i)(?:^|[^A-Za-z0-9_])([A-Za-z][A-Za-z0-9_]{0,49}-[1-9][0-9]{0,9})(?:$|[^A-Za-z0-9_])",
     )
-    .unwrap()
+    .expect("hard-coded regex is valid")
 });
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, TS)]
@@ -120,7 +121,7 @@ pub fn extract_keys(
         // FIND_RE consumes one delimiter on each side, so step past each match manually to
         // also catch adjacent keys like "ABC-1,ABC-2".
         while let Some(caps) = FIND_RE.captures(rest) {
-            let m = caps.get(1).expect("group 1");
+            let m = caps.get(1).expect("FIND_RE always captures group 1");
             let key = m.as_str().to_ascii_uppercase();
             let project = key.rsplit_once('-').map_or("", |(p, _)| p);
             if is_valid_key(&key)

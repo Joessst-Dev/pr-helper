@@ -327,7 +327,12 @@ query($q: String!, $cursor: String) {
             .send()
             .await?;
         let v: Value = check(NAME, resp).await?.json().await?;
-        let me = self.login().await.unwrap_or_default();
+        // The login only decides the "requested from me"/"authored by me" flags, which are not
+        // worth failing the fetch for.
+        let me = self.login().await.unwrap_or_else(|e| {
+            tracing::warn!("could not load the GitHub login: {e}");
+            String::new()
+        });
         self.map_rest_pr(&v, &me)
     }
 

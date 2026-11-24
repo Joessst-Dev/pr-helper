@@ -93,12 +93,17 @@ pub fn basic_auth_header(user: &str, token: &str) -> String {
     format!("Authorization: Basic {creds}")
 }
 
+/// Builds the HTTP client for one provider or ticket source.
+///
+/// Deliberately not a shared static: a pooled connection is bound to the tokio runtime that
+/// opened it, and tests run each case on its own runtime.
 pub fn http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .user_agent(concat!("pr-helper/", env!("CARGO_PKG_VERSION")))
         .timeout(std::time::Duration::from_secs(60))
         .build()
-        .expect("reqwest client")
+        // Only fails when the TLS backend can't initialise, which no request could recover from.
+        .expect("the HTTP client can be built")
 }
 
 pub fn make_provider(

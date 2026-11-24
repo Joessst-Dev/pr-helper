@@ -260,7 +260,12 @@ impl GitProvider for GitLab {
     }
 
     async fn get_pr(&self, project_id: &str, number: u64) -> AppResult<PullRequest> {
-        let me = self.me().await.unwrap_or_default();
+        // The username only decides the "requested from me"/"authored by me" flags, which are
+        // not worth failing the fetch for.
+        let me = self.me().await.unwrap_or_else(|e| {
+            tracing::warn!("could not load the GitLab username: {e}");
+            String::new()
+        });
         let v = self
             .get_json(&format!("/projects/{project_id}/merge_requests/{number}"))
             .await?;

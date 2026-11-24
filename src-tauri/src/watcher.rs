@@ -64,8 +64,12 @@ async fn tick(
     last_checked: &mut HashMap<(String, String, u64), Instant>,
     server_backoff: &mut HashMap<String, Instant>,
 ) {
-    let Ok(tracked) = svc.db.list_tracked(true) else {
-        return;
+    let tracked = match svc.db.list_tracked(true) {
+        Ok(tracked) => tracked,
+        Err(e) => {
+            tracing::warn!("could not list tracked PRs: {e}");
+            return;
+        }
     };
     let now = Instant::now();
     let mut changed = false;
@@ -77,8 +81,12 @@ async fn tick(
         {
             continue;
         }
-        let Ok(settings) = svc.effective_settings(&t.server_id, Some(&t.repo)) else {
-            continue;
+        let settings = match svc.effective_settings(&t.server_id, Some(&t.repo)) {
+            Ok(settings) => settings,
+            Err(e) => {
+                tracing::warn!("skipping {}#{}: {e}", t.repo, t.number);
+                continue;
+            }
         };
         let key = (t.server_id.clone(), t.repo.clone(), t.number);
         let interval = Duration::from_secs(u64::from(settings.poll_interval_secs.value));
@@ -90,15 +98,22 @@ async fn tick(
         }
         last_checked.insert(key, now);
 
-        let Ok((_server, provider)) = svc.provider_for(&t.server_id) else {
-            continue;
+        let provider = match svc.provider_for(&t.server_id) {
+            Ok((_server, provider)) => provider,
+            Err(e) => {
+                tracing::warn!("skipping {}#{}: {e}", t.repo, t.number);
+                continue;
+            }
         };
         let fresh: PullRequest = match provider.get_pr(&t.project_id, t.number).await {
             Ok(pr) => pr,
             Err(AppError::Api { status: 404, .. }) => {
-                let _ = svc
+                if let Err(e) = svc
                     .db
-                    .set_tracked_active(&t.server_id, &t.repo, t.number, false);
+                    .set_tracked_active(&t.server_id, &t.repo, t.number, false)
+                {
+                    tracing::warn!("deactivating {}#{} failed: {e}", t.repo, t.number);
+                }
                 changed = true;
                 continue;
             }
